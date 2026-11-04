@@ -23,6 +23,8 @@ Protocol:
 
 import argparse
 import base64
+import calendar
+import datetime
 import glob
 import hashlib
 import http.client
@@ -872,18 +874,37 @@ def cmd_ls(q, args):
             print(name)
 
 
-def fetch(q, e, target):
+def fetch(q, e, target, quiet=False):
+    """Download a document to `target` atomically; set mtime to the device's modified_date."""
     tmp = target + ".part"
-    with open(tmp, "wb") as fh:
-        n = q.download(e["entry_id"], fh)
-    os.replace(tmp, target)
-    print(f"{e['entry_path']} -> {target} ({human(n)})")
+    try:
+        with open(tmp, "wb") as fh:
+            n = q.download(e["entry_id"], fh)
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    mtime = parse_device_time(e.get("modified_date"))
+    if mtime is not None:
+        os.utime(target, (mtime, mtime))
+    if not quiet:
+        print(f"{e['entry_path']} -> {target} ({human(n)})")
+    return n
+
+
+def parse_device_time(s):
+    """'2024-04-08T11:31:43Z' -> epoch seconds (None if absent/unparseable)."""
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
 
 
 def get_tree(q, folder, dest):
     """Download `folder` as dest/<folder name>/..., keeping the subfolder layout."""
     base = os.path.join(dest, safe_local_name(folder["entry_name"]))
-    prefix = folder["entry_path"] + "/"
+    prefix = folder["entry_path"].rstrip("/") + "/"
     os.makedirs(base, exist_ok=True)
     count = 0
     for e in q.walk(folder):  # parents are yielded before their children
@@ -1095,6 +1116,194 @@ def cmd_screenshot(q, args):
     print(f"saved {args.output}")
 
 
+# --------------------------------------------------------------------------
+# open / time
+# --------------------------------------------------------------------------
+
+def cmd_open(q, args):
+    e = q.resolve(args.remote)
+    if e["entry_type"] != "document":
+        raise QuadernoError(f"{e['entry_path']} is a folder")
+    if args.page is None:
+        q.request("PUT", "/viewer/controls/open", {"document_id": e["entry_id"]})
+    else:
+        try:
+            q.request("PUT", "/viewer/controls/open2",
+                      {"document_id": e["entry_id"], "page": int(args.page)})
+        except QuadernoError as err:
+            if err.status in (404, 405):
+                raise QuadernoError("this firmware does not support opening at a page") from err
+            raise
+    where = f" at page {args.page}" if args.page is not None else ""
+    print(f"opened {e['entry_path']}{where} on the device")
+
+
+def mac_timezone_name():
+    try:
+        return os.readlink("/etc/localtime").split("zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return time.strftime("%Z")
+
+
+def cmd_time(q, args):
+    """Set the device clock from the Mac."""
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    value = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    q.request("PUT", "/system/configs/datetime", {"value": value})
+    print(f"device clock set to {value}")
+    tz = (q.request("GET", "/system/configs/timezone") or {}).get("value")
+    mac_tz = mac_timezone_name()
+    print(f"device timezone {tz}, Mac timezone {mac_tz}")
+    try:
+        from zoneinfo import ZoneInfo
+        dev_off = now.astimezone(ZoneInfo(tz)).utcoffset()
+    except Exception:
+        return
+    mac_off = now.astimezone().utcoffset()
+    if dev_off != mac_off:
+        hours = (mac_off - dev_off).total_seconds() / 3600
+        print(f"note: the device shows {abs(hours):g} h {'behind' if hours > 0 else 'ahead of'} "
+              f"the Mac's local time because its timezone differs; change it in the "
+              f"QUADERNO's own settings")
+
+
+# --------------------------------------------------------------------------
+# sync (one-way, device -> Mac)
+# --------------------------------------------------------------------------
+
+SYNC_STATE = ".quaderno-sync.json"
+
+
+def cmd_sync(q, args):
+    """Mirror a device folder into a local directory, downloading only what changed.
+
+    State (entry id -> local path, file_revision, size, mtime) lives in
+    LOCAL/.quaderno-sync.json. A local file is only replaced, moved or deleted if it
+    is still exactly as sync left it; anything else is kept and reported."""
+    root = os.path.abspath(os.path.expanduser(args.local))
+    remote = q.resolve(args.remote)
+    if remote["entry_type"] != "folder":
+        raise QuadernoError(f"{remote['entry_path']} is not a folder")
+    remote_path = remote["entry_path"].rstrip("/")
+    state_path = os.path.join(root, SYNC_STATE)
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            state = json.load(f)
+        if state.get("remote") != remote_path:
+            raise QuadernoError(f"{root} mirrors {state.get('remote')}, not {remote_path}")
+    else:
+        if os.path.isdir(root) and os.listdir(root) and not args.force:
+            raise QuadernoError(f"{root} is not empty and has no sync state; use an empty "
+                                "directory, or --force to sync into it without touching "
+                                "existing files")
+        state = {"remote": remote_path, "entries": {}}
+    entries = state["entries"]
+    dry = args.dry_run
+    stats = {"new": 0, "updated": 0, "moved": 0, "unchanged": 0, "kept": 0,
+             "deleted": 0, "gone": 0, "conflict": 0}
+
+    def save():
+        if dry:
+            return
+        tmp = state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, state_path)
+
+    def local_of(rel):
+        return os.path.join(root, *rel.split("/"))
+
+    def pristine(rec):
+        """True if the local copy is exactly what sync last wrote."""
+        try:
+            st = os.stat(local_of(rec["path"]))
+        except OSError:
+            return False
+        return st.st_size == rec["size"] and int(st.st_mtime) == rec["mtime"]
+
+    def act(tag, text):
+        print(f"{'(dry run) ' if dry else ''}{tag:7} {text}")
+
+    if not dry:
+        os.makedirs(root, exist_ok=True)
+    prefix = remote_path + "/"
+    seen, planned = set(), {}
+    for e in q.walk(remote):
+        path = e["entry_path"].rstrip("/")
+        if not path.startswith(prefix):
+            continue
+        rel = "/".join(safe_local_name(p) for p in path[len(prefix):].split("/"))
+        key = nfc(rel).casefold()  # macOS volumes are usually case-insensitive
+        if key in planned:
+            stats["conflict"] += 1
+            act("CLASH", f"{rel} (same local name as {planned[key]}; skipped)")
+            continue
+        planned[key] = rel
+        target = local_of(rel)
+        if e["entry_type"] == "folder":
+            if not dry:
+                os.makedirs(target, exist_ok=True)
+            continue
+
+        eid, rev = e["entry_id"], e.get("file_revision")
+        seen.add(eid)
+        old = entries.get(eid)
+        if old and old["rev"] == rev and pristine(old):
+            if old["path"] == rel:
+                stats["unchanged"] += 1
+                continue
+            if not os.path.exists(target):  # moved/renamed on the device
+                act("move", f"{old['path']} -> {rel}")
+                if not dry:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    os.replace(local_of(old["path"]), target)
+                    old["path"] = rel
+                    save()
+                stats["moved"] += 1
+                continue
+        if os.path.exists(target) and not (old and old["path"] == rel and pristine(old)):
+            stats["kept"] += 1
+            why = "changed locally" if old and old["path"] == rel else "exists locally, not from sync"
+            act("KEEP", f"{rel} ({why}; device version not downloaded)")
+            continue
+        stats["updated" if old else "new"] += 1
+        act("update" if old else "get", rel)
+        if dry:
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        size = fetch(q, e, target, quiet=True)
+        if old and old["path"] != rel and pristine(old):
+            os.remove(local_of(old["path"]))  # moved and changed: drop the stale copy
+        entries[eid] = {"path": rel, "rev": rev, "size": size,
+                        "mtime": int(os.stat(target).st_mtime)}
+        save()
+
+    for eid in [k for k in entries if k not in seen]:
+        rec = entries[eid]
+        if not args.delete:
+            stats["gone"] += 1
+            act("gone", f"{rec['path']} (deleted on device; kept, use --delete)")
+            continue
+        if pristine(rec):
+            act("delete", rec["path"])
+            if not dry:
+                os.remove(local_of(rec["path"]))
+                d = os.path.dirname(local_of(rec["path"]))
+                while d != root and os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+                    d = os.path.dirname(d)
+            stats["deleted"] += 1
+        else:
+            stats["kept"] += 1
+            act("KEEP", f"{rec['path']} (deleted on device but changed locally)")
+        if not dry:
+            del entries[eid]
+    save()
+    parts = [f"{v} {k}" for k, v in stats.items() if v]
+    print(f"{'(dry run) ' if dry else ''}sync {remote_path} -> {root}: "
+          + (", ".join(parts) or "nothing to do"))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="quaderno", description=__doc__.split("\n")[0])
     ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' (default: auto)")
@@ -1143,6 +1352,24 @@ def main(argv=None):
     p = sub.add_parser("screenshot", help="save a PNG of the current screen")
     p.add_argument("output", nargs="?", default="quaderno-screen.png")
     p.set_defaults(fn=cmd_screenshot)
+
+    p = sub.add_parser("sync", help="mirror a device folder into a local directory (incremental)")
+    p.add_argument("local", help="local directory (created if missing)")
+    p.add_argument("remote", nargs="?", default=ROOT, help="device folder (default: Document)")
+    p.add_argument("--delete", action="store_true",
+                   help="also delete local copies of documents deleted on the device")
+    p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
+    p.add_argument("--force", action="store_true",
+                   help="allow a first sync into a non-empty directory (existing files are kept)")
+    p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("open", help="open a document on the device's screen")
+    p.add_argument("remote")
+    p.add_argument("-p", "--page", type=int, help="page number")
+    p.set_defaults(fn=cmd_open)
+
+    p = sub.add_parser("time", help="set the device clock from the Mac")
+    p.set_defaults(fn=cmd_time)
 
     p = sub.add_parser("addr", help="print the device address (switches USB mode if needed)")
     p.set_defaults(fn=None)

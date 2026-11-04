@@ -16,6 +16,9 @@ Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web AP
 ./quaderno.py mkdir REMOTE... [-p]           create folders; -p creates parents, ok if exists
 ./quaderno.py mv SRC DST                     move or rename a document or folder
 ./quaderno.py rm REMOTE... [-r]              delete documents / empty folders; -r with contents
+./quaderno.py sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
+./quaderno.py open DOC [-p PAGE]             open a document on the device's screen
+./quaderno.py time                           set the device clock from the Mac
 ./quaderno.py info [--json]                  firmware, storage, battery, MAC, owner
 ./quaderno.py screenshot [OUT.png]           PNG of the current screen
 ./quaderno.py addr                           print the device address (switches USB mode if needed)
@@ -48,6 +51,35 @@ How the commands behave:
 - **`put` never overwrites.** If a document with the same name already exists in the target folder, `put` skips it and prints `skip ...` on stderr. This makes `put -r` safe to re-run: it uploads only what's missing. Non-PDF files and hidden files are ignored. A remote folder is created only where at least one PDF will go.
 - **`rm` on a folder only deletes it when it's empty.** `rm -r` deletes the documents first, then the folders from the deepest up. The CLI never sends a delete for a folder that still has contents, because the device's behaviour in that case isn't documented. It refuses to delete or move the root folder.
 - **`get -r` keeps the folder layout.** Partial downloads are written to `*.part` and renamed when complete.
+
+## Sync (device → Mac)
+
+```
+./quaderno.py sync ~/QUADERNO                # whole device
+./quaderno.py sync ~/QUADERNO-notes Note     # one folder
+./quaderno.py sync -n ~/QUADERNO             # dry run: show what would happen
+./quaderno.py sync --delete ~/QUADERNO       # also remove local copies of documents deleted on the device
+```
+
+`sync` copies one way, from the device to the Mac. Each run downloads only documents that are new or changed. It decides by the device's `file_revision`, which changes whenever a document is edited, including handwriting added on the device. Opening or reading a document doesn't change it.
+
+What each run does:
+- **New or edited on the device:** downloaded. The local file's date is set to the device's modification date.
+- **Moved or renamed on the device:** the local file is moved too, without downloading it again.
+- **Deleted on the device:** the local copy is kept and reported as `gone`. It is removed only with `--delete`, and empty folders left behind are removed too.
+- **Missing locally:** downloaded again.
+- **Name clash:** two device names that differ only in letter case would land on the same file on a case-insensitive Mac volume. The second one is skipped and reported as `CLASH`.
+
+**Local files are never overwritten.** `sync` only replaces, moves or deletes a file that is exactly as the last sync left it, checked by size and date. A file you edited, or one that wasn't created by sync, is kept and reported as `KEEP`.
+
+The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors exactly one device folder. A first sync into a non-empty folder needs `--force`, and existing files there are kept.
+
+## open and time
+
+- **`open DOC`** shows the document on the device at the page you last read. `open DOC -p N` opens it at page N. The device reports the new page a few seconds later.
+- **`time`** sets the device clock to the Mac's current time. The PC App does this on every connection; without the app, run it now and then. The device clock can be set but not read.
+
+  The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time.
 
 ## Pairing
 
@@ -106,6 +138,17 @@ When the PC App's credentials are used, there is no stored certificate, so the c
    - `/system/status/*`
 
 AES-128, RSA key generation and PKCS#1 signing are implemented in pure Python. They are checked against the FIPS-197 test vector and against the system's `/usr/bin/openssl`.
+
+## Tests
+
+```
+python3 tests/test_fake.py     # folder commands against an in-memory fake of the device API
+python3 tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
+python3 tests/test_pair.py     # AES/RSA against FIPS-197 and openssl; pairing vs a simulated device
+python3 tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
+```
+
+The first three need no device. `tests/fakedevice.py` replaces only the HTTP layer, so the tests run the CLI's real code.
 
 ## Wi-Fi
 

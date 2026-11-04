@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""In-memory fake of the DPT Web API; runs the real Quaderno methods and CLI commands."""
+"""Folder commands (mkdir -p, put -r, get -r, mv, rm -r) against the in-memory fake device."""
 import io, json, os, re, sys, tempfile, types, uuid
 from urllib.parse import unquote, urlsplit, parse_qs
 
@@ -7,87 +7,7 @@ sys.path.insert(0, sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path
 import quaderno as Q
 
 
-class FakeDevice(Q.Quaderno):
-    def __init__(self):
-        self.addr = "fake"
-        self.e = {"root": {"entry_id": "root", "entry_type": "folder", "entry_name": "Document",
-                           "entry_path": "Document", "parent_folder_id": None}}
-        self.files = {}
-        self.deletes = []
-
-    def _new(self, kind, parent, name):
-        p = self.e[parent]
-        path = p["entry_path"] + "/" + name
-        if any(x["entry_path"] == path for x in self.e.values()):
-            raise Q.QuadernoError("exists", 409)
-        i = uuid.uuid4().hex
-        self.e[i] = {"entry_id": i, "entry_type": kind, "entry_name": name, "entry_path": path,
-                     "parent_folder_id": parent, "file_size": 0}
-        return i
-
-    def _children(self, fid):
-        return [x for x in self.e.values() if x["parent_folder_id"] == fid]
-
-    def _repath(self, i):
-        x = self.e[i]
-        x["entry_path"] = self.e[x["parent_folder_id"]]["entry_path"] + "/" + x["entry_name"]
-        for c in self._children(i):
-            self._repath(c["entry_id"])
-
-    def request(self, method, path, body=None, headers=None, ok=(200, 204), raw=False, stream_to=None):
-        u = urlsplit(path)
-        qs = {k: v[0] for k, v in parse_qs(u.query).items()}
-        p = u.path
-        if method == "GET" and p.startswith("/resolve/entry/"):
-            want = unquote(p[len("/resolve/entry/"):])
-            for x in self.e.values():
-                if x["entry_path"] == want:
-                    return dict(x)
-            raise Q.QuadernoError("404", 404)
-        m = re.fullmatch(r"/folders/([^/]+)/entries", p)
-        if method == "GET" and m:
-            kids = sorted(self._children(m.group(1)), key=lambda x: x["entry_name"])
-            off, lim = int(qs.get("offset", 0)), int(qs.get("limit", 100))
-            lim = min(lim, 2)  # force pagination
-            return {"count": len(kids), "entry_list": [dict(x) for x in kids[off:off + lim]]}
-        if method == "POST" and p == "/folders":
-            return {"folder_id": self._new("folder", body["parent_folder_id"], body["folder_name"])}
-        if method == "POST" and p == "/documents":
-            return {"document_id": self._new("document", body["parent_folder_id"], body["file_name"])}
-        m = re.fullmatch(r"/documents/([^/]+)/file", p)
-        if m and method == "PUT":
-            data = body.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
-            off, total = int(qs["offset_bytes"]), int(qs["total_bytes"])
-            buf = self.files.setdefault(m.group(1), bytearray())
-            assert len(buf) == off
-            buf += data
-            self.e[m.group(1)]["file_size"] = len(buf)
-            done = len(buf) >= total
-            return {"current_bytes": len(buf), "received_bytes": len(data),
-                    "completed": "yes" if done else "no"}
-        if m and method == "GET":
-            stream_to.write(bytes(self.files[m.group(1)]))
-            return len(self.files[m.group(1)])
-        m = re.fullmatch(r"/(documents|folders)/([^/]+)", p)
-        if m and method == "DELETE":
-            i = m.group(2)
-            if m.group(1) == "folders" and self._children(i):
-                raise AssertionError("DELETE sent for NON-EMPTY folder " + self.e[i]["entry_path"])
-            self.deletes.append(self.e[i]["entry_path"])
-            del self.e[i]
-            return None
-        if m and method == "PUT":
-            x = self.e[m.group(2)]
-            x["parent_folder_id"] = body["parent_folder_id"]
-            x["entry_name"] = body.get("file_name") or body.get("folder_name")
-            self._repath(x["entry_id"])
-            return None
-        if m and method == "GET":
-            return dict(self.e[m.group(2)])
-        raise AssertionError(f"unhandled {method} {path}")
-
-    def paths(self):
-        return sorted(x["entry_path"] for x in self.e.values())
+from fakedevice import FakeDevice  # noqa: E402
 
 
 def ns(**kw):
