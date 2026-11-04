@@ -624,8 +624,9 @@ class Quaderno:
 
 
 def norm(path):
-    """Accept 'foo.pdf', '/foo.pdf' or 'Document/foo.pdf'; return 'Document/...'."""
-    p = (path or "").strip().strip("/")
+    """Accept 'foo.pdf', '/foo.pdf' or 'Document/foo.pdf'; return 'Document/...'.
+    Only slashes are trimmed: device names may begin or end with spaces."""
+    p = (path or "").strip("/")
     if p == ROOT or p.startswith(ROOT + "/"):
         return p
     return f"{ROOT}/{p}" if p else ROOT

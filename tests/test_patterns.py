@@ -141,7 +141,21 @@ assert d.opened == [(d._by_path(LONG)["entry_id"], None)]
 expect_error(lambda: run(Q.cmd_open, d, remote="Note/*meeting*", page=None), "matches 2 documents")
 expect_error(lambda: run(Q.cmd_open, d, remote="B*", page=None), "is a folder")
 
-print("9. no match / not found")
+print("9. names with leading/trailing spaces are kept exactly (device folder 'sailing ')")
+d = fresh()
+d.put_doc("Books/sailing /Ocean Passages.pdf", b"op")
+d.put_doc("Books/ leading.pdf", b"lead")
+out = run(Q.cmd_ls, d, path="Books/sailing /", long=False)
+assert out.strip() == "Ocean Passages.pdf", out
+out = run(Q.cmd_ls, d, path="Books/ leading.pdf", long=False)
+assert out.strip() == "leading.pdf" or out.rstrip("\n") == " leading.pdf", repr(out)
+expect_error(lambda: run(Q.cmd_ls, d, path="Books/sailing", long=False), "404")  # no space: different name
+out = run(Q.cmd_ls, d, path="Books/sail*", long=False)
+assert out.strip() == "Document/Books/sailing /", repr(out)
+mkdir = Q.ensure_folder(d, "Books/sailing /Charts")
+assert "Document/Books/sailing /Charts" in d.paths()
+
+print("10. no match / not found")
 expect_error(lambda: run(Q.cmd_ls, d, path="zzz*", long=False), "no match")
 expect_error(lambda: run(Q.cmd_ls, d, path="missing.pdf", long=False), "404")
 print("ALL PATTERN TESTS PASSED")
