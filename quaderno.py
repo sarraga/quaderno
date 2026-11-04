@@ -33,16 +33,17 @@ import hmac
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 APP_DIR = os.path.expanduser(
@@ -401,6 +402,24 @@ def _probe(addr, timeout=1.5):
         return False
 
 
+def _first_reachable(cands, timeout=1.5):
+    """Probe all candidates at once; return the first that accepts a connection.
+    Daemon threads, so probes still waiting on other interfaces never delay exit
+    (a thread pool would make the interpreter wait up to `timeout` at shutdown)."""
+    results = queue.Queue()
+    for a in cands:
+        threading.Thread(target=lambda a=a: results.put((a, _probe(a, timeout))),
+                         daemon=True).start()
+    for _ in cands:
+        try:
+            a, ok = results.get(timeout=timeout + 1)
+        except queue.Empty:
+            return None
+        if ok:
+            return a
+    return None
+
+
 def discover(serial_hint=None, verbose=False):
     """Find the device's scoped IPv6 address, switching USB mode if needed."""
     devs = usb_devices()
@@ -419,14 +438,9 @@ def discover(serial_hint=None, verbose=False):
     ifaces = [n for _, n in socket.if_nameindex() if n.startswith("en")]
     while True:
         cands = [f"{ipv6_from_serial(s)}%{i}" for s in serials for i in ifaces]
-        ex = ThreadPoolExecutor(max_workers=16)
-        futs = {ex.submit(_probe, a): a for a in cands}
-        try:
-            for f in as_completed(futs):
-                if f.result():
-                    return futs[f]
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+        found = _first_reachable(cands)
+        if found:
+            return found
         if time.time() > deadline:
             break
         time.sleep(1)
@@ -1450,7 +1464,41 @@ def cmd_sync(q, args):
           + (", ".join(parts) or "nothing to do"))
 
 
+def complete(argv):
+    """`quaderno __complete [--dirs] [--] PREFIX`: print device paths for shell tab
+    completion, one per line, folders ending in '/'. Lists the folder PREFIX is in,
+    keeping the folder part exactly as typed. Never prints errors; prints nothing
+    when the device isn't connected."""
+    dirs_only = "--dirs" in argv
+    words = [a for a in argv if a not in ("--dirs", "--")]
+    prefix = words[0] if words else ""
+    try:
+        addr = os.environ.get("QUADERNO_ADDR")
+        if not addr and not usb_devices():
+            return 0  # unplugged: answer instantly instead of waiting for discovery
+        cred_dir = find_credentials(None)
+        client_id, key, serial = load_credentials(cred_dir)
+        q = Quaderno(addr or discover(serial), client_id, key, timeout=5,
+                     pinned_cert=load_pinned_cert(cred_dir))
+        q.authenticate()
+        typed_dir, sep, _ = prefix.rpartition("/")
+        folder = q.resolve(typed_dir)
+        if folder["entry_type"] != "folder":
+            return 0
+        for e in sorted(q.entries(folder["entry_id"]), key=lambda e: e["entry_name"].lower()):
+            is_dir = e["entry_type"] == "folder"
+            if dirs_only and not is_dir:
+                continue
+            print(typed_dir + sep + e["entry_name"] + ("/" if is_dir else ""))
+    except (QuadernoError, OSError, ValueError, KeyError):
+        pass
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["__complete"]:
+        return complete(argv[1:])
     ap = argparse.ArgumentParser(prog="quaderno", description=__doc__.split("\n")[0])
     ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' (default: auto)")
     ap.add_argument("--workspace", help="credentials dir (default: ~/.config/quaderno, "

@@ -23,6 +23,32 @@ There are no dependencies. `./quaderno.py` also works directly, without the venv
 ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
 ```
 
+### Tab completion (zsh)
+
+`completions/_quaderno` completes subcommands, options, local files, and **paths on the device**. Paths are fetched live from the device, about 0.4 s per Tab:
+
+```
+quaderno ls Bo⇥                      ->  quaderno ls Books/
+quaderno get Books/milit⇥            ->  quaderno get Books/Military\ History/
+quaderno put x.pdf -d Books/Mil⇥     ->  only folders are offered after -d
+quaderno mv 'Books/Fight⇥            ->  quoting is handled, inside quotes or with \
+```
+
+How it behaves:
+- **Folders** complete with a trailing `/` and no space, so pressing Tab again goes one level deeper.
+- **Letter case** is ignored in the part you're completing.
+- **Patterns** containing `*`, `?` or `[` are left untouched.
+- **With the device unplugged**, nothing is offered, without any delay.
+
+To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
+
+```
+fpath=(~/quaderno/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+`compinit` turns on zsh's completion system for every command, not just this one. If your `~/.zshrc` already runs it, add only the `fpath` line, above it.
+
 ## Usage
 
 ```
@@ -194,6 +220,7 @@ python3 tests/test_sync.py     # sync: edits, moves, deletes, local changes, nam
 python3 tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
 python3 tests/test_pair.py     # AES/RSA against FIPS-197 and openssl; pairing vs a simulated device
 python3 tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
+zsh tests/hw_zsh_completion.zsh    # manual: presses Tab in a real zsh against the device
 ```
 
 The first three need no device. `tests/fakedevice.py` replaces only the HTTP layer, so the tests run the CLI's real code.

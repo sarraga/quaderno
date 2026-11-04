@@ -1,0 +1,121 @@
+#compdef quaderno
+# zsh completion for quaderno: subcommands, options, local files, and paths on the
+# device (asked live from the device via `quaderno __complete`, ~0.4 s per Tab).
+
+# Device paths; folders end in '/' and take no trailing space so Tab can descend.
+# $1 = "dirs" (folders only) or "all"; options _arguments appends after it are ignored.
+_quaderno_device_paths() {
+  local kind=$1
+  local typed=${(Q)PREFIX}
+  [[ $typed == *[\*\?\[]* ]] && return 1        # a glob pattern: nothing to complete
+  local -a lines dirs docs ddisp fdisp expl flag
+  [[ $kind == dirs ]] && flag=(--dirs)
+  lines=("${(@f)$(quaderno __complete $flag -- "$typed" 2>/dev/null)}")
+  local l
+  for l in $lines; do
+    [[ -z $l ]] && continue
+    if [[ $l == */ ]]; then
+      dirs+=("$l"); ddisp+=("${${l%/}:t}/")
+    else
+      docs+=("$l"); fdisp+=("${l:t}")
+    fi
+  done
+  local m='m:{[:lower:][:upper:]}={[:upper:][:lower:]}'   # match case-insensitively
+  local ret=1
+  (( $#dirs )) && _wanted device-folders expl 'device folder' \
+    compadd -M "$m" -S '' -d ddisp -- "${dirs[@]}" && ret=0
+  if [[ $kind != dirs ]] && (( $#docs )); then
+    _wanted device-documents expl 'device document' \
+      compadd -M "$m" -d fdisp -- "${docs[@]}" && ret=0
+  fi
+  return ret
+}
+
+_quaderno_remote() { _quaderno_device_paths all }
+_quaderno_remote_dirs() { _quaderno_device_paths dirs }
+
+_quaderno() {
+  local curcontext=$curcontext state line ret=1
+  typeset -A opt_args
+  local -a cmds regex
+  cmds=(
+    'ls:list a folder'
+    'get:download documents (folders with -r)'
+    'put:upload PDFs (directories with -r)'
+    'mkdir:create folders'
+    'mv:move or rename documents/folders'
+    'rm:delete documents or folders'
+    'sync:mirror a device folder to the Mac'
+    'open:open a document on the device screen'
+    'time:set the device clock from the Mac'
+    'info:firmware, storage, battery'
+    'screenshot:save the device screen as PNG'
+    'addr:print the device address'
+    'pair:pair with the device (PIN on its screen)'
+  )
+  regex=('(-E --regex)'{-E,--regex}'[remote paths are regular expressions]')
+
+  _arguments -C \
+    '(- *)'{-h,--help}'[show help]' \
+    '--addr=[device address]:address' \
+    '--workspace=[credentials directory]:directory:_files -/' \
+    '(-v --verbose)'{-v,--verbose}'[print credentials, address, TLS mode]' \
+    '1:command:->cmd' \
+    '*::argument:->args' && ret=0
+
+  case $state in
+    cmd) _describe -t commands 'quaderno command' cmds && ret=0 ;;
+    args)
+      curcontext=${curcontext%:*:*}:quaderno-$words[1]:
+      case $words[1] in
+        ls)
+          _arguments $regex \
+            '(-l --long)'{-l,--long}'[size, date, pages]' \
+            '(-R --recursive)'{-R,--recursive}'[list subfolders too]' \
+            '1::device path:_quaderno_remote' && ret=0 ;;
+        get)
+          _arguments $regex \
+            '(-r --recursive)'{-r,--recursive}'[download folders]' \
+            '(-o --output)'{-o,--output}'[local file or directory]:local path:_files' \
+            '*:device path:_quaderno_remote' && ret=0 ;;
+        put)
+          _arguments \
+            '(-r --recursive)'{-r,--recursive}'[upload directories]' \
+            '(-d --dest)'{-d,--dest}'[device folder, or new name ending in .pdf]:device folder:_quaderno_remote_dirs' \
+            '*:local file:_files' && ret=0 ;;
+        mkdir)
+          _arguments \
+            '(-p --parents)'{-p,--parents}'[create missing parents]' \
+            '*:device folder:_quaderno_remote_dirs' && ret=0 ;;
+        mv)
+          _arguments $regex '*:device path:_quaderno_remote' && ret=0 ;;
+        rm)
+          _arguments $regex \
+            '(-r --recursive)'{-r,--recursive}'[delete folders with their contents]' \
+            '(-y --yes)'{-y,--yes}'[do not ask before deleting pattern matches]' \
+            '*:device path:_quaderno_remote' && ret=0 ;;
+        sync)
+          _arguments \
+            '--delete[remove local copies of documents deleted on the device]' \
+            '(-n --dry-run)'{-n,--dry-run}'[show what would happen]' \
+            '--force[allow a first sync into a non-empty directory]' \
+            '1:local directory:_files -/' \
+            '2::device folder:_quaderno_remote_dirs' && ret=0 ;;
+        open)
+          _arguments $regex \
+            '(-p --page)'{-p,--page}'[page number]:page' \
+            '1:device document:_quaderno_remote' && ret=0 ;;
+        info)
+          _arguments '--json[JSON output]' && ret=0 ;;
+        screenshot)
+          _arguments '1::output PNG:_files -g "*.png"' && ret=0 ;;
+        pair)
+          _arguments '--force[replace an existing pairing]' \
+            '--pin-file[read the PIN from this file]:file:_files' && ret=0 ;;
+        time|addr) ret=0 ;;
+      esac ;;
+  esac
+  return ret
+}
+
+_quaderno "$@"
