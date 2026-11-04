@@ -1020,10 +1020,12 @@ def put_file(q, local, folder_id, folder_path, name, existing):
 def put_tree(q, local_dir, remote_path):
     """Mirror local_dir into remote_path (created as needed). Only PDFs are sent;
     folders are created only where there is a PDF at or below them."""
-    plan = []
+    plan, ignored = [], 0
     for root, dirs, files in os.walk(local_dir):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
-        pdfs = sorted(f for f in files if f.lower().endswith(".pdf") and not f.startswith("."))
+        visible = [f for f in files if not f.startswith(".")]
+        pdfs = sorted(f for f in visible if f.lower().endswith(".pdf"))
+        ignored += len(visible) - len(pdfs)
         if pdfs:
             rel = os.path.relpath(root, local_dir)
             sub_path = remote_path if rel == "." else \
@@ -1039,38 +1041,54 @@ def put_tree(q, local_dir, remote_path):
                 uploaded += 1
             else:
                 skipped += 1
-    print(f"{uploaded} uploaded, {skipped} skipped -> {remote_path}")
+    extra = f", {ignored} non-PDF ignored" if ignored else ""
+    print(f"{uploaded} uploaded, {skipped} skipped{extra} -> {remote_path}")
 
 
 def cmd_put(q, args):
+    """Upload what can be uploaded; anything else gets a `skip` line on stderr.
+    Exit status is 1 only if a named local file does not exist."""
     target = norm(args.remote) if args.remote else ROOT
     dest = try_resolve(q, target)
-    for local in args.local:
-        if os.path.isdir(local) and not args.recursive:
-            raise QuadernoError(f"{local} is a directory (use -r)")
-        if not os.path.isdir(local) and not local.lower().endswith(".pdf"):
-            raise QuadernoError(f"{local}: only PDF files are supported")
     if dest is not None and dest["entry_type"] != "folder":
         raise QuadernoError(f"{target} already exists")
+    if dest is None and len(args.local) > 1:
+        raise QuadernoError(f"{target} is not a folder")
+    items, missing = [], 0
+    for local in args.local:
+        if os.path.isdir(local):
+            if args.recursive:
+                items.append(local)
+            else:
+                print(f"skip {local}: is a directory (use -r)", file=sys.stderr)
+        elif not os.path.exists(local):
+            print(f"skip {local}: no such file", file=sys.stderr)
+            missing += 1
+        elif not local.lower().endswith(".pdf"):
+            print(f"skip {local}: not a PDF", file=sys.stderr)
+        else:
+            items.append(local)
+    if not items:
+        print("nothing to upload", file=sys.stderr)
+        return 1 if missing else None
     if dest is None:
         # Target does not exist: it is the new name for a single file or directory.
-        if len(args.local) > 1:
-            raise QuadernoError(f"{target} is not a folder")
-        local = args.local[0]
+        local = items[0]
         if os.path.isdir(local):
             put_tree(q, local, target)
         else:
             parent, name = target.rsplit("/", 1)
             put_file(q, local, q.resolve(parent)["entry_id"], parent, name, set())
-        return
+        return 1 if missing else None
     existing = {nfc(e["entry_name"]) for e in q.entries(dest["entry_id"])}
-    for local in args.local:
+    for local in items:
         if os.path.isdir(local):
             name = nfc(os.path.basename(os.path.normpath(local)))
             put_tree(q, local, f"{dest['entry_path']}/{name}")
         else:
             put_file(q, local, dest["entry_id"], dest["entry_path"],
                      os.path.basename(local), existing)
+    return 1 if missing else None
 
 
 def delete_empty_folder(q, e):
@@ -1509,8 +1527,7 @@ def main(argv=None):
             print(args.addr or discover(serial, args.verbose))
             return 0
         q = connect(args)
-        args.fn(q, args)
-        return 0
+        return args.fn(q, args) or 0
     except QuadernoError as err:
         print(f"quaderno: {err}", file=sys.stderr)
         return 1

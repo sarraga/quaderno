@@ -59,7 +59,27 @@ Q.cmd_put(d, ns(local=[src], remote="T", recursive=True))
 print("put -r to new path (rename dir)")
 Q.cmd_put(d, ns(local=[src], remote="T/copy2", recursive=True))
 assert "Document/T/copy2/sub/b.pdf" in d.paths()
-expect_error(lambda: Q.cmd_put(d, ns(local=[src], remote="T", recursive=False)), "use -r")
+print("put with bad arguments mixed in: skip each with a stderr line, upload the rest")
+import contextlib  # noqa: E402
+epub = os.path.join(tmp, "book.epub")
+open(epub, "w").write("not a pdf")
+good = os.path.join(tmp, "good.pdf")
+mkpdf(good, "G")
+err, out = io.StringIO(), io.StringIO()
+with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+    rc = Q.cmd_put(d, ns(local=[epub, good, src, os.path.join(tmp, "missing.pdf")],
+                         remote="T", recursive=False))
+print("  ", err.getvalue().strip().replace("\n", "\n   "))
+assert "Document/T/good.pdf" in d.paths()
+for frag in ("book.epub: not a PDF", "src: is a directory (use -r)", "missing.pdf: no such file"):
+    assert frag in err.getvalue(), frag
+assert rc == 1  # a named file was missing
+with contextlib.redirect_stderr(io.StringIO()):
+    assert Q.cmd_put(d, ns(local=[epub], remote="T", recursive=False)) is None  # only a skip: exit 0
+print("put -r reports non-PDFs it ignored inside folders")
+with contextlib.redirect_stdout(out):
+    Q.cmd_put(d, ns(local=[src], remote="T/copy3", recursive=True))
+assert "2 non-PDF ignored" in out.getvalue(), out.getvalue()
 
 print("get -r")
 out = os.path.join(tmp, "out")
