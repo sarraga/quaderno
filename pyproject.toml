@@ -1,0 +1,17 @@
+[project]
+name = "quaderno"
+version = "0.1.0"
+description = "Command-line client for the Fujitsu QUADERNO e-paper tablet over USB"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+quaderno = "quaderno:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["quaderno"]

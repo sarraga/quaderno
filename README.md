@@ -6,6 +6,19 @@ It pairs with the device by itself and does not need the QUADERNO PC App.
 
 Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2, Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) works with the PC App closed.
 
+## Install
+
+It's set up the same way as `ytchan`: a pyproject package installed in editable mode into its own `.venv`, so changes to `quaderno.py` take effect immediately.
+
+```
+cd ~/quaderno
+/opt/homebrew/opt/python@3.14/bin/python3.14 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/quaderno --help
+```
+
+There are no dependencies. `./quaderno.py` also works directly, without the venv. To run plain `quaderno` from anywhere, link it into a folder on your PATH, for example `ln -s ~/quaderno/.venv/bin/quaderno ~/.local/bin/`.
+
 ## Usage
 
 ```
