@@ -570,6 +570,17 @@ class Quaderno:
                            {"parent_folder_id": folder_id, "file_name": name,
                             "document_source": ""})
         doc_id = doc["document_id"]
+        try:
+            return self._upload_file(local, doc_id)
+        except BaseException:
+            # POST created an entry; don't leave an empty/partial document behind.
+            try:
+                self.request("DELETE", f"/documents/{doc_id}")
+            except (QuadernoError, OSError):
+                print(f"warning: could not remove the incomplete upload {name}", file=sys.stderr)
+            raise
+
+    def _upload_file(self, local, doc_id):
         size = os.path.getsize(local)
         with open(local, "rb") as fh:
             offset = 0
@@ -1045,6 +1056,18 @@ def put_tree(q, local_dir, remote_path):
     print(f"{uploaded} uploaded, {skipped} skipped{extra} -> {remote_path}")
 
 
+def no_such_folder(q, target):
+    """Error for a -d folder that doesn't exist, suggesting folders with that name."""
+    name = nfc(target.rsplit("/", 1)[-1]).casefold()
+    hits = [e["entry_path"].rstrip("/") for e in q.walk(q.resolve(ROOT))
+            if e["entry_type"] == "folder" and nfc(e["entry_name"]).casefold() == name]
+    msg = (f"there is no folder {target} on the device; create it with `quaderno mkdir`, "
+           "or give a new file name ending in .pdf")
+    if hits:
+        msg += "\ndid you mean: " + ", ".join(repr(h[len(ROOT) + 1:]) for h in hits[:5])
+    return QuadernoError(msg, 404)
+
+
 def cmd_put(q, args):
     """Upload what can be uploaded; anything else gets a `skip` line on stderr.
     Exit status is 1 only if a named local file does not exist."""
@@ -1053,7 +1076,7 @@ def cmd_put(q, args):
     if dest is not None and dest["entry_type"] != "folder":
         raise QuadernoError(f"{target} already exists")
     if dest is None and len(args.local) > 1:
-        raise QuadernoError(f"{target} is not a folder")
+        raise no_such_folder(q, target)
     items, missing = [], 0
     for local in args.local:
         if os.path.isdir(local):
@@ -1077,6 +1100,8 @@ def cmd_put(q, args):
         if os.path.isdir(local):
             put_tree(q, local, target)
         else:
+            if not target.lower().endswith(".pdf"):
+                raise no_such_folder(q, target)  # almost always a mistyped/missing folder
             parent, name = target.rsplit("/", 1)
             put_file(q, local, q.resolve(parent)["entry_id"], parent, name, set())
         return 1 if missing else None

@@ -104,4 +104,30 @@ expect_error(lambda: Q.cmd_rm(d, ns(remote=["/"], recursive=True)), "root")
 print("rm -r")
 Q.cmd_rm(d, ns(remote=["T"], recursive=True))
 assert d.paths() == ["Document"], d.paths()
+print("put -d to a folder that doesn't exist: clear error with suggestions, nothing created")
+d2 = FakeDevice()
+d2.mkdirs("Books/Military History")
+book = os.path.join(tmp, "Submarine Torpedo Tactics - Edward Monroe Jones & Shawn S. Roderick.pdf")
+mkpdf(book, "sub")
+before = d2.paths()
+with contextlib.redirect_stdout(io.StringIO()):
+    expect_error(lambda: Q.cmd_put(d2, ns(local=[book], remote="Military History", recursive=False)),
+                 "did you mean: 'Books/Military History'")
+    expect_error(lambda: Q.cmd_put(d2, ns(local=[book, good], remote="Military History",
+                                          recursive=False)), "no folder Document/Military History")
+assert d2.paths() == before
+print("...the full folder path works, & and . in the name are fine")
+with contextlib.redirect_stdout(io.StringIO()):
+    Q.cmd_put(d2, ns(local=[book], remote="Books/Military History", recursive=False))
+assert f"Document/Books/Military History/{os.path.basename(book)}" in d2.paths()
+print("...a new name ending in .pdf still renames on upload")
+with contextlib.redirect_stdout(io.StringIO()):
+    Q.cmd_put(d2, ns(local=[good], remote="Books/renamed.pdf", recursive=False))
+assert "Document/Books/renamed.pdf" in d2.paths()
+
+print("failed upload removes the half-created document")
+d2.fail_upload = True
+before = d2.paths()
+expect_error(lambda: Q.cmd_put(d2, ns(local=[good], remote="Books", recursive=False)), "simulated failure")
+assert d2.paths() == before, set(d2.paths()) ^ set(before)
 print("ALL FAKE-DEVICE TESTS PASSED")

@@ -89,6 +89,12 @@ How matching works:
 
 How the commands behave:
 - **`put` never overwrites.** If a document with the same name already exists in the target folder, `put` skips it and prints `skip ...` on stderr. This makes `put -r` safe to re-run: it uploads only what's missing. A remote folder is created only where at least one PDF will go.
+- **What `-d` means depends on what exists.**
+  - If `-d` names an existing folder, the files go into it.
+  - If it names something that doesn't exist and ends in `.pdf`, that becomes the uploaded file's new name.
+  - Otherwise `put` stops before uploading anything and suggests folders with that name, for example `did you mean: 'Books/Military History'`. Use the full path from the top (`-d 'Books/Military History'`), or create the folder with `mkdir`.
+  - With `put -r` and a single folder, a `-d` folder that doesn't exist yet is created.
+- **A failed upload leaves nothing behind.** If an upload fails partway, the half-created document is deleted from the device.
 - **`put` skips what it can't upload and carries on.** Each file or folder you name that can't be uploaded gets a `skip` line on stderr: not a PDF, a folder without `-r`, or a file that doesn't exist. Everything else is still uploaded. So `put -r dir/* -d DEST` works even when `dir` mixes PDFs and EPUBs. Inside folders uploaded with `-r`, non-PDF files are left out silently and counted in the summary line (`… 2 non-PDF ignored`); hidden files are ignored and not counted. The exit status is 1 only if a file you named doesn't exist.
 - **`rm` on a folder only deletes it when it's empty.** `rm -r` deletes the documents first, then the folders from the deepest up. The CLI never sends a delete for a folder that still has contents, because the device's behaviour in that case isn't documented. It refuses to delete or move the root folder.
 - **`get -r` keeps the folder layout.** Partial downloads are written to `*.part` and renamed when complete.

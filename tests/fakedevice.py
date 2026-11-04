@@ -22,6 +22,7 @@ class FakeDevice(Q.Quaderno):
         self.deletes = []
         self.downloads = 0
         self.opened = []
+        self.fail_upload = False  # make PUT /documents/{id}/file fail, to test cleanup
         self.clock = 1_700_000_000
 
     # --- helpers for tests ---------------------------------------------------
@@ -118,9 +119,14 @@ class FakeDevice(Q.Quaderno):
         if method == "POST" and p == "/folders":
             return {"folder_id": self._new("folder", body["parent_folder_id"], body["folder_name"])}
         if method == "POST" and p == "/documents":
+            if not body["file_name"].lower().endswith(".pdf"):  # what the real device answers
+                raise Q.QuadernoError("POST /documents -> HTTP 400: 40006 The value of a parameter "
+                                      "is invalid format. Bad parameter : fileName(unsupported)", 400)
             return {"document_id": self._new("document", body["parent_folder_id"], body["file_name"])}
         m = re.fullmatch(r"/documents/([^/]+)/file", p)
         if m and method == "PUT":
+            if self.fail_upload:
+                raise Q.QuadernoError("PUT -> HTTP 500: simulated failure", 500)
             data = body.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
             off, total = int(qs["offset_bytes"]), int(qs["total_bytes"])
             buf = self.files.setdefault(m.group(1), bytearray())
