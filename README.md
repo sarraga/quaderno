@@ -17,7 +17,11 @@ cd ~/quaderno
 .venv/bin/quaderno --help
 ```
 
-There are no dependencies. `./quaderno.py` also works directly, without the venv. To run plain `quaderno` from anywhere, link it into a folder on your PATH, for example `ln -s ~/quaderno/.venv/bin/quaderno ~/.local/bin/`.
+There are no dependencies. `./quaderno.py` also works directly, without the venv. To run plain `quaderno` from anywhere, link it into a folder on your PATH. On this Mac that folder is `~/bin`:
+
+```
+ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
+```
 
 ## Usage
 
