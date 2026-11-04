@@ -11,6 +11,10 @@ from fakedevice import FakeDevice  # noqa: E402
 
 
 def ns(**kw):
+    kw.setdefault("regex", False)
+    kw.setdefault("yes", False)
+    if isinstance(kw.get("src"), str):
+        kw["src"] = [kw["src"]]
     return types.SimpleNamespace(**kw)
 
 

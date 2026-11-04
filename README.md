@@ -31,8 +31,8 @@ ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
 ./quaderno.py get REMOTE... [-o DEST] [-r]   download documents; -r for whole folders
 ./quaderno.py put LOCAL... [-d DEST] [-r]    upload PDFs; -r for local directories
 ./quaderno.py mkdir REMOTE... [-p]           create folders; -p creates parents, ok if exists
-./quaderno.py mv SRC DST                     move or rename a document or folder
-./quaderno.py rm REMOTE... [-r]              delete documents / empty folders; -r with contents
+./quaderno.py mv SRC... DST                  move/rename; several sources -> into folder DST
+./quaderno.py rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
 ./quaderno.py sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
 ./quaderno.py open DOC [-p PAGE]             open a document on the device's screen
 ./quaderno.py time                           set the device clock from the Mac
@@ -63,6 +63,29 @@ The device has a single tree rooted at the folder `Document`. Remote paths are r
 ./quaderno.py mv Books/2026 Books/Twenty26            # rename
 ./quaderno.py rm -r Books/Old
 ```
+
+### Patterns
+
+`ls`, `get`, `mv`, `rm` and `open` accept patterns in remote paths, so you don't have to type long names. **Quote patterns** so your shell doesn't try to expand them against files on the Mac (zsh fails with `no matches found`).
+
+```
+quaderno ls 'fighter*'                    # glob: * ? [abc]; letter case is ignored
+quaderno mv 'Fighter*' Books              # move the long-named book into Books
+quaderno mv 'Note/2024-0[56]*' Archive    # several matches -> DST must be an existing folder
+quaderno get 'Note/*meeting*' -o ~/Downloads
+quaderno ls '*/sample_*'                  # patterns work in any part of the path
+quaderno ls -E 'naval institute'          # -E: regular expression, matched anywhere in the name
+quaderno open -E '^dhs660'
+quaderno rm 'Received/*'                  # lists the matches and asks first; -y skips the question
+```
+
+How matching works:
+- **An exact path always wins.** If `weird [draft].pdf` exists, it is used as-is. Otherwise the `[...]` would be read as a glob character class.
+- **Patterns match one level at a time.** `*` doesn't cross a `/`.
+- **A matched folder is listed itself.** `ls 'B*'` shows the folder `Books/`, not what's in it; add `-R` to list its contents too.
+- **`open` needs exactly one match.** Otherwise it lists the candidates.
+- **`rm` checks before deleting.** With a pattern, it shows what matched and asks. Without a terminal, it refuses unless you pass `--yes`. All checks, such as non-empty folders without `-r`, happen before anything is deleted.
+- **`-E` regex mode** uses Python syntax, ignores letter case, and matches anywhere in the name; anchor with `^` and `$` when you need to. It can't match across a `/`.
 
 How the commands behave:
 - **`put` never overwrites.** If a document with the same name already exists in the target folder, `put` skips it and prints `skip ...` on stderr. This makes `put -r` safe to re-run: it uploads only what's missing. Non-PDF files and hidden files are ignored. A remote folder is created only where at least one PDF will go.
@@ -161,6 +184,7 @@ AES-128, RSA key generation and PKCS#1 signing are implemented in pure Python. T
 ```
 python3 tests/test_fake.py     # folder commands against an in-memory fake of the device API
 python3 tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
+python3 tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
 python3 tests/test_pair.py     # AES/RSA against FIPS-197 and openssl; pairing vs a simulated device
 python3 tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
 ```

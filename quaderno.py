@@ -25,6 +25,7 @@ import argparse
 import base64
 import calendar
 import datetime
+import fnmatch
 import glob
 import hashlib
 import http.client
@@ -634,6 +635,66 @@ def ensure_folder(q, path):
     return folder_id
 
 
+_GLOB_CHARS = frozenset("*?[")
+
+
+def _is_pattern(component, regex):
+    return regex or any(c in component for c in _GLOB_CHARS)
+
+
+def _matcher(pattern, regex):
+    """Case-insensitive name matcher: shell glob, or (with -E) a regex searched in the name."""
+    if regex:
+        try:
+            rx = re.compile(nfc(pattern), re.IGNORECASE)
+        except re.error as err:
+            raise QuadernoError(f"bad regular expression {pattern!r}: {err}")
+        return lambda name: rx.search(nfc(name)) is not None
+    pat = nfc(pattern).casefold()
+    return lambda name: fnmatch.fnmatchcase(nfc(name).casefold(), pat)
+
+
+def expand(q, pattern, regex=False):
+    """Resolve a remote path whose components may be glob patterns (or regexes with
+    -E). An exact name always wins over a pattern, so names containing * ? [ still
+    work literally. Returns (entries sorted by path, matched_by_pattern)."""
+    path = norm(pattern)
+    exact = try_resolve(q, path)
+    if exact is not None:
+        return [exact], False
+    parts = path.split("/")[1:]
+    if not any(_is_pattern(p, regex) for p in parts):
+        q.resolve(path)  # not found and not a pattern: raise the device's 404
+    current = [q.resolve(ROOT)]
+    for i, part in enumerate(parts):
+        found = []
+        for folder in current:
+            literal = try_resolve(q, folder["entry_path"].rstrip("/") + "/" + part)
+            if literal is not None:
+                found.append(literal)
+            elif _is_pattern(part, regex):
+                match = _matcher(part, regex)
+                found += [c for c in q.entries(folder["entry_id"]) if match(c["entry_name"])]
+        last = i == len(parts) - 1
+        current = found if last else [x for x in found if x["entry_type"] == "folder"]
+        if not current:
+            raise QuadernoError(f"no match for {pattern!r}", 404)
+    return sorted(current, key=lambda x: x["entry_path"].lower()), True
+
+
+def expand_all(q, patterns, regex=False):
+    """expand() several arguments; de-duplicated. Returns (entries, any_pattern)."""
+    seen, out, any_pattern = set(), [], False
+    for p in patterns:
+        entries, by_pattern = expand(q, p, regex)
+        any_pattern |= by_pattern
+        for e in entries:
+            if e["entry_id"] not in seen:
+                seen.add(e["entry_id"])
+                out.append(e)
+    return out, any_pattern
+
+
 def safe_local_name(name):
     """Device names become local path components; reject anything that could escape."""
     if name in ("", ".", "..") or "/" in name or "\0" in name:
@@ -853,16 +914,22 @@ def cmd_pair(args):
 
 
 def cmd_ls(q, args):
-    entry = q.resolve(args.path)
-    if entry["entry_type"] != "folder":
-        rows = [entry]
-    elif args.recursive:
-        rows = list(q.walk(entry))
-    else:
-        rows = q.entries(entry["entry_id"])
-    rows.sort(key=lambda e: (e["entry_type"] != "folder", e["entry_path"].lower()))
+    matches, by_pattern = expand(q, args.path, args.regex)
+    rows = {}
+    for entry in matches:
+        if entry["entry_type"] != "folder":
+            rows[entry["entry_id"]] = entry
+            continue
+        if by_pattern:  # a matched folder is listed itself, like `ls -d`
+            rows[entry["entry_id"]] = entry
+            if not args.recursive:
+                continue
+        for e in (q.walk(entry) if args.recursive else q.entries(entry["entry_id"])):
+            rows[e["entry_id"]] = e
+    rows = sorted(rows.values(), key=lambda e: (e["entry_type"] != "folder", e["entry_path"].lower()))
+    full_path = args.recursive or by_pattern
     for e in rows:
-        name = e["entry_path"] if args.recursive else e["entry_name"]
+        name = e["entry_path"].rstrip("/") if full_path else e["entry_name"]
         if e["entry_type"] == "folder":
             name += "/"
         if args.long:
@@ -920,14 +987,17 @@ def get_tree(q, folder, dest):
 
 def cmd_get(q, args):
     dest = args.output or "."
-    many = len(args.remote) > 1 or args.recursive
-    if many:
+    targets, _ = expand_all(q, args.remote, args.regex)
+    if not args.recursive:
+        folders = [e["entry_path"] for e in targets if e["entry_type"] == "folder"]
+        if folders:
+            raise QuadernoError(f"{folders[0]} is a folder (use -r)")
+    if len(targets) > 1 or args.recursive:
+        if os.path.exists(dest) and not os.path.isdir(dest):
+            raise QuadernoError(f"{dest} is not a directory ({len(targets)} items to download)")
         os.makedirs(dest, exist_ok=True)
-    for remote in args.remote:
-        e = q.resolve(remote)
+    for e in targets:
         if e["entry_type"] == "folder":
-            if not args.recursive:
-                raise QuadernoError(f"{e['entry_path']} is a folder (use -r)")
             get_tree(q, e, dest)
         elif os.path.isdir(dest):
             fetch(q, e, os.path.join(dest, safe_local_name(e["entry_name"])))
@@ -1015,8 +1085,27 @@ def delete_empty_folder(q, e):
 
 
 def cmd_rm(q, args):
-    for remote in args.remote:
-        e = q.resolve(remote)
+    plan, by_pattern = expand_all(q, args.remote, args.regex)
+    plan.sort(key=lambda e: e["entry_path"])
+    # Checks before anything is deleted.
+    for e in plan:
+        if e["entry_path"].rstrip("/") == ROOT:
+            raise QuadernoError("refusing to delete the root folder")
+        if e["entry_type"] == "folder" and not args.recursive and q.entries(e["entry_id"]):
+            raise QuadernoError(f"{e['entry_path']} is not empty; use -r to delete its contents too")
+    folders = [e["entry_path"].rstrip("/") + "/" for e in plan if e["entry_type"] == "folder"]
+    plan = [e for e in plan if not any(e["entry_path"].startswith(f) for f in folders)]
+    if by_pattern and not args.yes:
+        print(f"pattern matches {len(plan)}:")
+        for e in plan:
+            print("  " + e["entry_path"].rstrip("/") + ("/" if e["entry_type"] == "folder" else ""))
+        if not sys.stdin.isatty():
+            raise QuadernoError("not deleting pattern matches without confirmation; add --yes")
+        extra = " and everything inside" if args.recursive and folders else ""
+        if input(f"delete these {len(plan)}{extra}? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("nothing deleted")
+            return
+    for e in plan:
         if e["entry_type"] != "folder":
             q.request("DELETE", f"/documents/{e['entry_id']}")
             print(f"deleted {e['entry_path']}")
@@ -1049,27 +1138,35 @@ def cmd_mkdir(q, args):
 
 
 def cmd_mv(q, args):
-    e = q.resolve(args.src)
-    if e["entry_path"] == ROOT:
-        raise QuadernoError("refusing to move the root folder")
+    sources, _ = expand_all(q, args.src, args.regex)
     dst = norm(args.dst)
     d = try_resolve(q, dst)
-    if d is not None:
-        if d["entry_type"] != "folder":
-            raise QuadernoError(f"{dst} already exists")
-        parent_id, parent_path, name = d["entry_id"], d["entry_path"], e["entry_name"]
-    else:
-        parent_path, name = dst.rsplit("/", 1)
-        parent_id = q.resolve(parent_path)["entry_id"]
-    if e["entry_type"] == "folder":
-        if parent_path == e["entry_path"] or parent_path.startswith(e["entry_path"] + "/"):
-            raise QuadernoError("cannot move a folder into itself")
-        kind, field = "folders", "folder_name"
-    else:
-        kind, field = "documents", "file_name"
-    q.request("PUT", f"/{kind}/{e['entry_id']}", {"parent_folder_id": parent_id, field: name})
-    new = q.request("GET", f"/{kind}/{e['entry_id']}") or {}
-    print(f"{e['entry_path']} -> {new.get('entry_path', parent_path + '/' + name)}")
+    if d is not None and d["entry_type"] != "folder":
+        raise QuadernoError(f"{dst} already exists")
+    if len(sources) > 1 and d is None:
+        raise QuadernoError(f"{len(sources)} items to move: {dst} must be an existing folder")
+    for e in sources:
+        if e["entry_path"].rstrip("/") == ROOT:
+            raise QuadernoError("refusing to move the root folder")
+    for e in sources:
+        if d is not None:
+            parent_id, parent_path, name = d["entry_id"], d["entry_path"].rstrip("/"), e["entry_name"]
+        else:
+            parent_path, name = dst.rsplit("/", 1)
+            parent_id = q.resolve(parent_path)["entry_id"]
+        src_path = e["entry_path"].rstrip("/")
+        if src_path == f"{parent_path}/{name}":
+            print(f"{src_path}: already there")
+            continue
+        if e["entry_type"] == "folder":
+            if parent_path == src_path or parent_path.startswith(src_path + "/"):
+                raise QuadernoError(f"cannot move {src_path} into itself")
+            kind, field = "folders", "folder_name"
+        else:
+            kind, field = "documents", "file_name"
+        q.request("PUT", f"/{kind}/{e['entry_id']}", {"parent_folder_id": parent_id, field: name})
+        new = q.request("GET", f"/{kind}/{e['entry_id']}") or {}
+        print(f"{src_path} -> {new.get('entry_path', parent_path + '/' + name).rstrip('/')}")
 
 
 def cmd_info(q, args):
@@ -1121,9 +1218,15 @@ def cmd_screenshot(q, args):
 # --------------------------------------------------------------------------
 
 def cmd_open(q, args):
-    e = q.resolve(args.remote)
-    if e["entry_type"] != "document":
-        raise QuadernoError(f"{e['entry_path']} is a folder")
+    matches, _ = expand(q, args.remote, args.regex)
+    docs = [e for e in matches if e["entry_type"] == "document"]
+    if len(docs) != 1:
+        if not docs:
+            raise QuadernoError(f"{matches[0]['entry_path']} is a folder")
+        listing = "\n  ".join(e["entry_path"] for e in docs[:10])
+        raise QuadernoError(f"{args.remote!r} matches {len(docs)} documents; be more "
+                            f"specific:\n  {listing}")
+    e = docs[0]
     if args.page is None:
         q.request("PUT", "/viewer/controls/open", {"document_id": e["entry_id"]})
     else:
@@ -1311,6 +1414,19 @@ def main(argv=None):
                                         "else the PC App's pairing)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    # Remote paths in ls/get/mv/rm/open accept glob patterns ('Fighter*'); -E makes
+    # them regular expressions. Quote them so the shell leaves them alone.
+    pat = argparse.ArgumentParser(add_help=False)
+    pat.add_argument("-E", "--regex", action="store_true",
+                     help="treat remote path components as regular expressions "
+                          "(case-insensitive search) instead of glob patterns")
+    _add_parser = sub.add_parser
+
+    def add_parser(name, **kw):
+        if name in ("ls", "get", "mv", "rm", "open"):
+            kw["parents"] = [pat]
+        return _add_parser(name, **kw)
+    sub.add_parser = add_parser
 
     p = sub.add_parser("ls", help="list a folder (default: Document)")
     p.add_argument("path", nargs="?", default=ROOT)
@@ -1333,6 +1449,7 @@ def main(argv=None):
     p = sub.add_parser("rm", help="delete documents or empty folders (-r: with contents)")
     p.add_argument("remote", nargs="+")
     p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before deleting pattern matches")
     p.set_defaults(fn=cmd_rm)
 
     p = sub.add_parser("mkdir", help="create folders")
@@ -1340,8 +1457,8 @@ def main(argv=None):
     p.add_argument("-p", "--parents", action="store_true", help="create missing parents; ok if exists")
     p.set_defaults(fn=cmd_mkdir)
 
-    p = sub.add_parser("mv", help="move or rename a document or folder")
-    p.add_argument("src")
+    p = sub.add_parser("mv", help="move or rename documents/folders (several -> into a folder)")
+    p.add_argument("src", nargs="+")
     p.add_argument("dst")
     p.set_defaults(fn=cmd_mv)
 

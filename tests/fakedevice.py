@@ -21,6 +21,7 @@ class FakeDevice(Q.Quaderno):
         self.files = {}
         self.deletes = []
         self.downloads = 0
+        self.opened = []
         self.clock = 1_700_000_000
 
     # --- helpers for tests ---------------------------------------------------
@@ -111,6 +112,9 @@ class FakeDevice(Q.Quaderno):
             off, lim = int(qs.get("offset", 0)), int(qs.get("limit", 100))
             lim = min(lim, 2)  # force pagination
             return {"count": len(kids), "entry_list": [dict(x) for x in kids[off:off + lim]]}
+        if method == "PUT" and p in ("/viewer/controls/open", "/viewer/controls/open2"):
+            self.opened.append((body["document_id"], body.get("page")))
+            return None
         if method == "POST" and p == "/folders":
             return {"folder_id": self._new("folder", body["parent_folder_id"], body["folder_name"])}
         if method == "POST" and p == "/documents":
