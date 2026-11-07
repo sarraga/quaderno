@@ -16,8 +16,8 @@ from .device import Device, PutResult, connect
 from .entry import Entry
 from .errors import (AuthError, CertificateError, ConnectError, DeviceNotFoundError,
                      DeviceUnreachableError, ExistsError, LoginError, NotEmptyError,
-                     NotFoundError, NotPairedError, PairingError, QuadernoError, RequestError,
-                     SerialModeError, WrongPinError)
+                     NotFoundError, NotPairedError, PairingError, ProtocolError, QuadernoError,
+                     RequestError, SerialModeError, WrongPinError)
 from .events import Event
 from .pairing import PairResult, pair
 
@@ -25,5 +25,5 @@ __version__ = "0.3.0"
 __all__ = ["connect", "pair", "Device", "Entry", "Event", "PutResult", "PairResult",
            "QuadernoError", "ConnectError", "DeviceNotFoundError", "SerialModeError",
            "DeviceUnreachableError", "AuthError", "NotPairedError", "LoginError",
-           "CertificateError", "PairingError", "WrongPinError", "RequestError",
+           "CertificateError", "PairingError", "WrongPinError", "RequestError", "ProtocolError",
            "NotFoundError", "ExistsError", "NotEmptyError", "__version__"]

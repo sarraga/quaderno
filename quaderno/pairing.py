@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from . import credentials, crypto, usb
 from .client import Client
-from .errors import DeviceUnreachableError, PairingError, WrongPinError
+from .errors import DeviceUnreachableError, PairingError, ProtocolError, WrongPinError
 from .events import emit
 from .util import REG_PORT
 
@@ -63,6 +63,8 @@ def register(addr, client_id, public_pem, read_pin):
             if path == "/register/ca" and status == 403 and code == "40301":
                 raise WrongPinError("pairing failed: wrong PIN")
             raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res}")
+        if want != 204 and not isinstance(res, dict):  # 204: no body expected
+            raise ProtocolError(f"pairing: POST {path}: the device's answer isn't JSON: {res!r}")
         return res
 
     m1 = call("/register/pin", None, 200)

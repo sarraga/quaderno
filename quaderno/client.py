@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 from . import crypto
 from .errors import (CertificateError, DeviceUnreachableError, LoginError, NotFoundError,
-                     QuadernoError, RequestError)
+                     ProtocolError, QuadernoError, RequestError)
 from .util import HTTPS_PORT
 
 log = logging.getLogger("quaderno")
@@ -132,7 +132,7 @@ class Client:
                 result = total
             else:
                 data = resp.read()
-                result = data if raw else (json.loads(data) if data else None)
+                result = data if raw else (self._json(method, path, data) if data else None)
         except QuadernoError:
             if resp.will_close:
                 self.close()
@@ -146,6 +146,14 @@ class Client:
         if resp.will_close:
             self.close()
         return result
+
+    @staticmethod
+    def _json(method, path, data):
+        try:
+            return json.loads(data)
+        except ValueError as err:
+            raise ProtocolError(f"{method} {path}: the device's answer isn't JSON ({err}): "
+                                f"{data[:80]!r}") from err
 
     # --- login -----------------------------------------------------------------
     def authenticate(self):

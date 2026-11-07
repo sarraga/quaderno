@@ -50,11 +50,17 @@ def matcher(pattern, regex=False):
 
 
 def parse_device_time(s):
-    """'2024-04-08T11:31:43Z' -> epoch seconds (None if absent or unparseable)."""
-    try:
-        return int(datetime.datetime.fromisoformat(s).timestamp())
-    except (TypeError, ValueError):
+    """'2024-04-08T11:31:43Z' -> epoch seconds. None (field absent) gives None;
+    anything else unreadable raises ValueError, including a time without a UTC
+    offset, which would otherwise be read as local time."""
+    if s is None:
         return None
+    if not isinstance(s, str):
+        raise ValueError(f"not a time: {s!r}")
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        raise ValueError(f"time without a UTC offset: {s!r}")
+    return int(dt.timestamp())
 
 
 def device_time(when=None):

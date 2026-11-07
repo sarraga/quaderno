@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Error detection and the exception hierarchy, offline: USB discovery states (fake
-USB bus and clock), HTTP errors, dropped connections, login rejection, CLI exit codes."""
+USB bus and clock), HTTP errors, dropped connections, login rejection, malformed
+answers (not JSON, unreadable dates and numbers), CLI exit codes."""
 import contextlib
 import http.client
 import io
@@ -12,7 +13,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import quaderno  # noqa: E402
 from quaderno import cli, client, credentials, usb  # noqa: E402
+from quaderno.entry import Entry  # noqa: E402
 from quaderno.usb import PID_ETHERNET, PID_SERIAL, UsbDevice  # noqa: E402
+from quaderno.util import parse_device_time  # noqa: E402
 
 
 def raises(exc, fn):
@@ -182,6 +185,36 @@ FakeConn.script = [FakeResponse(404, err_body("40401", "client not found"))]
 e = raises(quaderno.LoginError, c.authenticate)
 assert isinstance(e, quaderno.AuthError) and "pair --force" in str(e)
 
+print("200 with a body that isn't JSON -> ProtocolError (no raw ValueError)")
+c = make()
+FakeConn.script = [FakeResponse(200, b"<html>oops</html>")]
+e = raises(quaderno.ProtocolError, lambda: c.request("GET", "/folders/x/entries"))
+assert "isn't JSON" in str(e) and "/folders/x/entries" in str(e)
+
+
+# --- malformed fields: absent is None, unreadable is an error ----------------------
+
+print("parse_device_time: absent -> None; malformed or offset-less -> ValueError")
+assert parse_device_time(None) is None
+assert parse_device_time("2024-04-08T11:31:43Z") == 1712575903
+assert parse_device_time("2024-04-08T13:31:43+02:00") == 1712575903
+for bad in ("", "yesterday", "2024-04-08T11:31:43", 1712575903):
+    raises(ValueError, lambda: parse_device_time(bad))
+
+doc = {"entry_id": "d1", "entry_name": "x.pdf", "entry_path": "Document/x.pdf",
+       "entry_type": "document", "file_size": "1234", "total_page": "7",
+       "modified_date": "2024-04-08T11:31:43Z", "created_date": "2024-04-01T09:00:00Z"}
+print("Entry.from_api: well-formed and absent fields")
+e = Entry.from_api(doc)
+assert (e.size, e.pages, e.mtime) == (1234, 7, 1712575903)
+bare = Entry.from_api({"entry_id": "f1", "entry_path": "Document/F", "entry_type": "folder"})
+assert (bare.size, bare.pages, bare.mtime) == (None, None, None)
+print("Entry.from_api: malformed date or number -> ProtocolError naming field and entry")
+for key, val in [("modified_date", "08/04/2024"), ("created_date", ""), ("file_size", "12kB"),
+                 ("total_page", [7])]:
+    e = raises(quaderno.ProtocolError, lambda: Entry.from_api({**doc, key: val}))
+    assert key in str(e) and "Document/x.pdf" in str(e), str(e)
+
 
 # --- credentials and CLI exit codes ------------------------------------------------
 
@@ -205,7 +238,8 @@ print("CLI exit codes: 3 connect, 4 auth/pairing, 1 other")
 for exc, want in [(quaderno.SerialModeError("stuck"), 3), (quaderno.DeviceNotFoundError("none"), 3),
                   (quaderno.DeviceUnreachableError("silent"), 3), (quaderno.NotPairedError("np"), 4),
                   (quaderno.CertificateError("cert"), 4), (quaderno.WrongPinError("pin"), 4),
-                  (quaderno.ExistsError("exists"), 1), (quaderno.NotFoundError("nf"), 1)]:
+                  (quaderno.ExistsError("exists"), 1), (quaderno.NotFoundError("nf"), 1),
+                  (quaderno.ProtocolError("bad json"), 1)]:
     code, err = run_cli(exc)
     assert code == want and err.startswith("quaderno: "), (exc, code, err)
 print("ALL ERROR TESTS PASSED")

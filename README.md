@@ -176,7 +176,7 @@ with quaderno.connect() as dev:                  # find it on USB, log in (close
 ```
 
 - **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
-- **Errors:** every failure is a `quaderno.QuadernoError`. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), and errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
+- **Errors:** every failure is a `quaderno.QuadernoError`. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
 - **Pairing:** `quaderno.pair(read_pin)` pairs from code. `read_pin` is a function that returns the PIN shown on the device.
 
 ## Pairing
@@ -302,6 +302,7 @@ QuadernoError                    base: .status (HTTP status, when there is one)
 ├── PairingError                                                             exit 4
 │   └── WrongPinError
 ├── RequestError                 the device answered with an HTTP error: .status, .code   exit 1
+├── ProtocolError                the device's answer is malformed (not JSON, bad date)   exit 1
 ├── NotFoundError                path doesn't exist, or a pattern matched nothing        exit 1
 ├── ExistsError                  target already exists                                   exit 1
 └── NotEmptyError                folder not empty                                        exit 1
