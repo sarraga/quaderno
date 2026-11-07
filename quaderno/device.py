@@ -21,7 +21,7 @@ from urllib.parse import quote
 from . import credentials, usb
 from .client import Client
 from .entry import Entry
-from .errors import NotFoundError, QuadernoError
+from .errors import ExistsError, NotEmptyError, NotFoundError, QuadernoError
 from .events import emit
 from .util import ROOT, device_time, human, is_pattern, matcher, nfc, norm, safe_local_name
 
@@ -216,7 +216,7 @@ class Device(Client):
         f = self._folder(folder)
         name = nfc(name or os.path.basename(local))
         if any(nfc(e.name) == name for e in self._children(f.id)):
-            raise QuadernoError(f"{f.path}/{name} already exists")
+            raise ExistsError(f"{f.path}/{name} already exists")
         self.upload_file(local, f.id, name)
         emit(on_event, "uploaded", f"{local} -> {f.path}/{name}", f"{f.path}/{name}")
         return self.resolve(f"{f.path}/{name}")
@@ -233,7 +233,7 @@ class Device(Client):
         target = norm(dest) if dest else ROOT
         d = self.try_resolve(target)
         if d is not None and not d.is_folder:
-            raise QuadernoError(f"{target} already exists")
+            raise ExistsError(f"{target} already exists")
         if d is None and len(paths) > 1:
             raise self._no_such_folder(target)
         res, items = PutResult(), []
@@ -332,10 +332,10 @@ class Device(Client):
         e = self.try_resolve(path)
         if e is not None:
             if not e.is_folder:
-                raise QuadernoError(f"{path} exists and is not a folder")
+                raise ExistsError(f"{path} exists and is not a folder")
             return e.id
         if path == ROOT:
-            raise QuadernoError("root folder not found")
+            raise NotFoundError("root folder not found")
         parent, name = path.rsplit("/", 1)
         folder_id = self.create_folder(self.ensure_folder(parent, on_event), name)
         emit(on_event, "created", f"created {path}/", path)
@@ -348,7 +348,7 @@ class Device(Client):
         if parents:
             return self.ensure_folder(path, on_event)
         if path == ROOT:
-            raise QuadernoError(f"{ROOT} already exists")
+            raise ExistsError(f"{ROOT} already exists")
         parent, name = path.rsplit("/", 1)
         folder_id = self.create_folder(self.resolve(parent).id, name)
         emit(on_event, "created", f"created {path}/", path)
@@ -361,7 +361,7 @@ class Device(Client):
         dst = norm(dst)
         d = self.try_resolve(dst)
         if d is not None and not d.is_folder:
-            raise QuadernoError(f"{dst} already exists")
+            raise ExistsError(f"{dst} already exists")
         if len(sources) > 1 and d is None:
             raise QuadernoError(f"{len(sources)} items to move: {dst} must be an existing folder")
         if any(e.path == ROOT for e in sources):
@@ -400,7 +400,7 @@ class Device(Client):
             if e.path == ROOT:
                 raise QuadernoError("refusing to delete the root folder")
             if e.is_folder and not recursive and self._children(e.id):
-                raise QuadernoError(f"{e.path} is not empty; use -r to delete its contents too")
+                raise NotEmptyError(f"{e.path} is not empty; use -r to delete its contents too")
         folders = [e.path + "/" for e in plan if e.is_folder]
         plan = [e for e in plan if not any(e.path.startswith(f) for f in folders)]
         if by_pattern and confirm is not None and not confirm(plan):
@@ -427,7 +427,7 @@ class Device(Client):
         # recursively), so DELETE is only ever sent for a folder verified to be empty.
         children = self._children(e.id)
         if children:
-            raise QuadernoError(f"{e.path} is not empty ({len(children)} entries); "
+            raise NotEmptyError(f"{e.path} is not empty ({len(children)} entries); "
                                 "use -r to delete its contents first")
         self.request("DELETE", f"/folders/{e.id}")
         emit(on_event, "deleted", f"deleted {e.path}/", e.path)

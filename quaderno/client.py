@@ -10,13 +10,19 @@ import uuid
 from urllib.parse import quote
 
 from . import crypto
-from .errors import NotFoundError, QuadernoError
+from .errors import (CertificateError, DeviceUnreachableError, LoginError, NotFoundError,
+                     QuadernoError, RequestError)
 from .util import HTTPS_PORT
 
 log = logging.getLogger("quaderno")
 CHUNK = 8 * 1024 * 1024  # upload piece size (the one tested)
 _STALE = (http.client.RemoteDisconnected, http.client.CannotSendRequest,
           http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError)
+
+
+def _unreachable(err):
+    return DeviceUnreachableError(f"lost contact with the device ({err.__class__.__name__}: "
+                                  f"{err}); is it still connected and awake?")
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -31,8 +37,9 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
         super().connect()
         if self._pin is not None and self.sock.getpeercert(binary_form=True) != self._pin:
             self.sock.close()
-            raise QuadernoError("device TLS certificate differs from the one received at pairing "
-                                "(devicecert.bin); if the firmware was updated, run `pair --force`")
+            raise CertificateError("device TLS certificate differs from the one received at "
+                                   "pairing (devicecert.bin); if the firmware was updated, "
+                                   "run `quaderno pair --force`")
 
 
 class Client:
@@ -78,14 +85,17 @@ class Client:
             try:
                 self._conn.request(method, path, body=body, headers=hdrs)
                 return self._conn.getresponse()
-            except _STALE:
+            except _STALE as err:
                 self.close()
                 if not reused:
-                    raise
+                    raise _unreachable(err) from err
+            except OSError as err:  # refused, timed out, interface gone...
+                self.close()
+                raise _unreachable(err) from err
             except BaseException:
                 self.close()
                 raise
-        raise QuadernoError(f"{method} {path}: connection lost")
+        raise DeviceUnreachableError(f"{method} {path}: lost the connection to the device")
 
     def request(self, method, path, body=None, headers=None, ok=(200, 204), raw=False,
                 stream_to=None):
@@ -105,13 +115,15 @@ class Client:
                 self.cookies[name.strip()] = rest.split(";", 1)[0]
             if resp.status not in ok:
                 data = resp.read()
+                code = None
                 try:
                     err = json.loads(data)
-                    msg = f"{err.get('error_code')} {err.get('message')}"
+                    code = err.get("error_code")
+                    msg = f"{code} {err.get('message')}"
                 except ValueError:
                     msg = data[:200].decode(errors="replace")
-                cls = NotFoundError if resp.status == 404 else QuadernoError
-                raise cls(f"{method} {path} -> HTTP {resp.status}: {msg}", resp.status)
+                cls = NotFoundError if resp.status == 404 else RequestError
+                raise cls(f"{method} {path} -> HTTP {resp.status}: {msg}", resp.status, code)
             if stream_to is not None:
                 total = 0
                 while chunk := resp.read(1 << 20):
@@ -125,6 +137,9 @@ class Client:
             if resp.will_close:
                 self.close()
             raise
+        except OSError as err:  # dropped while reading the answer
+            self.close()
+            raise _unreachable(err) from err
         except BaseException:
             self.close()  # body may be half-read: the connection can't be reused
             raise
@@ -134,10 +149,17 @@ class Client:
 
     # --- login -----------------------------------------------------------------
     def authenticate(self):
-        nonce = self.request("GET", "/auth/nonce/" + quote(self.client_id))["nonce"]
-        sig = crypto.sign(self.key, nonce.encode("latin-1"))
-        self.request("PUT", "/auth", {"client_id": self.client_id,
-                                      "nonce_signed": base64.b64encode(sig).decode()})
+        try:
+            nonce = self.request("GET", "/auth/nonce/" + quote(self.client_id))["nonce"]
+            sig = crypto.sign(self.key, nonce.encode("latin-1"))
+            self.request("PUT", "/auth", {"client_id": self.client_id,
+                                          "nonce_signed": base64.b64encode(sig).decode()})
+        except (RequestError, NotFoundError) as err:  # 404: the device doesn't know this client
+            if err.status in (400, 401, 403, 404):
+                raise LoginError(f"the device rejected this client ({err}); it may have been "
+                                 "unpaired on the device: run `quaderno pair --force`",
+                                 err.status) from err
+            raise
 
     # --- raw document transfer ---------------------------------------------------
     def download_to(self, doc_id, fh):
@@ -178,10 +200,10 @@ class Client:
                 offset = int(r["current_bytes"])
                 if offset >= size:
                     if r.get("completed") != "yes":
-                        raise QuadernoError("upload finished but device did not mark it complete")
+                        raise RequestError("upload finished but device did not mark it complete")
                     return
                 if not chunk:
-                    raise QuadernoError("upload stalled")
+                    raise RequestError("upload stalled")
                 fh.seek(offset)
 
     def create_folder(self, parent_id, name):

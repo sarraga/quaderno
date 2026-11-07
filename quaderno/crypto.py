@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .errors import QuadernoError
+from .errors import AuthError, PairingError
 
 # RFC 3526 group 14 (2048-bit MODP), generator 2.
 DH_P = int(
@@ -58,9 +58,9 @@ def load_private_key(pem):
         key = serialization.load_pem_private_key(pem.encode() if isinstance(pem, str) else pem,
                                                  password=None)
     except (ValueError, TypeError) as err:
-        raise QuadernoError(f"cannot read the private key: {err}")
+        raise AuthError(f"cannot read the private key: {err}")
     if not isinstance(key, rsa.RSAPrivateKey):
-        raise QuadernoError("the private key is not an RSA key")
+        raise AuthError("the private key is not an RSA key")
     return key
 
 
@@ -87,7 +87,7 @@ def aes_cbc_decrypt(key, iv, data):
         unpadder = sym_padding.PKCS7(128).unpadder()
         return unpadder.update(dec.update(data) + dec.finalize()) + unpadder.finalize()
     except ValueError as err:
-        raise QuadernoError(f"pairing: undecryptable message ({err})")
+        raise PairingError(f"pairing: undecryptable message ({err})")
 
 
 def wrap(data, auth_key, kw_key):
@@ -100,7 +100,7 @@ def unwrap(data, auth_key, kw_key):
     plain = aes_cbc_decrypt(kw_key, data[-16:], data[:-16])
     body, tag = plain[:-8], plain[-8:]
     if not hmac.compare_digest(tag, hmac_sha256(auth_key, body)[:8]):
-        raise QuadernoError("pairing: wrapped data failed its integrity check")
+        raise PairingError("pairing: wrapped data failed its integrity check")
     return body
 
 
@@ -114,7 +114,7 @@ def dh_exchange(peer_public):
     DH (RFC 3526 group 14), which the `cryptography` package has deprecated for
     removal; two modular exponentiations need no library."""
     if not 1 < peer_public < DH_P - 1:
-        raise QuadernoError("pairing: device sent an invalid DH value")
+        raise PairingError("pairing: device sent an invalid DH value")
     while True:
         x = secrets.randbelow(DH_P - 3) + 2
         y, zz = pow(DH_G, x, DH_P), pow(peer_public, x, DH_P)

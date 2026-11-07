@@ -12,7 +12,7 @@ import threading
 import time
 from typing import NamedTuple
 
-from .errors import QuadernoError
+from .errors import DeviceNotFoundError, DeviceUnreachableError, SerialModeError
 from .util import HTTPS_PORT
 
 VID = 0x04C5
@@ -99,26 +99,66 @@ def first_reachable(cands, timeout=1.5):
     return None
 
 
-def discover(serial_hint=None, on_switch=None):
+def _leave_serial_mode(on_switch, timeout, resend_every):
+    """Send the switch command until no device is left in serial mode. Like the PC
+    App, resend it: a device in standby may ignore the first ones."""
+    deadline = time.time() + timeout
+    next_send = 0.0
+    while True:
+        stuck = [d for d in usb_devices() if d.pid == PID_SERIAL]
+        if not stuck:
+            return True
+        now = time.time()
+        if now >= deadline:
+            raise SerialModeError(
+                "the QUADERNO is connected but stayed in USB serial mode: it ignored the "
+                f"command that switches it to USB networking for {timeout:g} s. This happens "
+                "when it is in standby, e.g. after the Mac slept. Wake it with its power "
+                "button, or unplug and re-plug it, then try again.")
+        if now >= next_send:
+            for d in stuck:
+                if d.tty:  # the tty node can lag behind enumeration
+                    if on_switch:
+                        on_switch(d.tty, d.serial)
+                    try:
+                        switch_to_ethernet(d.tty)
+                    except OSError:
+                        pass  # the port vanished mid-switch: it is re-enumerating
+            next_send = now + resend_every
+        time.sleep(0.5)
+
+
+def discover(serial_hint=None, on_switch=None, switch_timeout=15, answer_timeout=None):
     """Return the device's scoped IPv6 address ('fe80::...%en8'), switching it to
     USB networking first if it is in serial mode. `on_switch(tty, serial)` is
-    called before each switch."""
+    called before each switch command.
+
+    Raises DeviceNotFoundError (not on USB), SerialModeError (won't leave serial
+    mode within `switch_timeout` s) or DeviceUnreachableError (network mode, but
+    not answering)."""
     devs = usb_devices()
+    if not devs:
+        raise DeviceNotFoundError("no QUADERNO on USB: plug it in with a data cable "
+                                  "(not a charge-only one) and wake it")
     serials = [d.serial for d in devs if d.serial] or ([serial_hint] if serial_hint else [])
-    in_serial_mode = [d for d in devs if d.pid == PID_SERIAL and d.tty]
-    for d in in_serial_mode:
-        if on_switch:
-            on_switch(d.tty, d.serial)
-        switch_to_ethernet(d.tty)
-    deadline = time.time() + (20 if in_serial_mode else 3)
     if not serials:
-        raise QuadernoError("no QUADERNO found on USB (and no serial number to derive an address)")
+        raise DeviceNotFoundError("the QUADERNO on USB reports no serial number, so its "
+                                  "address can't be derived")
+    switched = any(d.pid == PID_SERIAL for d in devs)
+    if switched:
+        _leave_serial_mode(on_switch, switch_timeout, resend_every=3)
+    if answer_timeout is None:
+        answer_timeout = 15 if switched else 3  # a fresh network link needs a few seconds
+    deadline = time.time() + answer_timeout
     while True:
         ifaces = [n for _, n in socket.if_nameindex() if n.startswith("en")]
         found = first_reachable([f"{ipv6_from_serial(s)}%{i}" for s in serials for i in ifaces])
         if found:
             return found
         if time.time() > deadline:
-            raise QuadernoError("QUADERNO is on USB but did not answer on port 8443 "
-                                "(unlock/wake the device, or replug it)")
+            if not usb_devices():
+                raise DeviceNotFoundError("the QUADERNO was disconnected")
+            raise DeviceUnreachableError(
+                "the QUADERNO is in USB network mode but doesn't answer on port "
+                f"{HTTPS_PORT}: wake or unlock it, or unplug and re-plug it")
         time.sleep(1)

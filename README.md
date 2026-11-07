@@ -176,7 +176,7 @@ with quaderno.connect() as dev:                  # find it on USB, log in (close
 ```
 
 - **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
-- **Errors:** failures raise `quaderno.QuadernoError`, which has `.status` when the device answered with an HTTP error. A missing path raises the subclass `NotFoundError`.
+- **Errors:** every failure is a `quaderno.QuadernoError`. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), and errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
 - **Pairing:** `quaderno.pair(read_pin)` pairs from code. `read_pin` is a function that returns the PIN shown on the device.
 
 ## Pairing
@@ -245,11 +245,12 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 .venv/bin/python tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
 .venv/bin/python tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
 .venv/bin/python tests/test_pair.py     # crypto wiring vs openssl; pairing vs a simulated device
+.venv/bin/python tests/test_errors.py   # discovery states (stuck serial mode...), HTTP/connection errors, exit codes
 .venv/bin/python tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
 zsh tests/hw_zsh_completion.zsh             # manual: presses Tab in a real zsh against the device
 ```
 
-The first five need no device. `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code.
+The first six need no device. `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code.
 
 ## Code layout
 
@@ -265,6 +266,7 @@ quaderno/
   usb.py          finding the device on USB (`ioreg -a`), USB mode switch, address
   entry.py        Entry: a document or folder
   events.py       Event: progress reports from API operations
+  errors.py       the exception hierarchy
   util.py         paths, patterns, time and size formatting
   cli.py          the `quaderno` command: argument parsing and printing only
 completions/_quaderno   zsh Tab completion
@@ -283,11 +285,48 @@ If the device is on Wi-Fi, pass its address explicitly with `--addr 192.168.x.y`
 dptrp1 --client-id ~/.config/quaderno/deviceid.dat --key ~/.config/quaderno/privatekey.dat --addr "[$(quaderno addr)]" list-documents
 ```
 
+## Errors and exit codes
+
+Every failure is a `quaderno.QuadernoError`. The subclasses tell you what went wrong; scripts using the command get the same distinction through the exit code.
+
+```
+QuadernoError                    base: .status (HTTP status, when there is one)
+├── ConnectError                 can't reach the device                      exit 3
+│   ├── DeviceNotFoundError      no QUADERNO on USB
+│   ├── SerialModeError          stuck in serial mode (see below)
+│   └── DeviceUnreachableError   network mode but silent, or the connection dropped
+├── AuthError                                                                exit 4
+│   ├── NotPairedError           no credentials
+│   ├── LoginError               the device rejected this client's key
+│   └── CertificateError         TLS certificate differs from the saved one
+├── PairingError                                                             exit 4
+│   └── WrongPinError
+├── RequestError                 the device answered with an HTTP error: .status, .code   exit 1
+├── NotFoundError                path doesn't exist, or a pattern matched nothing        exit 1
+├── ExistsError                  target already exists                                   exit 1
+└── NotEmptyError                folder not empty                                        exit 1
+```
+
+Exit code 2 is a command-line usage error, and 130 means you pressed Ctrl-C. Network failures in the middle of a command, such as the cable being pulled, become `DeviceUnreachableError`, not a Python traceback.
+
+### The device stuck in serial mode
+
+When the USB link restarts, the QUADERNO starts in serial mode; this happens when you plug it in or when the Mac wakes from sleep. `quaderno` then sends the command that switches it to USB networking. While the device is in standby, it can ignore that command.
+
+`quaderno` re-sends the command every 3 seconds. If the device is still in serial mode after 15 seconds, it stops with:
+
+```
+quaderno: the QUADERNO is connected but stayed in USB serial mode: it ignored the command that
+switches it to USB networking for 15 s. This happens when it is in standby, e.g. after the Mac
+slept. Wake it with its power button, or unplug and re-plug it, then try again.
+```
+
 ## Troubleshooting
 
-- **`no QUADERNO found on USB`**: run `ioreg -p IOUSB` and look for `FMVDP41`. If it is missing, check the cable, which must carry data, not only power.
-- **`did not answer on port 8443`**: wake or unlock the device. Running `ifconfig` should show an `enN` interface with an `fe80::` address.
+- **`no QUADERNO on USB`**: run `ioreg -p IOUSB` and look for `FMVDP41`. If it's missing, check the cable: it must carry data, not only power.
+- **`stayed in USB serial mode`**: wake the device or re-plug it, as described above.
+- **`in USB network mode but doesn't answer`**: wake or unlock the device. Running `ifconfig` should show an `enN` interface with an `fe80::` address.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
-- **HTTP 401 on login**: the device no longer knows this client. Run `pair --force`.
+- **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.
 - **PC App errors such as `EADDRINUSE:8081` or status 0**: these come from the app's own local port forwarding and affect only the app, not the USB link or this script.

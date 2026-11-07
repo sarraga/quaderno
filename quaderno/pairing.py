@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from . import credentials, crypto, usb
 from .client import Client
-from .errors import QuadernoError
+from .errors import DeviceUnreachableError, PairingError, WrongPinError
 from .events import emit
 from .util import REG_PORT
 
@@ -36,6 +36,8 @@ def reg_request(addr, method, path, body=None):
         conn.request(method, path, body=data, headers=hdrs)
         resp = conn.getresponse()
         raw = resp.read()
+    except OSError as err:
+        raise DeviceUnreachableError(f"pairing: lost contact with the device ({err})") from err
     finally:
         conn.close()
     try:
@@ -59,8 +61,8 @@ def register(addr, client_id, public_pem, read_pin):
         if status != want:
             code = res.get("error_code") if isinstance(res, dict) else None
             if path == "/register/ca" and status == 403 and code == "40301":
-                raise QuadernoError("pairing failed: wrong PIN")
-            raise QuadernoError(f"pairing: POST {path} -> HTTP {status}: {res}")
+                raise WrongPinError("pairing failed: wrong PIN")
+            raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res}")
         return res
 
     m1 = call("/register/pin", None, 200)
@@ -74,10 +76,10 @@ def register(addr, client_id, public_pem, read_pin):
     m3 = call("/register/hash", {"a": _b64(n1), "b": _b64(n2), "c": _b64(mac),
                                  "d": _b64(ya), "e": _b64(m2hmac)}, 200)
     if u(m3["a"]) != n2:
-        raise QuadernoError("pairing: nonce mismatch")
+        raise PairingError("pairing: nonce mismatch")
     e_hash, m3hmac = u(m3["b"]), u(m3["e"])
     if not hmac.compare_digest(m3hmac, H(auth_key, n1 + n2 + mac + ya + m2hmac + n2 + e_hash)):
-        raise QuadernoError("pairing: device message failed HMAC check")
+        raise PairingError("pairing: device message failed HMAC check")
 
     psk = H(auth_key, read_pin().strip().encode())
     rs = secrets.token_bytes(16)
@@ -87,16 +89,16 @@ def register(addr, client_id, public_pem, read_pin):
     m5 = call("/register/ca", {"a": _b64(n1), "b": _b64(r_hash), "d": _b64(wrapped_rs),
                                "e": _b64(m4hmac)}, 200)
     if u(m5["a"]) != n2:
-        raise QuadernoError("pairing: nonce mismatch")
+        raise PairingError("pairing: nonce mismatch")
     wrapped_es_cert, m5hmac = u(m5["d"]), u(m5["e"])
     if not hmac.compare_digest(m5hmac, H(auth_key, n1 + r_hash + wrapped_rs + m4hmac + n2
                                           + wrapped_es_cert)):
-        raise QuadernoError("pairing: device message failed HMAC check")
+        raise PairingError("pairing: device message failed HMAC check")
     es_cert = crypto.unwrap(wrapped_es_cert, auth_key, kw_key)
     es, cert = es_cert[:16], es_cert[16:]
     # The device proves it knows the same PIN; guards against a spoofed device.
     if not hmac.compare_digest(e_hash, H(auth_key, es + psk + yb + ya)):
-        raise QuadernoError("pairing: device failed the PIN proof")
+        raise PairingError("pairing: device failed the PIN proof")
 
     wrapped_id_key = crypto.wrap(client_id.encode() + public_pem.encode(), auth_key, kw_key)
     m6hmac = H(auth_key, n2 + wrapped_es_cert + m5hmac + n1 + wrapped_id_key)
@@ -119,7 +121,7 @@ def pair(read_pin, addr=None, force=False, cred_dir=None, on_event=None):
     an existing pairing unless `force`."""
     cred_dir = cred_dir or credentials.CONFIG_DIR
     if credentials.is_paired(cred_dir) and not force:
-        raise QuadernoError(f"already paired (credentials in {cred_dir}); "
+        raise PairingError(f"already paired (credentials in {cred_dir}); "
                             "use --force to pair again and replace them")
     addr = addr or os.environ.get("QUADERNO_ADDR") or usb.discover()
     status, info = reg_request(addr, "GET", "/register/information")

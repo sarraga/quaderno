@@ -1,6 +1,6 @@
 [project]
 name = "quaderno"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python API and command-line client for the Fujitsu QUADERNO e-paper tablet over USB"
 readme = "README.md"
 requires-python = ">=3.11"

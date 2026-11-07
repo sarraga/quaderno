@@ -10,7 +10,7 @@ import time
 
 from . import credentials, pairing, usb
 from .device import Device, connect
-from .errors import QuadernoError
+from .errors import AuthError, ConnectError, PairingError, QuadernoError
 from .util import ROOT, human
 
 
@@ -165,7 +165,7 @@ def cmd_pair(args):
                     if pin.strip():
                         return pin
                 time.sleep(0.3)
-            raise QuadernoError("timed out waiting for the PIN")
+            raise PairingError("timed out waiting for the PIN")
         if sys.stdin.isatty():
             return input(prompt)
         print(prompt, end="", flush=True)
@@ -286,6 +286,18 @@ def build_parser():
     return ap
 
 
+EXIT_ERROR, EXIT_CONNECT, EXIT_AUTH = 1, 3, 4  # 2 is argparse's usage error
+
+
+def exit_code(err):
+    """3: the device can't be reached; 4: pairing/credentials/identity; 1: the rest."""
+    if isinstance(err, ConnectError):
+        return EXIT_CONNECT
+    if isinstance(err, (AuthError, PairingError)):
+        return EXIT_AUTH
+    return EXIT_ERROR
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["__complete"]:
@@ -308,6 +320,6 @@ def main(argv=None):
             return args.fn(dev, args) or 0
     except QuadernoError as err:
         print(f"quaderno: {err}", file=sys.stderr)
-        return 1
+        return exit_code(err)
     except KeyboardInterrupt:
         return 130

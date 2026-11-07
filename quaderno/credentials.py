@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 
 from . import crypto
-from .errors import QuadernoError
+from .errors import CertificateError, NotPairedError
 
 APP_DIR = os.path.expanduser(
     "~/Library/Application Support/Fujitsu/QUADERNO PC App/QUADERNO_PCApp")
@@ -48,7 +48,7 @@ def find_credentials_dir(explicit=None):
     ws = find_app_workspace()
     if ws:
         return ws
-    raise QuadernoError("not paired: run `quaderno pair` with the device connected")
+    raise NotPairedError("not paired: run `quaderno pair` with the device connected")
 
 
 def load_pinned_cert(cred_dir):
@@ -58,7 +58,7 @@ def load_pinned_cert(cred_dir):
     with open(path, "rb") as f:
         der = crypto.cert_to_der(f.read())
     if der is None:
-        raise QuadernoError(f"{path} is not a valid certificate; run `pair --force` or delete it")
+        raise CertificateError(f"{path} is not a valid certificate; run `pair --force` or delete it")
     return der
 
 
@@ -68,7 +68,7 @@ def load_credentials(cred_dir=None):
     def read(name):
         p = os.path.join(cred_dir, name)
         if not os.path.exists(p):
-            raise QuadernoError("missing " + p)
+            raise NotPairedError(f"incomplete pairing: {p} is missing; run `quaderno pair --force`")
         with open(p) as f:
             return f.read().strip()
     serial = None

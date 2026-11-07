@@ -14,7 +14,10 @@ log("waiting for unplug")
 while Q.usb_devices():
     if time.time() > deadline: log("timeout waiting for unplug"); sys.exit(2)
     time.sleep(0.5)
-log("unplugged; waiting for plug-in")
+log("unplugged; running `quaderno ls` while unplugged (expect exit 3, no QUADERNO on USB)")
+r = subprocess.run([sys.executable, "-m", "quaderno", "ls"], cwd=REPO, capture_output=True, text=True, timeout=60)
+log("exit", r.returncode, "|", r.stderr.strip())
+log("waiting for plug-in")
 while not Q.usb_devices():
     if time.time() > deadline: log("timeout waiting for plug-in"); sys.exit(2)
     time.sleep(0.3)
