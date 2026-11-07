@@ -9,6 +9,8 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakedevice import FakeDevice, Q  # noqa: E402
+from quaderno.sync import SYNC_STATE  # noqa: E402
+from quaderno.util import parse_device_time  # noqa: E402
 
 LONG = ("Fighter Combat - Tactics and Maneuvering -- Robert L_ Shaw -- 1988 -- Naval Institute "
         "Press -- 9780870210594 -- cdf446d4aa8b1e83b4cd4dc824de74f8 -- Anna’s Archive.pdf")
@@ -152,7 +154,7 @@ assert out.strip() == "leading.pdf" or out.rstrip("\n") == " leading.pdf", repr(
 expect_error(lambda: run(Q.cmd_ls, d, path="Books/sailing", long=False), "404")  # no space: different name
 out = run(Q.cmd_ls, d, path="Books/sail*", long=False)
 assert out.strip() == "Document/Books/sailing /", repr(out)
-mkdir = Q.ensure_folder(d, "Books/sailing /Charts")
+mkdir = d.ensure_folder("Books/sailing /Charts")
 assert "Document/Books/sailing /Charts" in d.paths()
 
 print("10. no match / not found")

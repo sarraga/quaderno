@@ -11,6 +11,8 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakedevice import FakeDevice, Q  # noqa: E402
+from quaderno.sync import SYNC_STATE  # noqa: E402
+from quaderno.util import parse_device_time  # noqa: E402
 
 
 def sync(d, local, remote="Document", **kw):
@@ -33,7 +35,7 @@ def files(root):
     out = []
     for dp, dn, fn in os.walk(root):
         for f in fn:
-            if f != Q.SYNC_STATE:
+            if f != SYNC_STATE:
                 out.append(os.path.relpath(os.path.join(dp, f), root))
     return sorted(out)
 
@@ -62,7 +64,7 @@ sync(d, L)
 assert files(L) == ["Books/b.pdf", "Note/deep/n2.pdf", "Note/n1.pdf", "a.pdf"], files(L)
 assert os.path.isdir(os.path.join(L, "Empty"))
 e = d._by_path("a.pdf")
-assert int(os.stat(os.path.join(L, "a.pdf")).st_mtime) == Q.parse_device_time(e["modified_date"])
+assert int(os.stat(os.path.join(L, "a.pdf")).st_mtime) == parse_device_time(e["modified_date"])
 assert d.downloads == 4
 
 print("2. second sync: nothing downloaded")
@@ -71,7 +73,7 @@ assert d.downloads == 4 and "4 unchanged" in out
 
 print("3. device edit -> update; device move -> local move without download")
 d.edit_doc("Note/n1.pdf", b"N1 edited on device")
-d.move("Books/b.pdf", "Archive/b-renamed.pdf")
+d.dev_move("Books/b.pdf", "Archive/b-renamed.pdf")
 out = sync(d, L)
 assert read(os.path.join(L, "Note/n1.pdf")) == b"N1 edited on device"
 assert read(os.path.join(L, "Archive/b-renamed.pdf")) == b"B1"
@@ -80,7 +82,7 @@ assert d.downloads == 5, d.downloads  # only n1 re-downloaded
 assert "1 updated" in out and "1 moved" in out
 
 print("4. device delete: kept locally by default, removed with --delete (empty dirs pruned)")
-d.delete("Note/deep/n2.pdf")
+d.dev_delete("Note/deep/n2.pdf")
 out = sync(d, L)
 assert os.path.exists(os.path.join(L, "Note/deep/n2.pdf")) and "1 gone" in out
 out = sync(d, L, delete=True)
@@ -93,7 +95,7 @@ d.edit_doc("a.pdf", b"A2")
 out = sync(d, L)
 assert read(os.path.join(L, "a.pdf")) == b"my local notes" and "KEEP" in out
 print("   ...and a locally edited file deleted on device is kept even with --delete")
-d.delete("a.pdf")
+d.dev_delete("a.pdf")
 out = sync(d, L, delete=True)
 assert read(os.path.join(L, "a.pdf")) == b"my local notes"
 
@@ -103,7 +105,7 @@ sync(d, L)
 assert read(os.path.join(L, "Archive/b-renamed.pdf")) == b"B1"
 
 print("7. moved AND changed on device: new copy downloaded, stale copy removed")
-d.move("Archive/b-renamed.pdf", "Books/b2.pdf")
+d.dev_move("Archive/b-renamed.pdf", "Books/b2.pdf")
 d.edit_doc("Books/b2.pdf", b"B2")
 sync(d, L)
 assert read(os.path.join(L, "Books/b2.pdf")) == b"B2"
@@ -111,9 +113,9 @@ assert not os.path.exists(os.path.join(L, "Archive/b-renamed.pdf"))
 
 print("8. dry run changes nothing")
 d.put_doc("new.pdf", b"NEW")
-before = (files(L), read(os.path.join(L, Q.SYNC_STATE)), d.downloads)
+before = (files(L), read(os.path.join(L, SYNC_STATE)), d.downloads)
 out = sync(d, L, dry_run=True)
-assert "(dry run) get" in out and (files(L), read(os.path.join(L, Q.SYNC_STATE)), d.downloads) == before
+assert "(dry run) get" in out and (files(L), read(os.path.join(L, SYNC_STATE)), d.downloads) == before
 
 print("9. names that collide on a case-insensitive Mac volume: second one skipped")
 d.put_doc("Case.pdf", b"upper")
@@ -132,6 +134,6 @@ out = sync(d, other, remote="Note", force=True)
 assert read(os.path.join(other, "n1.pdf")) == b"unrelated" and "exists locally" in out
 
 print("11. state survives as JSON keyed by entry id")
-st = json.load(open(os.path.join(L, Q.SYNC_STATE)))
+st = json.load(open(os.path.join(L, SYNC_STATE)))
 assert st["remote"] == "Document" and all({"path", "rev", "size", "mtime"} <= set(v) for v in st["entries"].values())
 print("ALL SYNC TESTS PASSED")

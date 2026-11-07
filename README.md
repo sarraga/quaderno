@@ -1,14 +1,14 @@
-# quaderno.py
+# quaderno
 
 A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected to a Mac over USB.
-It is a single file that uses only the Python standard library: no venv, nothing to `pip install`, and no native code for Santa to block.
+It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io); its compiled module loads fine under Santa.
 It pairs with the device by itself and does not need the QUADERNO PC App.
 
 Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2, Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) works with the PC App closed.
 
 ## Install
 
-It's set up the same way as `ytchan`: a pyproject package installed in editable mode into its own `.venv`, so changes to `quaderno.py` take effect immediately.
+It's set up the same way as `ytchan`: a pyproject package installed in editable mode into its own `.venv`, so changes to the code take effect immediately.
 
 ```
 cd ~/quaderno
@@ -17,7 +17,7 @@ cd ~/quaderno
 .venv/bin/quaderno --help
 ```
 
-There are no dependencies. `./quaderno.py` also works directly, without the venv. To run plain `quaderno` from anywhere, link it into a folder on your PATH. On this Mac that folder is `~/bin`:
+`pip install` also installs `cryptography`. Without the `quaderno` command on your PATH, `.venv/bin/python -m quaderno` works the same. To run plain `quaderno` from anywhere, link it into a folder on your PATH. On this Mac that folder is `~/bin`:
 
 ```
 ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
@@ -52,19 +52,19 @@ autoload -Uz compinit && compinit
 ## Usage
 
 ```
-./quaderno.py pair [--force] [--pin-file F]  pair with the device (PIN shown on its screen)
-./quaderno.py ls [PATH] [-l] [-R]            list a folder (default: Document)
-./quaderno.py get REMOTE... [-o DEST] [-r]   download documents; -r for whole folders
-./quaderno.py put LOCAL... [-d DEST] [-r]    upload PDFs; -r for local directories
-./quaderno.py mkdir REMOTE... [-p]           create folders; -p creates parents, ok if exists
-./quaderno.py mv SRC... DST                  move/rename; several sources -> into folder DST
-./quaderno.py rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
-./quaderno.py sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
-./quaderno.py open DOC [-p PAGE]             open a document on the device's screen
-./quaderno.py time                           set the device clock from the Mac
-./quaderno.py info [--json]                  firmware, storage, battery, MAC, owner
-./quaderno.py screenshot [OUT.png]           PNG of the current screen
-./quaderno.py addr                           print the device address (switches USB mode if needed)
+quaderno pair [--force] [--pin-file F]  pair with the device (PIN shown on its screen)
+quaderno ls [PATH] [-l] [-R]            list a folder (default: Document)
+quaderno get REMOTE... [-o DEST] [-r]   download documents; -r for whole folders
+quaderno put LOCAL... [-d DEST] [-r]    upload PDFs; -r for local directories
+quaderno mkdir REMOTE... [-p]           create folders; -p creates parents, ok if exists
+quaderno mv SRC... DST                  move/rename; several sources -> into folder DST
+quaderno rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
+quaderno sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
+quaderno open DOC [-p PAGE]             open a document on the device's screen
+quaderno time                           set the device clock from the Mac
+quaderno info [--json]                  firmware, storage, battery, MAC, owner
+quaderno screenshot [OUT.png]           PNG of the current screen
+quaderno addr                           print the device address (switches USB mode if needed)
 ```
 
 Global options:
@@ -77,17 +77,17 @@ Global options:
 The device has a single tree rooted at the folder `Document`. Remote paths are relative to it, so `foo.pdf`, `/foo.pdf` and `Document/foo.pdf` all refer to the same file. Folder names cannot contain `/`, and the device stores only PDFs.
 
 ```
-./quaderno.py ls -l Note
-./quaderno.py get "Note/Meeting Notes_20240506.pdf" -o ~/Downloads
-./quaderno.py get -r Note -o ~/Backup                 # -> ~/Backup/Note/...
-./quaderno.py put paper.pdf -d Books                  # into an existing folder
-./quaderno.py put paper.pdf -d "Books/Better name.pdf"
-./quaderno.py put -r ~/Papers -d Books                # -> Books/Papers/... (created as needed)
-./quaderno.py put -r ~/Papers -d Books/Reading        # Reading is new -> it becomes the copy of ~/Papers
-./quaderno.py mkdir -p Books/2026/Q4
-./quaderno.py mv Books/2026 Archive/                  # into an existing folder
-./quaderno.py mv Books/2026 Books/Twenty26            # rename
-./quaderno.py rm -r Books/Old
+quaderno ls -l Note
+quaderno get "Note/Meeting Notes_20240506.pdf" -o ~/Downloads
+quaderno get -r Note -o ~/Backup                 # -> ~/Backup/Note/...
+quaderno put paper.pdf -d Books                  # into an existing folder
+quaderno put paper.pdf -d "Books/Better name.pdf"
+quaderno put -r ~/Papers -d Books                # -> Books/Papers/... (created as needed)
+quaderno put -r ~/Papers -d Books/Reading        # Reading is new -> it becomes the copy of ~/Papers
+quaderno mkdir -p Books/2026/Q4
+quaderno mv Books/2026 Archive/                  # into an existing folder
+quaderno mv Books/2026 Books/Twenty26            # rename
+quaderno rm -r Books/Old
 ```
 
 ### Patterns
@@ -128,10 +128,10 @@ How the commands behave:
 ## Sync (device → Mac)
 
 ```
-./quaderno.py sync ~/QUADERNO                # whole device
-./quaderno.py sync ~/QUADERNO-notes Note     # one folder
-./quaderno.py sync -n ~/QUADERNO             # dry run: show what would happen
-./quaderno.py sync --delete ~/QUADERNO       # also remove local copies of documents deleted on the device
+quaderno sync ~/QUADERNO                # whole device
+quaderno sync ~/QUADERNO-notes Note     # one folder
+quaderno sync -n ~/QUADERNO             # dry run: show what would happen
+quaderno sync --delete ~/QUADERNO       # also remove local copies of documents deleted on the device
 ```
 
 `sync` copies one way, from the device to the Mac. Each run downloads only documents that are new or changed. It decides by the device's `file_revision`, which changes whenever a document is edited, including handwriting added on the device. Opening or reading a document doesn't change it.
@@ -154,10 +154,35 @@ The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors ex
 
   The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time.
 
+## Python API
+
+Everything the command does is available from Python; the CLI is a thin layer over it.
+
+```python
+import quaderno
+
+with quaderno.connect() as dev:                  # find it on USB, log in (closes the connection after)
+    for e in dev.entries("Books"):               # Entry: name, path, relpath, size, pages, modified, ...
+        print(e.relpath, e.size)
+    dev.get("Books/Sailing/*.pdf", "~/Downloads")      # patterns work as in the CLI
+    res = dev.put(["a.pdf", "b.pdf"], "Books")         # PutResult(uploaded=, skipped=, missing=, ...)
+    dev.upload("c.pdf", "Books")                       # one file; raises if the name exists
+    dev.move("Fighter*", "Books")                      # -> [(old_path, new_path), ...]
+    dev.rm("Received/*", confirm=lambda entries: True) # confirm is asked only when a pattern matched
+    dev.sync("~/QUADERNO", "Note")                     # -> counts per action
+    dev.open("Books/x.pdf", page=5)
+    dev.set_time()
+    print(dev.info()["storage"])
+```
+
+- **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
+- **Errors:** failures raise `quaderno.QuadernoError`, which has `.status` when the device answered with an HTTP error. A missing path raises the subclass `NotFoundError`.
+- **Pairing:** `quaderno.pair(read_pin)` pairs from code. `read_pin` is a function that returns the PIN shown on the device.
+
 ## Pairing
 
 ```
-./quaderno.py pair
+quaderno pair
 ```
 
 1. Connect the device by USB and wake it.
@@ -210,20 +235,41 @@ When the PC App's credentials are used, there is no stored certificate, so the c
    - `DELETE /documents/{id}` and `DELETE /folders/{id}`
    - `/system/status/*`
 
-AES-128, RSA key generation and PKCS#1 signing are implemented in pure Python. They are checked against the FIPS-197 test vector and against the system's `/usr/bin/openssl`.
+RSA key generation, signing, key files and AES come from the `cryptography` package; HMAC and PBKDF2 from the standard library. The one Diffie-Hellman exchange is done with Python's `pow()`. The device requires classic finite-field Diffie-Hellman (RFC 3526 group 14), which `cryptography` has deprecated for removal, and no other well-maintained Python library offers it. It is two modular exponentiations, so no library is needed. The tests check all of this against `/usr/bin/openssl` and a simulated device.
 
 ## Tests
 
 ```
-python3 tests/test_fake.py     # folder commands against an in-memory fake of the device API
-python3 tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
-python3 tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
-python3 tests/test_pair.py     # AES/RSA against FIPS-197 and openssl; pairing vs a simulated device
-python3 tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
-zsh tests/hw_zsh_completion.zsh    # manual: presses Tab in a real zsh against the device
+.venv/bin/python tests/test_api.py      # the Python API used directly
+.venv/bin/python tests/test_fake.py     # CLI folder commands (put/get/mv/rm/mkdir)
+.venv/bin/python tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
+.venv/bin/python tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
+.venv/bin/python tests/test_pair.py     # crypto wiring vs openssl; pairing vs a simulated device
+.venv/bin/python tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
+zsh tests/hw_zsh_completion.zsh             # manual: presses Tab in a real zsh against the device
 ```
 
-The first three need no device. `tests/fakedevice.py` replaces only the HTTP layer, so the tests run the CLI's real code.
+The first five need no device. `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code.
+
+## Code layout
+
+```
+quaderno/
+  __init__.py     public API: connect, pair, Device, Entry, Event, PutResult, errors
+  device.py       Device: ls/find/walk, get/put/upload, mkdir/move/rm, open, set_time, info, sync
+  sync.py         one-way incremental sync (device -> Mac)
+  client.py       HTTPS transport (kept-alive, certificate pinning) and login
+  pairing.py      PIN pairing protocol
+  crypto.py       RSA/AES via `cryptography`, HMAC, Diffie-Hellman, PEM/DER
+  credentials.py  where credentials live; loading and saving them
+  usb.py          finding the device on USB (`ioreg -a`), USB mode switch, address
+  entry.py        Entry: a document or folder
+  events.py       Event: progress reports from API operations
+  util.py         paths, patterns, time and size formatting
+  cli.py          the `quaderno` command: argument parsing and printing only
+completions/_quaderno   zsh Tab completion
+tests/                  offline tests (fake device) and manual device checks
+```
 
 ## Wi-Fi
 
@@ -234,7 +280,7 @@ If the device is on Wi-Fi, pass its address explicitly with `--addr 192.168.x.y`
 [dpt-rp1-py](https://github.com/janten/dpt-rp1-py) implements the same API and adds sync, Wi-Fi configuration and note templates. It requires `pycryptodome` (native code) and other packages, and it can't find the device over USB by itself. It should be able to use the same credentials, but the following command has not been tested here:
 
 ```
-dptrp1 --client-id ~/.config/quaderno/deviceid.dat --key ~/.config/quaderno/privatekey.dat --addr "[$(./quaderno.py addr)]" list-documents
+dptrp1 --client-id ~/.config/quaderno/deviceid.dat --key ~/.config/quaderno/privatekey.dat --addr "[$(quaderno addr)]" list-documents
 ```
 
 ## Troubleshooting

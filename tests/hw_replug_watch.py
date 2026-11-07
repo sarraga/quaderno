@@ -1,9 +1,9 @@
 """Wait for the QUADERNO to be unplugged and plugged back in, record how it
 enumerates, then run the CLI so it has to do the USB mode switch itself."""
 import glob, os, subprocess, sys, time
-CLI_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, CLI_DIR)
-import quaderno as Q
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+from quaderno import usb as Q
 
 t0 = time.time()
 def log(*a):
@@ -25,8 +25,8 @@ for _ in range(20):  # give the tty node a moment to appear
     time.sleep(0.25)
 log("enumerated as", [(hex(pid), ser, tty) for pid, ser, tty in devs])
 log("/dev/cu.*:", glob.glob("/dev/cu.*"))
-log("running: quaderno.py -v ls")
-r = subprocess.run([sys.executable, os.path.join(CLI_DIR, "quaderno.py"), "-v", "ls"],
+log("running: quaderno -v ls")
+r = subprocess.run([sys.executable, "-m", "quaderno", "-v", "ls"], cwd=REPO,
                    capture_output=True, text=True, timeout=120)
 log("exit", r.returncode)
 print(r.stderr + r.stdout, flush=True)
