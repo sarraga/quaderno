@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Error detection and the exception hierarchy, offline: USB discovery states (fake
 USB bus and clock), HTTP errors, dropped connections, login rejection, malformed
-answers (not JSON, unreadable dates and numbers), CLI exit codes."""
+answers (not JSON: error; unreadable date or size: warning), CLI exit codes."""
 import contextlib
 import http.client
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import quaderno  # noqa: E402
@@ -16,6 +18,7 @@ from quaderno import cli, client, credentials, usb  # noqa: E402
 from quaderno.entry import Entry  # noqa: E402
 from quaderno.usb import PID_ETHERNET, PID_SERIAL, UsbDevice  # noqa: E402
 from quaderno.util import parse_device_time  # noqa: E402
+from fakedevice import FakeDevice  # noqa: E402
 
 
 def raises(exc, fn):
@@ -192,7 +195,21 @@ e = raises(quaderno.ProtocolError, lambda: c.request("GET", "/folders/x/entries"
 assert "isn't JSON" in str(e) and "/folders/x/entries" in str(e)
 
 
-# --- malformed fields: absent is None, unreadable is an error ----------------------
+# --- malformed fields: absent is None; unreadable warns, or errors where it matters --
+
+class Captured(logging.Handler):
+    """Collects the package's log warnings (and keeps them off the test output)."""
+
+    def __init__(self):
+        super().__init__()
+        self.msgs = []
+
+    def emit(self, record):
+        self.msgs.append(record.getMessage())
+
+
+cap = Captured()
+logging.getLogger("quaderno").addHandler(cap)
 
 print("parse_device_time: absent -> None; malformed or offset-less -> ValueError")
 assert parse_device_time(None) is None
@@ -209,11 +226,40 @@ e = Entry.from_api(doc)
 assert (e.size, e.pages, e.mtime) == (1234, 7, 1712575903)
 bare = Entry.from_api({"entry_id": "f1", "entry_path": "Document/F", "entry_type": "folder"})
 assert (bare.size, bare.pages, bare.mtime) == (None, None, None)
-print("Entry.from_api: malformed date or number -> ProtocolError naming field and entry")
-for key, val in [("modified_date", "08/04/2024"), ("created_date", ""), ("file_size", "12kB"),
-                 ("total_page", [7])]:
-    e = raises(quaderno.ProtocolError, lambda: Entry.from_api({**doc, key: val}))
-    assert key in str(e) and "Document/x.pdf" in str(e), str(e)
+
+print("Entry.from_api: a malformed date doesn't stop a listing; mtime raises ProtocolError")
+e = Entry.from_api({**doc, "modified_date": "08/04/2024", "created_date": ""})
+assert e.modified == "08/04/2024" and e.created == "" and not cap.msgs
+err = raises(quaderno.ProtocolError, lambda: e.mtime)
+assert "modified_date" in str(err) and "Document/x.pdf" in str(err), str(err)
+
+print("Entry.from_api: malformed size or page count -> None, with a warning")
+for key, val in [("file_size", "12kB"), ("total_page", [7])]:
+    cap.msgs.clear()
+    e = Entry.from_api({**doc, key: val})
+    assert getattr(e, "size" if key == "file_size" else "pages") is None
+    assert len(cap.msgs) == 1 and key in cap.msgs[0] and "Document/x.pdf" in cap.msgs[0], cap.msgs
+
+print("get with a malformed date: file saved (exit 0), date not applied, warning")
+dev = FakeDevice()
+dev.e[dev.put_doc("Document/Books/x.pdf", b"%PDF-1.7 body")]["modified_date"] = "08/04/2024"
+out = tempfile.mkdtemp()
+cli.connect = lambda **kw: dev
+cap.msgs.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    assert cli.main(["get", "Books/x.pdf", "-o", out]) == 0
+saved = os.path.join(out, "x.pdf")
+with open(saved, "rb") as fh:
+    assert fh.read() == b"%PDF-1.7 body"
+assert abs(os.stat(saved).st_mtime - time.time()) < 60       # not a device time
+assert len(cap.msgs) == 1 and "saved" in cap.msgs[0] and "08/04/2024" in cap.msgs[0], cap.msgs
+
+print("sync (no event callback) with a malformed date: completes, warning still shown")
+cap.msgs.clear()
+mirror = tempfile.mkdtemp()
+dev.sync(mirror)
+assert os.path.exists(os.path.join(mirror, "Books", "x.pdf"))
+assert len(cap.msgs) == 1 and "modified_date" in cap.msgs[0], cap.msgs
 
 
 # --- credentials and CLI exit codes ------------------------------------------------

@@ -14,6 +14,7 @@ be glob patterns ('Books/*.pdf', case-insensitive) or, with regex=True, regular
 expressions; an exact name always wins. Operations that change things accept an
 optional `on_event` callback that receives an Event for each step."""
 
+import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -21,9 +22,11 @@ from urllib.parse import quote
 from . import credentials, usb
 from .client import Client
 from .entry import Entry
-from .errors import ExistsError, NotEmptyError, NotFoundError, QuadernoError
+from .errors import ExistsError, NotEmptyError, NotFoundError, ProtocolError, QuadernoError
 from .events import emit
 from .util import ROOT, device_time, human, is_pattern, matcher, nfc, norm, safe_local_name
+
+log = logging.getLogger("quaderno")
 
 
 @dataclass
@@ -151,7 +154,8 @@ class Device(Client):
     # --- download ---------------------------------------------------------------
     def download(self, doc, target, on_event=None):
         """Save a document (path or Entry) to the local file `target`, atomically,
-        with the device's modification time. Returns the size in bytes."""
+        with the device's modification time. Returns the size in bytes. If that
+        time is unreadable, the file is kept with a warning, without it."""
         doc = doc if isinstance(doc, Entry) else self.resolve(doc)
         tmp = target + ".part"
         try:
@@ -162,8 +166,14 @@ class Device(Client):
             if os.path.exists(tmp):
                 os.remove(tmp)
             raise
-        if doc.mtime is not None:
-            os.utime(target, (doc.mtime, doc.mtime))
+        try:
+            mtime = doc.mtime
+        except ProtocolError as err:  # the contents are fine; only the date is lost
+            log.warning("warning: %s; saved %s without the device's modification time",
+                        err, target)
+            mtime = None
+        if mtime is not None:
+            os.utime(target, (mtime, mtime))
         emit(on_event, "downloaded", f"{doc.path} -> {target} ({human(n)})", doc.path)
         return n
 

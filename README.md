@@ -302,13 +302,15 @@ QuadernoError                    base: .status (HTTP status, when there is one)
 ├── PairingError                                                             exit 4
 │   └── WrongPinError
 ├── RequestError                 the device answered with an HTTP error: .status, .code   exit 1
-├── ProtocolError                the device's answer is malformed (not JSON, bad date)   exit 1
+├── ProtocolError                the device's answer is malformed (not JSON)            exit 1
 ├── NotFoundError                path doesn't exist, or a pattern matched nothing        exit 1
 ├── ExistsError                  target already exists                                   exit 1
 └── NotEmptyError                folder not empty                                        exit 1
 ```
 
 Exit code 2 is a command-line usage error, and 130 means you pressed Ctrl-C. Network failures in the middle of a command, such as the cable being pulled, become `DeviceUnreachableError`, not a Python traceback.
+
+A malformed value that only affects what is shown or a file's date doesn't stop a command: an unreadable size or page count shows as missing, and `get` saves the file without the device's modification time. Both print a warning on stderr.
 
 ### The device stuck in serial mode
 

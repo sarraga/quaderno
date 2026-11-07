@@ -12,7 +12,7 @@
     ├── PairingError
     │   └── WrongPinError
     ├── RequestError                 the device answered with an HTTP error: .status, .code
-    ├── ProtocolError                the device's answer is malformed (not JSON, bad date or number)
+    ├── ProtocolError                the device's answer is malformed (not JSON; Entry.mtime: bad date)
     ├── NotFoundError                path doesn't exist, or a pattern matched nothing
     ├── ExistsError                  target already exists
     └── NotEmptyError                folder not empty
@@ -80,8 +80,10 @@ class RequestError(QuadernoError):
 
 class ProtocolError(QuadernoError):
     """The device answered, but with something this client can't read: a body that
-    isn't JSON, or a date or number in an unexpected format. Usually means a
-    firmware change; the operation stops rather than guess."""
+    isn't JSON, or (from Entry.mtime) a date in an unexpected format. Usually means
+    a firmware change. Where only a displayed or cosmetic value is affected the
+    operation goes on with a logged warning instead: an unreadable size or page
+    count reads as missing, and download() keeps the file without its date."""
 
 
 class NotFoundError(QuadernoError):
