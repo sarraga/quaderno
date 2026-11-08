@@ -39,6 +39,7 @@ How it behaves:
 - **Letter case** is ignored in the part you're completing.
 - **Patterns** containing `*`, `?` or `[` are left untouched.
 - **With the device unplugged**, nothing is offered, without any delay.
+- **Right after plugging in**, the first Tab switches the device to USB networking, which takes about 4 s. Later Tabs take about 0.4 s.
 
 `pip install` doesn't install this file: zsh reads it straight from the checkout. To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
 
@@ -213,7 +214,7 @@ If pairing received a certificate it couldn't read, none is stored and connectio
 ## How the connection works
 
 1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*`. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new `enN` interface. The script writes only to a tty whose USB VID/PID match.
-2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For this unit it is `fe80::c8d3:84ff:fec2:323b%en8`. The script tries that address on every `en*` interface.
+2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For this unit it is `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface macOS created for the device: the I/O Registry lists that interface (e.g. `en8`) and its link status under the USB device. That's also how the errors below tell a missing interface, a link that is down, and a device that doesn't answer apart. With several QUADERNOs attached, the serial saved at pairing picks the right one.
 3. **Pairing.** Plain HTTP on port 8080, in five calls:
    - `POST /register/pin`: the device sends nonce `n1`, its MAC and its Diffie-Hellman public value.
    - `POST /register/hash`: both sides compute a shared secret (DH, RFC 3526 2048-bit group). PBKDF2-SHA256 with 10,000 iterations turns it into a 32-byte HMAC key and a 16-byte AES-128-CBC key. The PIN enters as `HMAC(key, pin)`, so each side proves it knows the PIN without sending it.
@@ -306,10 +307,10 @@ Every failure is a `quaderno.QuadernoError`. The subclasses tell you what went w
 
 ```
 QuadernoError                    base: .status (HTTP status, when there is one)
-├── ConnectError                 can't reach the device                      exit 3
-│   ├── DeviceNotFoundError      no QUADERNO on USB
+├── ConnectError                 can't reach the device, or can't read the USB device list   exit 3
+│   ├── DeviceNotFoundError      no QUADERNO on USB, or not the paired one
 │   ├── SerialModeError          stuck in serial mode (see below)
-│   └── DeviceUnreachableError   network mode but silent, or the connection dropped
+│   └── DeviceUnreachableError   network mode but no interface, link down or silent; or the connection dropped
 ├── AuthError                                                                exit 4
 │   ├── NotPairedError           no credentials
 │   ├── LoginError               the device rejected this client's key
@@ -343,7 +344,11 @@ slept. Wake it with its power button, or unplug and re-plug it, then try again.
 
 - **`no QUADERNO on USB`**: run `ioreg -p IOUSB` and look for `FMVDP41`. If it's missing, check the cable: it must carry data, not only power.
 - **`stayed in USB serial mode`**: wake the device or re-plug it, as described above.
-- **`in USB network mode but doesn't answer`**: wake or unlock the device. Running `ifconfig` should show an `enN` interface with an `fe80::` address.
+- **`macOS lists no network interface for it`**: macOS didn't set up networking for the device after the switch. Unplug and re-plug it.
+- **`USB network link (enN) is down`**: the interface exists but has no link. Wake or unlock the device; if that doesn't help, re-plug it.
+- **`its link is up, but it doesn't answer`**: the network is fine but the device's server isn't responding. Wake or unlock the device.
+- **`isn't the one these credentials were paired with`**: a different QUADERNO is plugged in. Plug in the paired one, or pair this one into its own folder with `quaderno --config DIR pair` and use `--config DIR` with it.
+- **`couldn't read the list of USB devices with ioreg`**: macOS's `ioreg` failed or timed out; the message includes why. This is not the same as the device being absent.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
 - **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.

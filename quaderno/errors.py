@@ -1,10 +1,11 @@
 """Exceptions raised by the quaderno package.
 
     QuadernoError                    base: .status (HTTP status, when there is one)
-    ├── ConnectError                 can't reach the device
-    │   ├── DeviceNotFoundError      no QUADERNO on USB
+    ├── ConnectError                 can't reach the device, or can't read the USB device list
+    │   ├── DeviceNotFoundError      no QUADERNO on USB, or not the paired one
     │   ├── SerialModeError          stuck in serial mode: ignored the switch to USB networking
-    │   └── DeviceUnreachableError   in network mode but not answering, or the connection dropped
+    │   └── DeviceUnreachableError   network mode but no interface, link down or not answering;
+    │                                or the connection dropped
     ├── AuthError
     │   ├── NotPairedError           no credentials
     │   ├── LoginError               the device rejected this client's key
@@ -33,7 +34,8 @@ class ConnectError(QuadernoError):
 
 
 class DeviceNotFoundError(ConnectError):
-    """No QUADERNO on USB (not plugged in, or a charge-only cable)."""
+    """No QUADERNO on USB (not plugged in, or a charge-only cable), not the one
+    the credentials were paired with, or none with a usable serial number."""
 
 
 class SerialModeError(ConnectError):
@@ -43,7 +45,8 @@ class SerialModeError(ConnectError):
 
 
 class DeviceUnreachableError(ConnectError):
-    """The device is in USB network mode but doesn't answer, or the connection broke."""
+    """The device is in USB network mode but has no network interface, its link is
+    down, or it doesn't answer; or the connection broke."""
 
 
 class AuthError(QuadernoError):

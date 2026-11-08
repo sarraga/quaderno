@@ -1,5 +1,7 @@
 """Wait for the QUADERNO to be unplugged and plugged back in, record how it
-enumerates, then run the CLI so it has to do the USB mode switch itself."""
+enumerates, then run the CLI so it has to do the USB mode switch itself.
+With --tab, that first command is a Tab completion (`quaderno __complete Bo`),
+to check that the first Tab after plugging in works."""
 import glob, os, subprocess, sys, time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -23,14 +25,16 @@ while not Q.usb_devices():
     time.sleep(0.3)
 for _ in range(20):  # give the tty node a moment to appear
     devs = Q.usb_devices()
-    if any(tty for _, _, tty in devs) or any(pid == Q.PID_ETHERNET for pid, _, _ in devs):
+    if any(d.tty or d.pid == Q.PID_ETHERNET for d in devs):
         break
     time.sleep(0.25)
-log("enumerated as", [(hex(pid), ser, tty) for pid, ser, tty in devs])
+log("enumerated as", [(hex(d.pid), d.serial, d.tty or d.iface) for d in devs])
 log("/dev/cu.*:", glob.glob("/dev/cu.*"))
-log("running: quaderno -v ls")
-r = subprocess.run([sys.executable, "-m", "quaderno", "-v", "ls"], cwd=REPO,
+cmd = ["__complete", "Bo"] if "--tab" in sys.argv else ["-v", "ls"]
+log("running: quaderno", *cmd)
+t1 = time.time()
+r = subprocess.run([sys.executable, "-m", "quaderno", *cmd], cwd=REPO,
                    capture_output=True, text=True, timeout=120)
-log("exit", r.returncode)
+log("exit", r.returncode, f"after {time.time() - t1:.1f} s")
 print(r.stderr + r.stdout, flush=True)
-log("after:", [(hex(pid), ser, tty) for pid, ser, tty in Q.usb_devices()])
+log("after:", [(hex(d.pid), d.serial, d.iface, d.link) for d in Q.usb_devices()])

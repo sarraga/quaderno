@@ -4,7 +4,10 @@ answers (not JSON: error; unreadable date or size: warning), CLI exit codes."""
 import http.client
 import json
 import logging
+import plistlib
+import subprocess
 import time
+import types
 
 import pytest
 from fakedevice import FakeDevice
@@ -34,28 +37,32 @@ class FakeClock:
 
 
 class FakeBus:
-    """A device that leaves serial mode after `switch_after` switch commands
-    (None: never), then answers on the network unless `answers` is False."""
+    """A device on a fake USB bus. It leaves serial mode after `switch_after`
+    switch commands (None: never). In network mode it has interface `iface` with
+    link `link`, and answers there if `answers`."""
 
-    def __init__(self, mode, switch_after=None, answers=True, unplug_after=None):
+    def __init__(self, mode, switch_after=None, answers=True, unplug_after=None, iface="en8",
+                 link=True, serial="850000312345678"):
         self.mode, self.switch_after, self.answers = mode, switch_after, answers
-        self.unplug_after, self.polls, self.sent = unplug_after, 0, []
+        self.unplug_after, self.iface, self.link, self.serial = unplug_after, iface, link, serial
+        self.polls, self.sent, self.probed = 0, [], []
 
     def usb_devices(self):
         self.polls += 1
         if self.mode is None or (self.unplug_after is not None and self.polls > self.unplug_after):
             return []
         if self.mode == "serial":
-            return [UsbDevice(PID_SERIAL, "850000312345678", "/dev/cu.usbmodemFAKE")]
-        return [UsbDevice(PID_ETHERNET, "850000312345678", None)]
+            return [UsbDevice(PID_SERIAL, self.serial, "/dev/cu.usbmodemFAKE")]
+        return [UsbDevice(PID_ETHERNET, self.serial, None, self.iface, self.link)]
 
     def switch_to_ethernet(self, tty):
         self.sent.append(tty)
         if self.switch_after is not None and len(self.sent) >= self.switch_after:
             self.mode = "ethernet"
 
-    def first_reachable(self, cands, timeout=1.5):
-        return cands[0] if self.mode == "ethernet" and self.answers and self.usb_devices() else None
+    def probe(self, addr, timeout=1.5):
+        self.probed.append(addr)
+        return self.mode == "ethernet" and self.answers and addr.endswith(f"%{self.iface}")
 
 
 @pytest.fixture
@@ -64,7 +71,7 @@ def on_bus(monkeypatch):
     def run(bus, **kw):
         monkeypatch.setattr(usb, "usb_devices", bus.usb_devices)
         monkeypatch.setattr(usb, "switch_to_ethernet", bus.switch_to_ethernet)
-        monkeypatch.setattr(usb, "first_reachable", bus.first_reachable)
+        monkeypatch.setattr(usb, "probe", bus.probe)
         monkeypatch.setattr(usb, "time", FakeClock())
         return usb.discover(**kw)
     return run
@@ -77,7 +84,9 @@ def test_discover_not_plugged_in(on_bus):
 
 
 def test_discover_already_in_network_mode(on_bus):
-    assert on_bus(FakeBus("ethernet")).startswith("fe80::c8d3:84ff:fec2:323b%")
+    bus = FakeBus("ethernet")
+    assert on_bus(bus) == "fe80::c8d3:84ff:fec2:323b%en8"
+    assert bus.probed == ["fe80::c8d3:84ff:fec2:323b%en8"]   # only its own interface
 
 
 def test_discover_switches_on_the_resend(on_bus):
@@ -94,14 +103,94 @@ def test_discover_stuck_in_serial_mode(on_bus):
     assert "stayed in USB serial mode" in str(e.value) and "re-plug" in str(e.value)
 
 
-def test_discover_network_mode_but_silent(on_bus):
-    with pytest.raises(quaderno.DeviceUnreachableError, match="doesn't answer"):
-        on_bus(FakeBus("ethernet", answers=False))
+@pytest.mark.parametrize("bus,message", [
+    (FakeBus("ethernet", iface=None), "lists no network interface"),
+    (FakeBus("ethernet", link=False), "link (en8) is down"),
+    (FakeBus("ethernet", answers=False), "link is up, but it doesn't answer at fe80::c8d3"),
+])
+def test_discover_says_why_the_device_does_not_answer(on_bus, bus, message):
+    with pytest.raises(quaderno.DeviceUnreachableError) as e:
+        on_bus(bus)
+    assert message in str(e.value), str(e.value)
 
 
 def test_discover_unplugged_while_waiting(on_bus):
-    with pytest.raises(quaderno.DeviceNotFoundError):
+    with pytest.raises(quaderno.DeviceNotFoundError, match="disconnected"):
         on_bus(FakeBus("ethernet", answers=False, unplug_after=1))
+
+
+@pytest.mark.parametrize("serial,hint", [("85000A", None), (None, "not-a-serial")])
+def test_discover_rejects_a_serial_that_is_not_numeric(on_bus, serial, hint):
+    with pytest.raises(quaderno.DeviceNotFoundError, match="isn't numeric"):
+        on_bus(FakeBus("ethernet", serial=serial), serial_hint=hint)
+
+
+def test_discover_uses_the_paired_serial_for_a_device_reporting_none(on_bus):
+    assert on_bus(FakeBus("ethernet", serial=None), serial_hint="850000312345678") == \
+        "fe80::c8d3:84ff:fec2:323b%en8"
+
+
+A, B = UsbDevice(PID_ETHERNET, "111", None, "en8", True), UsbDevice(PID_SERIAL, "222", "/dev/cu.x")
+
+
+def test_choose_picks_the_paired_device_among_several():
+    assert usb._choose([A, B], "222") == (B, "222")
+
+
+@pytest.mark.parametrize("devs,hint,message", [
+    ([A], "222", "isn't the one these credentials were paired with (222)"),
+    ([A, B], None, "2 QUADERNOs on USB (serials 111, 222)"),
+    ([A._replace(serial=None)], None, "reports no serial number"),
+])
+def test_choose_refuses_to_guess(devs, hint, message):
+    with pytest.raises(quaderno.DeviceNotFoundError) as e:
+        usb._choose(devs, hint)
+    assert message in str(e.value), str(e.value)
+
+
+# --- reading the I/O Registry ---------------------------------------------------------
+
+def ioreg_device(pid, serial, **children):
+    """An `ioreg -a -l` node for a QUADERNO, with the subtree layout seen on macOS 27."""
+    if pid == PID_ETHERNET:
+        kids = [{"IOObjectClass": "IOUserNetworkEthernet", "IORegistryEntryChildren": [
+            {"IOLinkStatus": children["link"], "IORegistryEntryChildren": [
+                {"BSD Name": children["iface"]}]}]}]
+    else:
+        kids = [{"IORegistryEntryChildren": [{"IOCalloutDevice": children["tty"]}]}]
+    return {"idVendor": 0x04C5, "idProduct": pid, "USB Serial Number": serial,
+            "IORegistryEntryChildren": kids}
+
+
+@pytest.fixture
+def ioreg(monkeypatch):
+    """ioreg(nodes) makes usb_devices() read `nodes` as ioreg's output."""
+    def use(nodes):
+        out = types.SimpleNamespace(stdout=plistlib.dumps(nodes), returncode=0)
+        monkeypatch.setattr(usb.subprocess, "run", lambda *a, **kw: out)
+    return use
+
+
+@pytest.mark.parametrize("status,link", [(3, True), (1, False), (0, None)])
+def test_usb_devices_reads_interface_and_link(ioreg, status, link):
+    ioreg([{"idVendor": 0x05AC, "idProduct": 1},             # someone else's device
+           ioreg_device(PID_ETHERNET, "111", iface="en8", link=status),
+           ioreg_device(PID_SERIAL, "222", tty="/dev/cu.usbmodem101")])
+    assert usb.usb_devices() == [UsbDevice(PID_ETHERNET, "111", None, "en8", link),
+                                 UsbDevice(PID_SERIAL, "222", "/dev/cu.usbmodem101")]
+
+
+def test_usb_devices_with_nothing_attached(ioreg):
+    ioreg([])
+    assert usb.usb_devices() == []
+
+
+def test_ioreg_failure_is_not_taken_for_no_device(monkeypatch):
+    def fail(*a, **kw):
+        raise subprocess.TimeoutExpired("ioreg", 15)
+    monkeypatch.setattr(usb.subprocess, "run", fail)
+    with pytest.raises(quaderno.ConnectError, match="couldn't read the list of USB devices"):
+        usb.usb_devices()
 
 
 # --- HTTP client ------------------------------------------------------------------
