@@ -115,6 +115,7 @@ How matching works:
 
 How the commands behave:
 - **`put` never overwrites.** If a document with the same name already exists in the target folder, `put` skips it and prints `skip ...` on stderr. This makes `put -r` safe to re-run: it uploads only what's missing. A remote folder is created only where at least one PDF will go.
+- **`mv` never overwrites.** Before moving anything, it checks every destination. If a name is already taken there, or two sources would end up with the same name, it stops with an error and moves nothing.
 - **What `-d` means depends on what exists.**
   - If `-d` names an existing folder, the files go into it.
   - If it names something that doesn't exist and ends in `.pdf`, that becomes the uploaded file's new name.

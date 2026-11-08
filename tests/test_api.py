@@ -85,6 +85,21 @@ def test_mkdir_and_move(d):
     assert {"created", "moved"} <= {ev.kind for ev in events}
 
 
+def test_move_refuses_name_clashes_before_moving_anything(d):
+    d.put_doc("Archive/a.pdf", b"other A")
+    d.put_doc("Note/c.pdf", b"C")
+    before = d.paths()
+    with pytest.raises(ExistsError, match="Document/Archive/a.pdf already exists"):
+        d.move(["Note/c.pdf", "Books/a.pdf"], "Archive")       # c.pdf alone would be fine
+    assert d.paths() == before
+    d.put_doc("Note/Old/b.pdf", b"other B")
+    with pytest.raises(ExistsError, match="cannot move both"):  # two sources, one name
+        d.move(["Books/Old/b.pdf", "Note/Old/b.pdf"], "Note")
+    with pytest.raises(QuadernoError, match="into itself"):     # also checked up front
+        d.move(["Note/c.pdf", "Books"], "Books/Old")
+    assert d.paths() == sorted(before + ["Document/Note/Old", "Document/Note/Old/b.pdf"])
+
+
 def test_rm(d):
     for n in "xyz":
         d.put_doc(f"Archive/2026/{n}.pdf", n.encode())

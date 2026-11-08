@@ -366,7 +366,9 @@ class Device(Client):
 
     def move(self, patterns, dst, regex=False, on_event=None):
         """Move or rename documents/folders (patterns allowed). Several sources need
-        an existing folder as `dst`. Returns [(old_path, new_path), ...]."""
+        an existing folder as `dst`. Everything is checked before anything moves:
+        a name already taken at the destination, or two sources that would land on
+        the same name, raise ExistsError. Returns [(old_path, new_path), ...]."""
         sources, _ = self.find_all(patterns, regex)
         dst = norm(dst)
         d = self.try_resolve(dst)
@@ -376,22 +378,30 @@ class Device(Client):
             raise QuadernoError(f"{len(sources)} items to move: {dst} must be an existing folder")
         if any(e.path == ROOT for e in sources):
             raise QuadernoError("refusing to move the root folder")
-        moved = []
+        taken = {c.name for c in self._children(d.id)} if d is not None else set()
+        plan, claimed = [], {}
         for e in sources:
             if d is not None:
                 parent_id, parent_path, name = d.id, d.path, e.name
-            else:
+            else:  # rename to `dst`, which doesn't exist
                 parent_path, name = dst.rsplit("/", 1)
                 parent_id = self.resolve(parent_path).id
+            target = f"{parent_path}/{name}"
+            if e.path != target:
+                if e.is_folder and (parent_path == e.path or parent_path.startswith(e.path + "/")):
+                    raise QuadernoError(f"cannot move {e.path} into itself")
+                if name in taken:
+                    raise ExistsError(f"cannot move {e.path}: {target} already exists")
+                if target in claimed:
+                    raise ExistsError(f"cannot move both {claimed[target]} and {e.path} to {target}")
+                claimed[target] = e.path
+            plan.append((e, parent_id, parent_path, name))
+        moved = []
+        for e, parent_id, parent_path, name in plan:
             if e.path == f"{parent_path}/{name}":
                 emit(on_event, "unchanged", f"{e.path}: already there", e.path)
                 continue
-            if e.is_folder:
-                if parent_path == e.path or parent_path.startswith(e.path + "/"):
-                    raise QuadernoError(f"cannot move {e.path} into itself")
-                kind, field = "folders", "folder_name"
-            else:
-                kind, field = "documents", "file_name"
+            kind, field = ("folders", "folder_name") if e.is_folder else ("documents", "file_name")
             self.request("PUT", f"/{kind}/{e.id}", {"parent_folder_id": parent_id, field: name})
             new = self.request("GET", f"/{kind}/{e.id}") or {}
             new_path = new.get("entry_path", f"{parent_path}/{name}").rstrip("/")
