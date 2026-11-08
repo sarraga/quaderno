@@ -40,7 +40,7 @@ How it behaves:
 - **Patterns** containing `*`, `?` or `[` are left untouched.
 - **With the device unplugged**, nothing is offered, without any delay.
 
-To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
+`pip install` doesn't install this file: zsh reads it straight from the checkout. To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
 
 ```
 fpath=(~/quaderno/completions $fpath)

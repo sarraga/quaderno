@@ -191,6 +191,9 @@ class Client:
             raise
 
     def _send_file(self, local, doc_id):
+        # The multipart filename is ignored: the document's name was set by the
+        # POST in upload_file. A fixed ASCII value keeps arbitrary file names
+        # (quotes, non-ASCII) out of a header the device has to parse.
         size = os.path.getsize(local)
         with open(local, "rb") as fh:
             offset = 0

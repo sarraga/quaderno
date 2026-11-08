@@ -1,6 +1,6 @@
 [project]
 name = "quaderno"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Python API and command-line client for the Fujitsu QUADERNO e-paper tablet over USB"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["quaderno"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quaderno.__version__"}  # the one place the version is set
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
