@@ -1,16 +1,17 @@
 """The Python API used directly (no CLI), against the in-memory fake device."""
 import datetime
+from pathlib import Path
 
 import pytest
-from fakedevice import FakeDevice
+from fakedevice import FakeDevice, MakePdf
 
 import quaderno
-from quaderno import (Entry, ExistsError, NotEmptyError, NotFoundError, PutResult,
+from quaderno import (Entry, Event, ExistsError, NotEmptyError, NotFoundError, PutResult,
                       QuadernoError)
 
 
 @pytest.fixture
-def d():
+def d() -> FakeDevice:
     d = FakeDevice()
     d.put_doc("Books/a.pdf", b"A")
     d.put_doc("Books/Old/b.pdf", b"B")
@@ -18,12 +19,12 @@ def d():
     return d
 
 
-def test_public_surface():
+def test_public_surface() -> None:
     assert callable(quaderno.connect) and callable(quaderno.pair) and quaderno.__version__
     assert issubclass(NotFoundError, QuadernoError)
 
 
-def test_lookup(d):
+def test_lookup(d: FakeDevice) -> None:
     a = d.resolve("Books/a.pdf")
     assert isinstance(a, Entry) and a.is_document and a.relpath == "Books/a.pdf" and a.size == 1
     assert a.revision and a.mtime and a.parent_id == d.resolve("Books").id
@@ -40,8 +41,8 @@ def test_lookup(d):
         d.find("zz*")
 
 
-def test_upload_and_put(d, mkpdf, tmp_path):
-    events = []
+def test_upload_and_put(d: FakeDevice, mkpdf: MakePdf, tmp_path: Path) -> None:
+    events: list[Event] = []
     e = d.upload(mkpdf("c.pdf"), "Books", on_event=events.append)
     assert e.path == "Document/Books/c.pdf" and events[-1].kind == "uploaded"
     with pytest.raises(ExistsError):                                     # never overwrites
@@ -59,7 +60,7 @@ def test_upload_and_put(d, mkpdf, tmp_path):
     assert res.uploaded == 2 and res.ignored == 1 and "Document/Books/tree/sub/y.pdf" in d.paths()
 
 
-def test_get(d, tmp_path):
+def test_get(d: FakeDevice, tmp_path: Path) -> None:
     copy = tmp_path / "a-copy.pdf"
     assert d.get("Books/a.pdf", str(copy)) == 1
     assert copy.read_bytes() == b"A"
@@ -70,8 +71,8 @@ def test_get(d, tmp_path):
         d.get("Books/Old", str(out))
 
 
-def test_mkdir_and_move(d):
-    events = []
+def test_mkdir_and_move(d: FakeDevice) -> None:
+    events: list[Event] = []
     d.put_doc("Books/c.pdf", b"C")
     d.put_doc("Books/d.pdf", b"D")
     d.mkdir("Archive/2026", parents=True, on_event=events.append)
@@ -85,7 +86,7 @@ def test_mkdir_and_move(d):
     assert {"created", "moved"} <= {ev.kind for ev in events}
 
 
-def test_move_refuses_name_clashes_before_moving_anything(d):
+def test_move_refuses_name_clashes_before_moving_anything(d: FakeDevice) -> None:
     d.put_doc("Archive/a.pdf", b"other A")
     d.put_doc("Note/c.pdf", b"C")
     before = d.paths()
@@ -100,16 +101,20 @@ def test_move_refuses_name_clashes_before_moving_anything(d):
     assert d.paths() == sorted(before + ["Document/Note/Old", "Document/Note/Old/b.pdf"])
 
 
-def test_rm(d):
+def test_rm(d: FakeDevice) -> None:
     for n in "xyz":
         d.put_doc(f"Archive/2026/{n}.pdf", n.encode())
     with pytest.raises(NotEmptyError):                                   # not recursive
         d.rm("Books/Old")
     before = d.paths()
     assert d.rm("Archive/2026/*", confirm=lambda plan: False) == [] and d.paths() == before
-    seen, events = [], []
-    deleted = d.rm("Archive/2026/*", confirm=lambda plan: seen.extend(plan) or True,
-                   on_event=events.append)
+    seen: list[Entry] = []
+    events: list[Event] = []
+
+    def confirm(plan: list[Entry]) -> bool:
+        seen.extend(plan)
+        return True
+    deleted = d.rm("Archive/2026/*", confirm=confirm, on_event=events.append)
     assert len(deleted) == 3 and len(seen) == 3 and not d.entries("Archive/2026")
     assert "deleted" in {ev.kind for ev in events}
     assert d.rm("Books/Old", recursive=True)[0].relpath == "Books/Old"   # literal: no confirm needed
@@ -117,7 +122,7 @@ def test_rm(d):
         d.rm("/", recursive=True)
 
 
-def test_device_controls(d):
+def test_device_controls(d: FakeDevice) -> None:
     opened = d.open("Note/n*", page=3)
     assert opened.relpath == "Note/n.pdf" and d.opened[-1] == (opened.id, 3)
     when = datetime.datetime(2026, 11, 7, 12, 30, 5, tzinfo=datetime.timezone.utc)

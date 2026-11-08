@@ -4,23 +4,27 @@ import contextlib
 import io
 import os
 import sys
-import types
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import pytest
-from fakedevice import FakeDevice, Q, expect
+from fakedevice import FakeDevice, expect
+
+from quaderno import cli as Q
 
 LONG = ("Fighter Combat - Tactics and Maneuvering -- Robert L_ Shaw -- 1988 -- Naval Institute "
         "Press -- 9780870210594 -- cdf446d4aa8b1e83b4cd4dc824de74f8 -- Anna’s Archive.pdf")
 
 
-def ns(**kw):
+def ns(**kw: Any) -> Q.Args:
     kw.setdefault("regex", False)
     kw.setdefault("yes", False)
     kw.setdefault("recursive", False)
-    return types.SimpleNamespace(**kw)
+    return Q.Args(**kw)
 
 
-def run(fn, d, **kw):
+def run(fn: Callable[[FakeDevice, Q.Args], object], d: FakeDevice, **kw: Any) -> str:
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         fn(d, ns(**kw))
@@ -28,15 +32,15 @@ def run(fn, d, **kw):
 
 
 class Stdin:
-    def __init__(self, tty):
+    def __init__(self, tty: bool) -> None:
         self.tty = tty
 
-    def isatty(self):
+    def isatty(self) -> bool:
         return self.tty
 
 
 @pytest.fixture
-def d():
+def d() -> FakeDevice:
     d = FakeDevice()
     d.put_doc(LONG, b"book")
     d.put_doc("DHS660-UG (1).pdf", b"manual")
@@ -49,12 +53,12 @@ def d():
     return d
 
 
-def test_move_long_name_with_a_short_glob(d):
+def test_move_long_name_with_a_short_glob(d: FakeDevice) -> None:
     out = run(Q.cmd_mv, d, src=["Fighter*"], dst="Books/")
     assert f"Document/Books/{LONG}" in d.paths(), out
 
 
-def test_ls_patterns(d):
+def test_ls_patterns(d: FakeDevice) -> None:
     """Case-insensitive; folders listed like ls -d."""
     assert run(Q.cmd_ls, d, path="b*", long=False).split() == ["Document/Bonus/", "Document/Books/"]
     out = run(Q.cmd_ls, d, path="Note/2024-0?*", long=False)
@@ -66,13 +70,13 @@ def test_ls_patterns(d):
     assert out.strip() == "Document/Note/sub/2024-05 deep.pdf", out
 
 
-def test_exact_names_win(d):
+def test_exact_names_win(d: FakeDevice) -> None:
     """Brackets and parentheses are taken literally when the file exists."""
     assert run(Q.cmd_ls, d, path="weird [draft].pdf", long=False).strip() == "weird [draft].pdf"
     assert run(Q.cmd_ls, d, path="DHS660-UG (1).pdf", long=False).strip() == "DHS660-UG (1).pdf"
 
 
-def test_regex(d):
+def test_regex(d: FakeDevice) -> None:
     """-E: searched anywhere in the name, case-insensitive."""
     d.dev_move(LONG, f"Books/{LONG}")
     out = run(Q.cmd_ls, d, path=r"Note/^2024-0[56] meet", long=False, regex=True)
@@ -83,14 +87,14 @@ def test_regex(d):
         run(Q.cmd_ls, d, path="Note/(", long=False, regex=True)
 
 
-def test_get_downloads_every_match(d, tmp_path):
+def test_get_downloads_every_match(d: FakeDevice, tmp_path: Path) -> None:
     run(Q.cmd_get, d, remote=["Note/*meeting*"], output=str(tmp_path))
     assert sorted(os.listdir(tmp_path)) == ["2024-05 meeting.pdf", "2024-06 meeting.pdf"]
     with expect("is a folder"):
         run(Q.cmd_get, d, remote=["B*"], output=str(tmp_path))
 
 
-def test_mv_several_matches_into_a_folder(d):
+def test_mv_several_matches_into_a_folder(d: FakeDevice) -> None:
     with expect("must be an existing folder"):
         run(Q.cmd_mv, d, src=["Note/*meeting*"], dst="Archive")
     run(Q.cmd_mv, d, src=["Note/*meeting*"], dst="Bonus")
@@ -98,7 +102,7 @@ def test_mv_several_matches_into_a_folder(d):
     assert "already there" in run(Q.cmd_mv, d, src=["Bonus/2024-05*"], dst="Bonus")
 
 
-def test_rm_patterns(d, monkeypatch):
+def test_rm_patterns(d: FakeDevice, monkeypatch: pytest.MonkeyPatch) -> None:
     """Lists matches; without a TTY it refuses unless --yes."""
     monkeypatch.setattr(sys, "stdin", Stdin(tty=False))
     d.dev_move("Note/2024-05 meeting.pdf", "Bonus/2024-05 meeting.pdf")
@@ -126,7 +130,7 @@ def test_rm_patterns(d, monkeypatch):
     assert d.paths() == before
 
 
-def test_rm_asks_at_a_terminal(d, monkeypatch):
+def test_rm_asks_at_a_terminal(d: FakeDevice, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", Stdin(tty=True))
     monkeypatch.setattr(builtins, "input", lambda prompt="": "n")
     out = run(Q.cmd_rm, d, remote=["DHS*"])
@@ -136,16 +140,16 @@ def test_rm_asks_at_a_terminal(d, monkeypatch):
     assert "Document/DHS660-UG (1).pdf" not in d.paths()
 
 
-def test_open_needs_exactly_one_document(d):
-    run(Q.cmd_open, d, remote="fighter*", page=None)
-    assert d.opened == [(d._by_path(LONG)["entry_id"], None)]
+def test_open_needs_exactly_one_document(d: FakeDevice) -> None:
+    run(Q.cmd_open, d, target="fighter*", page=None)
+    assert d.opened == [(d._at(LONG)["entry_id"], None)]
     with expect("matches 2 documents"):
-        run(Q.cmd_open, d, remote="Note/*meeting*", page=None)
+        run(Q.cmd_open, d, target="Note/*meeting*", page=None)
     with expect("is a folder"):
-        run(Q.cmd_open, d, remote="B*", page=None)
+        run(Q.cmd_open, d, target="B*", page=None)
 
 
-def test_leading_and_trailing_spaces_are_kept(d):
+def test_leading_and_trailing_spaces_are_kept(d: FakeDevice) -> None:
     """The device had a folder named 'sailing ' (trailing space)."""
     d.put_doc("Books/sailing /Ocean Passages.pdf", b"op")
     d.put_doc("Books/ leading.pdf", b"lead")
@@ -159,7 +163,7 @@ def test_leading_and_trailing_spaces_are_kept(d):
     assert "Document/Books/sailing /Charts" in d.paths()
 
 
-def test_no_match_and_not_found(d):
+def test_no_match_and_not_found(d: FakeDevice) -> None:
     with expect("no match"):
         run(Q.cmd_ls, d, path="zzz*", long=False)
     with expect("404"):

@@ -7,20 +7,27 @@ import logging
 import os
 import ssl
 import uuid
+from collections.abc import Collection
+from typing import BinaryIO, Self
 from urllib.parse import quote
 
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+
 from . import crypto
-from .errors import (CertificateError, DeviceUnreachableError, LoginError, NotFoundError,
-                     ProtocolError, QuadernoError, RequestError)
-from .util import HTTPS_PORT
+from .errors import (AuthError, CertificateError, DeviceUnreachableError, LoginError,
+                     NotFoundError, ProtocolError, QuadernoError, RequestError)
+from .util import HTTPS_PORT, JsonObject, json_int, json_str
 
 log = logging.getLogger("quaderno")
 CHUNK = 8 * 1024 * 1024  # upload piece size (the one tested)
-_STALE = (http.client.RemoteDisconnected, http.client.CannotSendRequest,
-          http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError)
+_STALE: tuple[type[BaseException], ...] = (
+    http.client.RemoteDisconnected, http.client.CannotSendRequest,
+    http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError)
+
+Body = JsonObject | bytes | None  # a JSON object is sent as JSON, bytes as they are
 
 
-def _unreachable(err):
+def _unreachable(err: BaseException) -> DeviceUnreachableError:
     return DeviceUnreachableError(f"lost contact with the device ({err.__class__.__name__}: "
                                   f"{err}); is it still connected and awake?")
 
@@ -29,14 +36,18 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS to a self-signed device: accept exactly the certificate obtained at
     pairing (when there is one); checked on every (re)connect."""
 
-    def __init__(self, *args, pin=None, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, host: str, port: int, *, context: ssl.SSLContext, timeout: float,
+                 pin: bytes | None = None) -> None:
+        super().__init__(host, port, context=context, timeout=timeout)
         self._pin = pin
 
-    def connect(self):
+    def connect(self) -> None:
         super().connect()
-        if self._pin is not None and self.sock.getpeercert(binary_form=True) != self._pin:
-            self.sock.close()
+        if self._pin is None:
+            return
+        sock = self.sock
+        if not isinstance(sock, ssl.SSLSocket) or sock.getpeercert(binary_form=True) != self._pin:
+            sock.close()
             raise CertificateError("device TLS certificate differs from the one received at "
                                    "pairing (devicecert.bin); if the firmware was updated, "
                                    "run `quaderno pair --force`")
@@ -45,14 +56,15 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 class Client:
     """One device session: a kept-alive HTTPS connection plus the login cookie."""
 
-    def __init__(self, addr, client_id, key, timeout=60, pinned_cert=None):
+    def __init__(self, addr: str, client_id: str, key: RSAPrivateKey | None, timeout: float = 60,
+                 pinned_cert: bytes | None = None) -> None:
         self.addr = addr.strip("[]")
         self.client_id = client_id
         self.key = key
         self.timeout = timeout
         self.pinned_cert = pinned_cert
-        self.cookies = {}
-        self._conn = None
+        self.cookies: dict[str, str] = {}
+        self._conn: PinnedHTTPSConnection | None = None
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE  # self-signed; pinned_cert does the checking
@@ -63,28 +75,31 @@ class Client:
         self.ctx = ctx
 
     # --- connection ------------------------------------------------------------
-    def close(self):
+    def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _send(self, method, path, body, hdrs):
+    def _send(self, method: str, path: str, body: bytes | None,
+              hdrs: dict[str, str]) -> http.client.HTTPResponse:
         """Send on the kept-alive connection; if that connection had gone stale,
         reconnect and send once more (a fresh connection is never retried)."""
         for _ in range(2):
-            reused = self._conn is not None
-            if not reused:
-                self._conn = PinnedHTTPSConnection(self.addr, HTTPS_PORT, context=self.ctx,
-                                                   timeout=self.timeout, pin=self.pinned_cert)
+            conn = self._conn
+            reused = conn is not None
+            if conn is None:
+                conn = self._conn = PinnedHTTPSConnection(
+                    self.addr, HTTPS_PORT, context=self.ctx, timeout=self.timeout,
+                    pin=self.pinned_cert)
             try:
-                self._conn.request(method, path, body=body, headers=hdrs)
-                return self._conn.getresponse()
+                conn.request(method, path, body=body, headers=hdrs)
+                return conn.getresponse()
             except _STALE as err:
                 self.close()
                 if not reused:
@@ -97,33 +112,30 @@ class Client:
                 raise
         raise DeviceUnreachableError(f"{method} {path}: lost the connection to the device")
 
-    def request(self, method, path, body=None, headers=None, ok=(200, 204), raw=False,
-                stream_to=None):
-        """Call the Web API. JSON bodies are encoded, JSON answers decoded; with
-        `stream_to`, the response body is written there and its size returned."""
+    def _request(self, method: str, path: str, body: Body = None,
+                 headers: dict[str, str] | None = None, ok: Collection[int] = (200, 204),
+                 stream_to: BinaryIO | None = None) -> JsonObject | int | None:
+        """One Web API call. A JSON object body is encoded; the answer is decoded
+        (None if empty), or with `stream_to`, written there and its size returned.
+        The typed entry points are request, request_json and request_stream."""
         hdrs = {"Host": f"digitalpaper.local:{HTTPS_PORT}", "Accept": "application/json"}
         if self.cookies:
             hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
-        if isinstance(body, (dict, list)):
-            body = json.dumps(body).encode()
+        data: bytes | None
+        if isinstance(body, dict):
+            data = json.dumps(body).encode()
             hdrs["Content-Type"] = "application/json"
+        else:
+            data = body
         hdrs.update(headers or {})
-        resp = self._send(method, path, body, hdrs)
+        resp = self._send(method, path, data, hdrs)
+        result: JsonObject | int | None
         try:
             for h in resp.headers.get_all("Set-Cookie") or []:
                 name, _, rest = h.partition("=")
                 self.cookies[name.strip()] = rest.split(";", 1)[0]
             if resp.status not in ok:
-                data = resp.read()
-                code = None
-                try:
-                    err = json.loads(data)
-                    code = err.get("error_code")
-                    msg = f"{code} {err.get('message')}"
-                except ValueError:
-                    msg = data[:200].decode(errors="replace")
-                cls = NotFoundError if resp.status == 404 else RequestError
-                raise cls(f"{method} {path} -> HTTP {resp.status}: {msg}", resp.status, code)
+                raise self._http_error(method, path, resp.status, resp.read())
             if stream_to is not None:
                 total = 0
                 while chunk := resp.read(1 << 20):
@@ -131,8 +143,8 @@ class Client:
                     total += len(chunk)
                 result = total
             else:
-                data = resp.read()
-                result = data if raw else (self._json(method, path, data) if data else None)
+                answer = resp.read()
+                result = self._json(method, path, answer) if answer else None
         except QuadernoError:
             if resp.will_close:
                 self.close()
@@ -147,18 +159,70 @@ class Client:
             self.close()
         return result
 
+    def request(self, method: str, path: str, body: Body = None,
+                headers: dict[str, str] | None = None,
+                ok: Collection[int] = (200, 204)) -> JsonObject | None:
+        """Call the Web API; the decoded JSON object, or None for an empty answer."""
+        result = self._request(method, path, body, headers, ok)
+        if isinstance(result, int):
+            raise ProtocolError(f"{method} {path}: unexpected answer")
+        return result
+
+    def request_json(self, method: str, path: str, body: Body = None,
+                     headers: dict[str, str] | None = None,
+                     ok: Collection[int] = (200, 204)) -> JsonObject:
+        """Like request, for calls whose answer must be a JSON object."""
+        result = self.request(method, path, body, headers, ok)
+        if result is None:
+            raise ProtocolError(f"{method} {path}: the device's answer is empty")
+        return result
+
+    def request_stream(self, method: str, path: str, fh: BinaryIO,
+                       headers: dict[str, str] | None = None) -> int:
+        """Write the answer's body to `fh`; returns its size in bytes."""
+        result = self._request(method, path, None, headers, (200, 204), fh)
+        if not isinstance(result, int):
+            raise ProtocolError(f"{method} {path}: unexpected answer")
+        return result
+
     @staticmethod
-    def _json(method, path, data):
+    def _http_error(method: str, path: str, status: int, data: bytes) -> QuadernoError:
+        code = None
         try:
-            return json.loads(data)
+            err = json.loads(data)
+        except ValueError:
+            msg = data[:200].decode(errors="replace")
+        else:
+            if isinstance(err, dict):
+                code = err.get("error_code")
+                code = str(code) if code is not None else None
+                msg = f"{code} {err.get('message')}"
+            else:
+                msg = str(err)[:200]
+        text = f"{method} {path} -> HTTP {status}: {msg}"
+        if status == 404:
+            return NotFoundError(text, status, code)
+        return RequestError(text, status, code)
+
+    @staticmethod
+    def _json(method: str, path: str, data: bytes) -> JsonObject:
+        try:
+            value = json.loads(data)
         except ValueError as err:
             raise ProtocolError(f"{method} {path}: the device's answer isn't JSON ({err}): "
                                 f"{data[:80]!r}") from err
+        if not isinstance(value, dict):
+            raise ProtocolError(f"{method} {path}: the device's answer isn't a JSON object: "
+                                f"{data[:80]!r}")
+        return value
 
     # --- login -----------------------------------------------------------------
-    def authenticate(self):
+    def authenticate(self) -> None:
+        if self.key is None:
+            raise AuthError("no private key to log in with")
         try:
-            nonce = self.request("GET", "/auth/nonce/" + quote(self.client_id))["nonce"]
+            nonce = json_str(self.request_json("GET", "/auth/nonce/" + quote(self.client_id)),
+                             "nonce")
             sig = crypto.sign(self.key, nonce.encode("latin-1"))
             self.request("PUT", "/auth", {"client_id": self.client_id,
                                           "nonce_signed": base64.b64encode(sig).decode()})
@@ -170,16 +234,16 @@ class Client:
             raise
 
     # --- raw document transfer ---------------------------------------------------
-    def download_to(self, doc_id, fh):
-        return self.request("GET", f"/documents/{doc_id}/file", stream_to=fh,
-                            headers={"Accept": "*/*"})
+    def download_to(self, doc_id: str, fh: BinaryIO) -> int:
+        return self.request_stream("GET", f"/documents/{doc_id}/file", fh,
+                                   headers={"Accept": "*/*"})
 
-    def upload_file(self, local, folder_id, name):
+    def upload_file(self, local: str, folder_id: str, name: str) -> str:
         """Create a document `name` in folder `folder_id` with the contents of
         `local`; returns its id. A failed transfer deletes the half-made entry."""
-        doc_id = self.request("POST", "/documents", {"parent_folder_id": folder_id,
-                                                     "file_name": name,
-                                                     "document_source": ""})["document_id"]
+        doc_id = json_str(self.request_json("POST", "/documents", {
+            "parent_folder_id": folder_id, "file_name": name, "document_source": ""}),
+            "document_id")
         try:
             self._send_file(local, doc_id)
             return doc_id
@@ -190,7 +254,7 @@ class Client:
                 log.warning("warning: could not remove the incomplete upload %s", name)
             raise
 
-    def _send_file(self, local, doc_id):
+    def _send_file(self, local: str, doc_id: str) -> None:
         # The multipart filename is ignored: the document's name was set by the
         # POST in upload_file. A fixed ASCII value keeps arbitrary file names
         # (quotes, non-ASCII) out of a header the device has to parse.
@@ -204,11 +268,11 @@ class Client:
                         f'Content-Disposition: form-data; name="file"; filename="altair.pdf"\r\n'
                         f"Content-Type: application/octet-stream\r\n\r\n").encode() + chunk + \
                     f"\r\n--{boundary}--\r\n".encode()
-                r = self.request(
+                r = self.request_json(
                     "PUT", f"/documents/{doc_id}/file?offset_bytes={offset}&total_bytes={size}",
                     body, {"Content-Type": f"multipart/form-data; boundary={boundary}"},
                     ok=(200, 206))
-                offset = int(r["current_bytes"])
+                offset = json_int(r, "current_bytes")
                 if offset >= size:
                     if r.get("completed") != "yes":
                         raise RequestError("upload finished but device did not mark it complete")
@@ -217,6 +281,7 @@ class Client:
                     raise RequestError("upload stalled")
                 fh.seek(offset)
 
-    def create_folder(self, parent_id, name):
-        return self.request("POST", "/folders", {"parent_folder_id": parent_id,
-                                                 "folder_name": name})["folder_id"]
+    def create_folder(self, parent_id: str, name: str) -> str:
+        return json_str(self.request_json("POST", "/folders", {"parent_folder_id": parent_id,
+                                                               "folder_name": name}),
+                        "folder_id")

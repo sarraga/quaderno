@@ -7,33 +7,70 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import credentials, pairing, usb
 from .device import Device, connect
+from .entry import Entry
 from .errors import AuthError, ConnectError, PairingError, QuadernoError
-from .util import ROOT, human
+from .events import Event
+from .util import ROOT, JsonObject, human
 
 
-def show(event):
+class Args(argparse.Namespace):
+    """The parsed command line. Which attributes are set depends on the command."""
+    cmd: str
+    fn: "Command | None"
+    addr: str | None
+    config_dir: str | None
+    verbose: bool
+    regex: bool           # ls, get, mv, rm, open
+    recursive: bool       # ls, get, put, rm
+    path: str             # ls
+    long: bool            # ls
+    remote: list[str]     # get, rm, mkdir: device paths
+    output: str | None    # get -o; screenshot
+    local: list[str]      # put: local files and directories
+    dest: str | None      # put -d
+    yes: bool             # rm
+    parents: bool         # mkdir
+    src: list[str]        # mv
+    dst: str              # mv
+    json: bool            # info
+    directory: str        # sync: local directory
+    folder: str           # sync: device folder
+    delete: bool          # sync
+    dry_run: bool         # sync
+    force: bool           # sync, pair
+    target: str           # open
+    page: int | None      # open
+    pin_file: str | None  # pair
+
+
+Command = Callable[[Device, Args], "int | None"]
+
+
+def show(event: Event) -> None:
     """Print an API event: warnings to stderr, the rest to stdout."""
     print(event.message, file=sys.stderr if event.warning else sys.stdout)
 
 
-def open_device(args):
-    def on_switch(tty, serial):
+def open_device(args: Args) -> Device:
+    def on_switch(tty: str, serial: str | None) -> None:
         if args.verbose:
             print(f"switching {tty} ({serial}) to USB Ethernet", file=sys.stderr)
     dev = connect(addr=args.addr, config_dir=args.config_dir, on_switch=on_switch)
     if args.verbose:
         tls = "pinned to devicecert.bin" if dev.pinned_cert else "unverified (no pinned cert)"
-        print(f"credentials: {dev.credentials.source}\ndevice: {dev.addr}\ntls: {tls}",
-              file=sys.stderr)
+        source = dev.credentials.source if dev.credentials else "?"
+        print(f"credentials: {source}\ndevice: {dev.addr}\ntls: {tls}", file=sys.stderr)
     return dev
 
 
 # --- commands (each takes a Device and the parsed args) ---------------------------
 
-def cmd_ls(dev, args):
+def cmd_ls(dev: Device, args: Args) -> None:
     rows, by_pattern = dev.ls(args.path, recursive=args.recursive, regex=args.regex)
     full_path = args.recursive or by_pattern
     for e in rows:
@@ -47,21 +84,21 @@ def cmd_ls(dev, args):
             print(name)
 
 
-def cmd_get(dev, args):
+def cmd_get(dev: Device, args: Args) -> None:
     dev.get(args.remote, args.output or ".", recursive=args.recursive, regex=args.regex,
             on_event=show)
 
 
-def cmd_put(dev, args):
+def cmd_put(dev: Device, args: Args) -> int | None:
     """Uploads what it can, like cp. Exit status 1 if anything named couldn't be
     uploaded (missing, not a PDF, a folder without -r). Files already on the
     device and non-PDFs inside folders uploaded with -r don't count."""
-    res = dev.put(args.local, args.remote, recursive=args.recursive, on_event=show)
+    res = dev.put(args.local, args.dest, recursive=args.recursive, on_event=show)
     return 1 if res.missing or res.rejected else None
 
 
-def cmd_rm(dev, args):
-    def confirm(plan):
+def cmd_rm(dev: Device, args: Args) -> None:
+    def confirm(plan: list[Entry]) -> bool:
         print(f"pattern matches {len(plan)}:")
         for e in plan:
             print("  " + e.path + ("/" if e.is_folder else ""))
@@ -76,33 +113,33 @@ def cmd_rm(dev, args):
            confirm=None if args.yes else confirm, on_event=show)
 
 
-def cmd_mkdir(dev, args):
+def cmd_mkdir(dev: Device, args: Args) -> None:
     for path in args.remote:
         dev.mkdir(path, parents=args.parents, on_event=show)
 
 
-def cmd_mv(dev, args):
+def cmd_mv(dev: Device, args: Args) -> None:
     dev.move(args.src, args.dst, regex=args.regex, on_event=show)
 
 
-def cmd_info(dev, args):
+def cmd_info(dev: Device, args: Args) -> None:
     info = dev.info()
     if args.json:
         print(json.dumps(info, indent=2))
         return
 
-    def val(d, k="value"):
-        return d.get(k, d.get("error", "?")) if isinstance(d, dict) else d
+    def val(d: JsonObject, k: str = "value") -> object:
+        return d.get(k, d.get("error", "?"))
     st, b = info["storage"], info["battery"]
     print(f"address        {dev.addr}")
     print(f"api version    {val(info['api_version'])}")
     print(f"firmware       {val(info['firmware_version'])}")
     print(f"owner          {val(info['owner'])}")
     print(f"mac address    {val(info['mac_address'])}")
-    if "capacity" in st:
+    try:
         cap, free = int(st["capacity"]), int(st["available"])
         print(f"storage        {human(cap - free)} used / {human(cap)} ({human(free)} free)")
-    else:
+    except (KeyError, TypeError, ValueError):
         print(f"storage        {val(st)}")
     if "level" in b:
         print(f"battery        {b['level']}% ({b.get('status', '?')}, {b.get('plugged', '?')})")
@@ -110,49 +147,51 @@ def cmd_info(dev, args):
         print(f"battery        {val(b)}")
 
 
-def cmd_screenshot(dev, args):
-    dev.screenshot(args.output)
-    print(f"saved {args.output}")
+def cmd_screenshot(dev: Device, args: Args) -> None:
+    output = args.output or "quaderno-screen.png"
+    dev.screenshot(output)
+    print(f"saved {output}")
 
 
-def cmd_open(dev, args):
-    e = dev.open(args.remote, page=args.page, regex=args.regex)
+def cmd_open(dev: Device, args: Args) -> None:
+    e = dev.open(args.target, page=args.page, regex=args.regex)
     where = f" at page {args.page}" if args.page is not None else ""
     print(f"opened {e.path}{where} on the device")
 
 
-def mac_timezone_name():
+def mac_timezone_name() -> str:
     try:
         return os.readlink("/etc/localtime").split("zoneinfo/", 1)[1]
     except (OSError, IndexError):
         return time.strftime("%Z")
 
 
-def cmd_time(dev, args):
+def cmd_time(dev: Device, args: Args) -> None:
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     print(f"device clock set to {dev.set_time(now)}")
     tz = dev.timezone()
     print(f"device timezone {tz}, Mac timezone {mac_timezone_name()}")
+    if tz is None:
+        return
     try:
-        from zoneinfo import ZoneInfo
         dev_off = now.astimezone(ZoneInfo(tz)).utcoffset()
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError):
         return
     mac_off = now.astimezone().utcoffset()
-    if dev_off != mac_off:
+    if dev_off is not None and mac_off is not None and dev_off != mac_off:
         hours = (mac_off - dev_off).total_seconds() / 3600
         print(f"note: the device shows {abs(hours):g} h {'behind' if hours > 0 else 'ahead of'} "
               f"the Mac's local time because its timezone differs; change it in the "
               f"QUADERNO's own settings")
 
 
-def cmd_sync(dev, args):
-    dev.sync(args.local, args.remote, delete=args.delete, dry_run=args.dry_run,
+def cmd_sync(dev: Device, args: Args) -> None:
+    dev.sync(args.directory, args.folder, delete=args.delete, dry_run=args.dry_run,
              force=args.force, on_event=show)
 
 
-def cmd_pair(args):
-    def read_pin():
+def cmd_pair(args: Args) -> None:
+    def read_pin() -> str:
         prompt = "Enter the PIN shown on the QUADERNO: "
         if args.pin_file:
             # Lets another process (or person) supply the PIN by writing this file.
@@ -173,27 +212,44 @@ def cmd_pair(args):
         print(prompt, end="", flush=True)
         return sys.stdin.readline()
 
-    def on_event(ev):
+    def on_event(ev: Event) -> None:
         print(ev.message, file=sys.stderr if ev.warning else sys.stdout, flush=True)
-    addr = args.addr or os.environ.get("QUADERNO_ADDR") or usb.discover(
-        on_switch=lambda tty, s: args.verbose and print(f"switching {tty} ({s})", file=sys.stderr))
+
+    def on_switch(tty: str, serial: str | None) -> None:
+        if args.verbose:
+            print(f"switching {tty} ({serial})", file=sys.stderr)
+    addr = args.addr or os.environ.get("QUADERNO_ADDR") or usb.discover(on_switch=on_switch)
     pairing.pair(read_pin, addr=addr, force=args.force, cred_dir=args.config_dir,
                  on_event=on_event)
 
 
-def complete(argv):
-    """`quaderno __complete [--dirs] [--] PREFIX`: device paths for shell Tab
-    completion, one per line, folders ending in '/'. Lists the folder PREFIX is in,
-    keeping the folder part exactly as typed. Never prints errors; prints nothing
-    (at once) when the device isn't connected."""
-    dirs_only = "--dirs" in argv
-    words = [a for a in argv if a not in ("--dirs", "--")]
-    prefix = words[0] if words else ""
+def complete(argv: list[str]) -> int:
+    """`quaderno __complete [--dirs] [--config DIR] [--addr ADDR] [--] PREFIX`:
+    device paths for shell Tab completion, one per line, folders ending in '/'.
+    Lists the folder PREFIX is in, keeping the folder part exactly as typed. The
+    shell passes on --config and --addr from the command line being completed.
+    Never prints errors; prints nothing (at once) when the device isn't connected."""
+    dirs_only, config_dir, addr, prefix = False, None, os.environ.get("QUADERNO_ADDR"), ""
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--dirs":
+            dirs_only = True
+        elif a in ("--config", "--addr") and rest:
+            value = rest.pop(0)
+            if a == "--config":
+                config_dir = os.path.expanduser(value)  # as typed: the shell hasn't expanded ~
+            else:
+                addr = value
+        elif a == "--":
+            prefix = rest[0] if rest else ""
+            break
+        else:
+            prefix = a
     try:
-        addr = os.environ.get("QUADERNO_ADDR")
         if not addr and not usb.usb_devices():
             return 0
-        creds = credentials.load_credentials()
+        creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
         with Device(addr or usb.discover(creds.serial), creds.client_id, creds.key, timeout=5,
                     pinned_cert=creds.pinned_cert) as dev:
             dev.authenticate()
@@ -205,14 +261,14 @@ def complete(argv):
                 if dirs_only and not e.is_folder:
                     continue
                 print(typed_dir + sep + e.name + ("/" if e.is_folder else ""))
-    except (QuadernoError, OSError, ValueError, KeyError):
+    except (QuadernoError, OSError):
         pass
     return 0
 
 
 # --- argument parsing -------------------------------------------------------------
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="quaderno",
                                  description="Fujitsu QUADERNO over USB: files, sync, pairing.")
     ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' (default: auto)")
@@ -228,7 +284,8 @@ def build_parser():
                      help="treat remote path components as regular expressions "
                           "(case-insensitive search) instead of glob patterns")
 
-    def add(name, fn, help, patterns=False):
+    def add(name: str, fn: Command | None, help: str,
+            patterns: bool = False) -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help, parents=[pat] if patterns else [])
         p.set_defaults(fn=fn)
         return p
@@ -245,7 +302,7 @@ def build_parser():
 
     p = add("put", cmd_put, "upload PDFs (or directories with -r)")
     p.add_argument("local", nargs="+")
-    p.add_argument("-d", "--dest", dest="remote", help="remote folder or new path (default: Document)")
+    p.add_argument("-d", "--dest", help="remote folder or new path (default: Document)")
     p.add_argument("-r", "--recursive", action="store_true", help="upload directories")
 
     p = add("rm", cmd_rm, "delete documents or empty folders (-r: with contents)", patterns=True)
@@ -268,8 +325,9 @@ def build_parser():
     p.add_argument("output", nargs="?", default="quaderno-screen.png")
 
     p = add("sync", cmd_sync, "mirror a device folder into a local directory (incremental)")
-    p.add_argument("local", help="local directory (created if missing)")
-    p.add_argument("remote", nargs="?", default=ROOT, help="device folder (default: Document)")
+    p.add_argument("directory", metavar="local", help="local directory (created if missing)")
+    p.add_argument("folder", metavar="remote", nargs="?", default=ROOT,
+                   help="device folder (default: Document)")
     p.add_argument("--delete", action="store_true",
                    help="also delete local copies of documents deleted on the device")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
@@ -277,7 +335,7 @@ def build_parser():
                    help="allow a first sync into a non-empty directory (existing files are kept)")
 
     p = add("open", cmd_open, "open a document on the device's screen", patterns=True)
-    p.add_argument("remote")
+    p.add_argument("target", metavar="remote")
     p.add_argument("-p", "--page", type=int, help="page number")
 
     add("time", cmd_time, "set the device clock from the Mac")
@@ -293,7 +351,7 @@ def build_parser():
 EXIT_ERROR, EXIT_CONNECT, EXIT_AUTH = 1, 3, 4  # 2 is argparse's usage error
 
 
-def exit_code(err):
+def exit_code(err: QuadernoError) -> int:
     """3: the device can't be reached; 4: pairing/credentials/identity; 1: the rest."""
     if isinstance(err, ConnectError):
         return EXIT_CONNECT
@@ -302,11 +360,18 @@ def exit_code(err):
     return EXIT_ERROR
 
 
-def main(argv=None):
+def describe_os_error(err: OSError) -> str:
+    """'PATH: reason' for a local file problem, as cp and friends print it."""
+    if err.filename is not None and err.strerror:
+        return f"{err.filename}: {err.strerror}"
+    return str(err)
+
+
+def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["__complete"]:
         return complete(argv[1:])
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv, namespace=Args())
     logging.basicConfig(format="%(message)s", level=logging.WARNING, stream=sys.stderr)
     try:
         if args.cmd == "pair":
@@ -320,10 +385,16 @@ def main(argv=None):
                 serial = None
             print(args.addr or usb.discover(serial))
             return 0
+        fn = args.fn
+        if fn is None:  # every other command sets one
+            raise QuadernoError(f"{args.cmd}: nothing to run")
         with open_device(args) as dev:
-            return args.fn(dev, args) or 0
+            return fn(dev, args) or 0
     except QuadernoError as err:
         print(f"quaderno: {err}", file=sys.stderr)
         return exit_code(err)
+    except OSError as err:  # local files: a missing directory, no permission, disk full
+        print(f"quaderno: {describe_os_error(err)}", file=sys.stderr)
+        return EXIT_ERROR
     except KeyboardInterrupt:
         return 130

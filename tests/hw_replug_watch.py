@@ -2,14 +2,22 @@
 enumerates, then run the CLI so it has to do the USB mode switch itself.
 With --tab, that first command is a Tab completion (`quaderno __complete Bo`),
 to check that the first Tab after plugging in works."""
-import glob, os, subprocess, sys, time
+import glob
+import os
+import subprocess
+import sys
+import time
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from quaderno import usb as Q
+from quaderno import usb as Q  # noqa: E402
 
 t0 = time.time()
-def log(*a):
+
+
+def log(*a: object) -> None:
     print(f"[{time.time() - t0:6.1f}s]", *a, flush=True)
+
 
 deadline = t0 + 600
 log("waiting for unplug")

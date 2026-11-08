@@ -24,7 +24,7 @@ class QuadernoError(Exception):
     """Any failure talking to the device or carrying out an operation.
     `status` is the HTTP status the device answered with, when there was one."""
 
-    def __init__(self, msg, status=None):
+    def __init__(self, msg: str, status: int | None = None) -> None:
         super().__init__(msg)
         self.status = status
 
@@ -76,7 +76,7 @@ class WrongPinError(PairingError):
 class RequestError(QuadernoError):
     """The device answered with an HTTP error. `code` is its error_code, e.g. '40006'."""
 
-    def __init__(self, msg, status=None, code=None):
+    def __init__(self, msg: str, status: int | None = None, code: str | None = None) -> None:
         super().__init__(msg, status)
         self.code = code
 
@@ -92,7 +92,7 @@ class ProtocolError(QuadernoError):
 class NotFoundError(QuadernoError):
     """A path doesn't exist on the device, or a pattern matched nothing."""
 
-    def __init__(self, msg, status=404, code=None):
+    def __init__(self, msg: str, status: int | None = 404, code: str | None = None) -> None:
         super().__init__(msg, status)
         self.code = code
 

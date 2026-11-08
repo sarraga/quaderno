@@ -4,30 +4,32 @@ import contextlib
 import io
 import json
 import os
-import types
+from pathlib import Path
 
 import pytest
-from fakedevice import FakeDevice, Q, expect
+from fakedevice import FakeDevice, expect
+
+from quaderno import cli as Q
 
 from quaderno.sync import SYNC_STATE
 from quaderno.util import parse_device_time
 
 
-def sync(d, local, remote="Document", **kw):
-    args = types.SimpleNamespace(local=local, remote=remote, delete=kw.get("delete", False),
-                                 dry_run=kw.get("dry_run", False), force=kw.get("force", False))
+def sync(d: FakeDevice, local: str, remote: str = "Document", **kw: bool) -> str:
+    args = Q.Args(directory=local, folder=remote, delete=kw.get("delete", False),
+                  dry_run=kw.get("dry_run", False), force=kw.get("force", False))
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         Q.cmd_sync(d, args)
     return out.getvalue()
 
 
-def read(path):
+def read(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
 
 
-def files(root):
+def files(root: str) -> list[str]:
     out = []
     for dp, dn, fn in os.walk(root):
         for f in fn:
@@ -37,7 +39,7 @@ def files(root):
 
 
 @pytest.fixture
-def d():
+def d() -> FakeDevice:
     d = FakeDevice()
     d.put_doc("a.pdf", b"A1")
     d.put_doc("Note/n1.pdf", b"N1")
@@ -47,7 +49,7 @@ def d():
     return d
 
 
-def test_incremental_sync(d, tmp_path):
+def test_incremental_sync(d: FakeDevice, tmp_path: Path) -> None:
     """One mirror through a sequence of device-side and local changes."""
     L = str(tmp_path / "mirror")
 
@@ -55,7 +57,7 @@ def test_incremental_sync(d, tmp_path):
     sync(d, L)
     assert files(L) == ["Books/b.pdf", "Note/deep/n2.pdf", "Note/n1.pdf", "a.pdf"], files(L)
     assert os.path.isdir(os.path.join(L, "Empty"))
-    e = d._by_path("a.pdf")
+    e = d._at("a.pdf")
     assert int(os.stat(os.path.join(L, "a.pdf")).st_mtime) == parse_device_time(e["modified_date"])
     assert d.downloads == 4
 
@@ -116,7 +118,7 @@ def test_incremental_sync(d, tmp_path):
     assert all({"path", "rev", "size", "mtime"} <= set(v) for v in st["entries"].values())
 
 
-def test_names_that_clash_on_a_case_insensitive_volume(d, tmp_path):
+def test_names_that_clash_on_a_case_insensitive_volume(d: FakeDevice, tmp_path: Path) -> None:
     d.put_doc("Case.pdf", b"upper")
     d.put_doc("case.pdf", b"lower")
     L = str(tmp_path / "mirror")
@@ -124,7 +126,7 @@ def test_names_that_clash_on_a_case_insensitive_volume(d, tmp_path):
     assert "CLASH" in out and len([f for f in files(L) if f.lower() == "case.pdf"]) == 1
 
 
-def test_guards(d, tmp_path):
+def test_guards(d: FakeDevice, tmp_path: Path) -> None:
     L = str(tmp_path / "mirror")
     sync(d, L)
     with expect("mirrors Document"):

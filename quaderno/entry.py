@@ -2,14 +2,15 @@
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from .errors import ProtocolError
-from .util import ROOT, parse_device_time
+from .util import ROOT, JsonObject, parse_device_time
 
 log = logging.getLogger("quaderno")
 
 
-def _int_field(d, key):
+def _int_field(d: JsonObject, key: str) -> int | None:
     """d[key] as an int; None if absent. These fields (size, page count) are only
     displayed, so an unreadable one is logged and read as missing rather than
     failing the whole listing."""
@@ -39,22 +40,22 @@ class Entry:
     revision: str | None = None    # changes whenever the document's file changes
     modified: str | None = None    # device time, 'YYYY-MM-DDTHH:MM:SSZ'
     created: str | None = None
-    raw: dict = field(default_factory=dict, repr=False, compare=False)
+    raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
-    def is_folder(self):
+    def is_folder(self) -> bool:
         return self.type == "folder"
 
     @property
-    def is_document(self):
+    def is_document(self) -> bool:
         return self.type == "document"
 
     @property
-    def relpath(self):
+    def relpath(self) -> str:
         return self.path[len(ROOT) + 1:] if self.path.startswith(ROOT + "/") else ""
 
     @property
-    def mtime(self):
+    def mtime(self) -> int | None:
         """Modification time as epoch seconds; None if the device gave none.
         Raises ProtocolError if it gave one this client can't read."""
         try:
@@ -64,7 +65,7 @@ class Entry:
                                 f"{self.path}: {self.modified!r} ({err})") from err
 
     @classmethod
-    def from_api(cls, d):
+    def from_api(cls, d: JsonObject) -> "Entry":
         """Build from a Web API entry. Dates are kept as the device's text and
         only parsed when used (mtime); see _int_field for size and page count."""
         return cls(id=d["entry_id"], name=d.get("entry_name", ""),

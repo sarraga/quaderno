@@ -44,5 +44,9 @@ try 'quaderno get Books/Military\ History/Jag' \
 try 'quaderno mv Books/Fight'             'quaderno mv Books/Fighter\ Combat\ -\ Tactics\ and\ Maneuvering\ --\ Robert\ L_\ Shaw\ --\ 1988\ --\ Naval\ Institute\ Press\ --\ 9780870210594\ --\ cdf446d4aa8b1e83b4cd4dc824de74f8\ --\ Anna’s\ Archive.pdf '
 try 'quaderno sync /tmp/x Sam'            'quaderno sync /tmp/x Samples/'
 try "quaderno ls 'Fight*"                 "quaderno ls 'Fight*"
+# --config before the command is passed on: the paired folder completes, a folder
+# without credentials completes nothing
+try 'quaderno --config ~/.config/quaderno ls Bo'   'quaderno --config ~/.config/quaderno ls Books/'
+try 'quaderno --config /nonexistent ls Bo'          'quaderno --config /nonexistent ls Bo'
 zpty -d z
 exit $fail

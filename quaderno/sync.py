@@ -2,15 +2,53 @@
 
 import json
 import os
+from typing import TYPE_CHECKING, Any, TypedDict, TypeGuard
 
 from .errors import QuadernoError
-from .events import emit
+from .events import EventHandler, emit
 from .util import ROOT, nfc, safe_local_name
+
+if TYPE_CHECKING:
+    from .device import Device
 
 SYNC_STATE = ".quaderno-sync.json"
 
 
-def sync_folder(dev, local, remote=ROOT, delete=False, dry_run=False, force=False, on_event=None):
+class SyncRecord(TypedDict):
+    path: str          # local path relative to the sync root, '/'-separated
+    rev: str | None    # the device's file_revision when downloaded
+    size: int          # local size and mtime right after download: if either
+    mtime: int         # changed, the local copy was edited and is left alone
+
+
+class SyncState(TypedDict):
+    remote: str                       # the device folder mirrored, e.g. 'Document'
+    entries: dict[str, SyncRecord]    # by device entry id
+
+
+def _is_record(r: Any) -> TypeGuard[SyncRecord]:
+    return (isinstance(r, dict) and isinstance(r.get("path"), str)
+            and (r.get("rev") is None or isinstance(r.get("rev"), str))
+            and isinstance(r.get("size"), int) and isinstance(r.get("mtime"), int))
+
+
+def _load_state(path: str) -> SyncState:
+    with open(path) as f:
+        try:
+            state = json.load(f)
+        except ValueError as err:
+            raise QuadernoError(f"{path} is damaged ({err}); move it away to sync afresh") from err
+    entries = state.get("entries") if isinstance(state, dict) else None
+    if (not isinstance(state, dict) or not isinstance(state.get("remote"), str)
+            or not isinstance(entries, dict) or not all(_is_record(r) for r in entries.values())):
+        raise QuadernoError(f"{path} is not a sync state file this version understands; "
+                            "move it away to sync afresh")
+    return {"remote": state["remote"], "entries": {str(k): v for k, v in entries.items()}}
+
+
+def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = False,
+                dry_run: bool = False, force: bool = False,
+                on_event: EventHandler | None = None) -> dict[str, int]:
     """Mirror a device folder into a local directory, downloading only what changed
     (by the device's file_revision). Follows moves/renames on the device without
     re-downloading. A local file is only replaced, moved or deleted if it is still
@@ -24,11 +62,11 @@ def sync_folder(dev, local, remote=ROOT, delete=False, dry_run=False, force=Fals
         raise QuadernoError(f"{folder.path} is not a folder")
     remote_path = folder.path
     state_path = os.path.join(root, SYNC_STATE)
+    state: SyncState
     if os.path.exists(state_path):
-        with open(state_path) as f:
-            state = json.load(f)
-        if state.get("remote") != remote_path:
-            raise QuadernoError(f"{root} mirrors {state.get('remote')}, not {remote_path}")
+        state = _load_state(state_path)
+        if state["remote"] != remote_path:
+            raise QuadernoError(f"{root} mirrors {state['remote']}, not {remote_path}")
     else:
         if os.path.isdir(root) and os.listdir(root) and not force:
             raise QuadernoError(f"{root} is not empty and has no sync state; use an empty "
@@ -40,7 +78,7 @@ def sync_folder(dev, local, remote=ROOT, delete=False, dry_run=False, force=Fals
              "deleted": 0, "gone": 0, "conflict": 0}
     prefix_text = "(dry run) " if dry_run else ""
 
-    def save():
+    def save() -> None:
         if dry_run:
             return
         tmp = state_path + ".tmp"
@@ -48,10 +86,10 @@ def sync_folder(dev, local, remote=ROOT, delete=False, dry_run=False, force=Fals
             json.dump(state, f, indent=1, ensure_ascii=False)
         os.replace(tmp, state_path)
 
-    def local_of(rel):
+    def local_of(rel: str) -> str:
         return os.path.join(root, *rel.split("/"))
 
-    def pristine(rec):
+    def pristine(rec: SyncRecord) -> bool:
         """True if the local copy is exactly what sync last wrote."""
         try:
             st = os.stat(local_of(rec["path"]))
@@ -59,13 +97,14 @@ def sync_folder(dev, local, remote=ROOT, delete=False, dry_run=False, force=Fals
             return False
         return st.st_size == rec["size"] and int(st.st_mtime) == rec["mtime"]
 
-    def act(kind, tag, text, path):
+    def act(kind: str, tag: str, text: str, path: str | None) -> None:
         emit(on_event, kind, f"{prefix_text}{tag:7} {text}", path)
 
     if not dry_run:
         os.makedirs(root, exist_ok=True)
     prefix = remote_path + "/"
-    seen, planned = set(), {}
+    seen: set[str] = set()
+    planned: dict[str, str] = {}
     for e in dev.walk(folder):
         if not e.path.startswith(prefix):
             continue

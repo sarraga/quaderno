@@ -12,7 +12,8 @@ import re
 import socket
 import subprocess
 import time
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 from .errors import ConnectError, DeviceNotFoundError, DeviceUnreachableError, SerialModeError
 from .util import HTTPS_PORT
@@ -22,6 +23,9 @@ PID_SERIAL = 0x1656
 PID_ETHERNET = 0x1657
 SWITCH_TO_CDC_ECM = bytes([0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04])
 LINK_VALID, LINK_ACTIVE = 1, 2  # IOLinkStatus bits (IONetworkMedium.h)
+
+RegistryNode = dict[str, Any]  # one entry of `ioreg -a` output, as plistlib decodes it
+SwitchHandler = Callable[[str, "str | None"], None]  # on_switch(tty, serial)
 
 
 class UsbDevice(NamedTuple):
@@ -34,7 +38,7 @@ class UsbDevice(NamedTuple):
                                # valid) while the device answered on that interface.
 
 
-def ipv6_from_serial(serial):
+def ipv6_from_serial(serial: str) -> str:
     """The device's IPv6 link-local address, computed from its serial number."""
     v = (int("1" + str(serial)) * 0x9E37FFFFFFFC0001) & 0xFCFFFFFFFFFFFFFF
     h = format(v >> 16, "x").zfill(12)
@@ -44,7 +48,7 @@ def ipv6_from_serial(serial):
 
 # --- the I/O Registry -------------------------------------------------------------
 
-def _find_node(node, key):
+def _find_node(node: RegistryNode, key: str) -> RegistryNode | None:
     """The first node in this I/O Registry subtree that has `key`, or None."""
     if key in node:
         return node
@@ -55,23 +59,27 @@ def _find_node(node, key):
     return None
 
 
-def _value(node, key):
+def _str(node: RegistryNode, key: str) -> str | None:
+    """The first string value of `key` in this subtree, or None."""
     found = _find_node(node, key)
-    return None if found is None else found[key]
+    value = None if found is None else found[key]
+    return value if isinstance(value, str) else None
 
 
-def _network(node):
+def _network(node: RegistryNode) -> tuple[str | None, bool | None]:
     """(interface name, link up) of a device in network mode. The Ethernet
     controller node carries IOLinkStatus; the interface below it, its BSD name."""
     ctrl = _find_node(node, "IOLinkStatus")
     if ctrl is None:
-        return _value(node, "BSD Name"), None
+        return _str(node, "BSD Name"), None
     status = ctrl["IOLinkStatus"]
-    link = bool(status & LINK_ACTIVE) if status & LINK_VALID else None
-    return _value(ctrl, "BSD Name") or _value(node, "BSD Name"), link
+    link = None
+    if isinstance(status, int) and status & LINK_VALID:
+        link = bool(status & LINK_ACTIVE)
+    return _str(ctrl, "BSD Name") or _str(node, "BSD Name"), link
 
 
-def usb_devices():
+def usb_devices() -> list[UsbDevice]:
     """QUADERNO devices attached over USB, read from the I/O Registry (`ioreg -a`).
     Raises ConnectError if the registry can't be read, so that the failure isn't
     taken for "no device"."""
@@ -82,19 +90,22 @@ def usb_devices():
     except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException, ValueError) as err:
         raise ConnectError(f"couldn't read the list of USB devices with ioreg: {err}") from err
     devs = []
-    for n in nodes:
-        if n.get("idVendor") != VID:
+    for n in nodes if isinstance(nodes, list) else []:
+        if not isinstance(n, dict) or n.get("idVendor") != VID:
             continue
         pid = n.get("idProduct")
+        if not isinstance(pid, int):
+            continue
+        serial = n.get("USB Serial Number")
         iface, link = _network(n) if pid == PID_ETHERNET else (None, None)
-        devs.append(UsbDevice(pid, n.get("USB Serial Number"), _value(n, "IOCalloutDevice"),
-                              iface, link))
+        devs.append(UsbDevice(pid, serial if isinstance(serial, str) else None,
+                              _str(n, "IOCalloutDevice"), iface, link))
     return devs
 
 
 # --- switching and probing ----------------------------------------------------------
 
-def switch_to_ethernet(tty):
+def switch_to_ethernet(tty: str) -> None:
     import termios
     fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
@@ -109,7 +120,7 @@ def switch_to_ethernet(tty):
         os.close(fd)
 
 
-def probe(addr, timeout=1.5):
+def probe(addr: str, timeout: float = 1.5) -> bool:
     """Whether the device's HTTPS port accepts a connection at `addr`."""
     try:
         with socket.create_connection((addr, HTTPS_PORT), timeout=timeout):
@@ -118,7 +129,7 @@ def probe(addr, timeout=1.5):
         return False
 
 
-def _choose(devs, serial_hint):
+def _choose(devs: list[UsbDevice], serial_hint: str | None) -> tuple[UsbDevice, str]:
     """The device to use, and the serial its address is derived from. With a
     serial from pairing, only that device; without one, the only device."""
     listed = ", ".join(d.serial or "unknown" for d in devs)
@@ -140,7 +151,8 @@ def _choose(devs, serial_hint):
     return devs[0], devs[0].serial
 
 
-def _leave_serial_mode(dev, on_switch, timeout, resend_every):
+def _leave_serial_mode(dev: UsbDevice, on_switch: SwitchHandler | None, timeout: float,
+                       resend_every: float) -> None:
     """Send the switch command until `dev` is no longer in serial mode, resending
     it: a device in standby may ignore the first ones."""
     deadline = time.time() + timeout
@@ -169,7 +181,7 @@ def _leave_serial_mode(dev, on_switch, timeout, resend_every):
         time.sleep(0.5)
 
 
-def _no_answer(dev, ip):
+def _no_answer(dev: UsbDevice, ip: str) -> ConnectError:
     """The error for a device that didn't answer in time, by what the Mac sees."""
     if dev.pid == PID_SERIAL:
         return SerialModeError("the QUADERNO went back to USB serial mode: unplug and re-plug it")
@@ -186,7 +198,8 @@ def _no_answer(dev, ip):
         f"{ip} on port {HTTPS_PORT}: wake or unlock it, or unplug and re-plug it")
 
 
-def discover(serial_hint=None, on_switch=None, switch_timeout=15, answer_timeout=None):
+def discover(serial_hint: str | None = None, on_switch: SwitchHandler | None = None,
+             switch_timeout: float = 15, answer_timeout: float | None = None) -> str:
     """Return the device's scoped IPv6 address ('fe80::...%en8'), switching it to
     USB networking first if it is in serial mode. `serial_hint` (the serial saved
     at pairing) selects the device; `on_switch(tty, serial)` is called before each

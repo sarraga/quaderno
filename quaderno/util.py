@@ -4,16 +4,39 @@ import datetime
 import fnmatch
 import re
 import unicodedata
+from collections.abc import Callable
+from typing import Any
 
-from .errors import QuadernoError
+from .errors import ProtocolError, QuadernoError
 
 ROOT = "Document"  # the device's single top-level folder
 GLOB_CHARS = frozenset("*?[")
 HTTPS_PORT = 8443  # Web API (TLS, self-signed certificate)
 REG_PORT = 8080    # pairing ("registration"), plain HTTP
 
+JsonObject = dict[str, Any]  # a decoded JSON object from the device: not validated
 
-def norm(path):
+
+def json_str(obj: JsonObject, key: str) -> str:
+    """obj[key], which the device must have sent as a string."""
+    value = obj.get(key)
+    if not isinstance(value, str):
+        raise ProtocolError(f"the device's answer has no text {key!r}: {str(obj)[:200]}")
+    return value
+
+
+def json_int(obj: JsonObject, key: str) -> int:
+    """obj[key], which the device must have sent as a whole number (or digits)."""
+    value = obj.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ProtocolError(f"the device's answer has no number {key!r}: {str(obj)[:200]}")
+    try:
+        return int(value)
+    except ValueError as err:
+        raise ProtocolError(f"the device's answer has no number {key!r}: {str(obj)[:200]}") from err
+
+
+def norm(path: str | None) -> str:
     """Accept 'foo.pdf', '/foo.pdf' or 'Document/foo.pdf'; return 'Document/...'.
     Only slashes are trimmed: device names may begin or end with spaces."""
     p = (path or "").strip("/")
@@ -22,34 +45,34 @@ def norm(path):
     return f"{ROOT}/{p}" if p else ROOT
 
 
-def nfc(name):
+def nfc(name: str) -> str:
     return unicodedata.normalize("NFC", name)
 
 
-def safe_local_name(name):
+def safe_local_name(name: str) -> str:
     """Device names become local path components; reject anything that could escape."""
     if name in ("", ".", "..") or "/" in name or "\0" in name:
         raise QuadernoError(f"refusing unsafe name from device: {name!r}")
     return name
 
 
-def is_pattern(component, regex=False):
+def is_pattern(component: str, regex: bool = False) -> bool:
     return regex or any(c in component for c in GLOB_CHARS)
 
 
-def matcher(pattern, regex=False):
+def matcher(pattern: str, regex: bool = False) -> Callable[[str], bool]:
     """Case-insensitive name matcher: shell glob, or a regex searched in the name."""
     if regex:
         try:
             rx = re.compile(nfc(pattern), re.IGNORECASE)
         except re.error as err:
-            raise QuadernoError(f"bad regular expression {pattern!r}: {err}")
+            raise QuadernoError(f"bad regular expression {pattern!r}: {err}") from err
         return lambda name: rx.search(nfc(name)) is not None
     pat = nfc(pattern).casefold()
     return lambda name: fnmatch.fnmatchcase(nfc(name).casefold(), pat)
 
 
-def parse_device_time(s):
+def parse_device_time(s: object) -> int | None:
     """'2024-04-08T11:31:43Z' -> epoch seconds. None (field absent) gives None;
     anything else unreadable raises ValueError, including a time without a UTC
     offset, which would otherwise be read as local time."""
@@ -63,15 +86,17 @@ def parse_device_time(s):
     return int(dt.timestamp())
 
 
-def device_time(when=None):
+def device_time(when: datetime.datetime | None = None) -> str:
     """A UTC datetime (default: now) in the device's 'YYYY-MM-DDTHH:MM:SSZ' format."""
     when = when or datetime.datetime.now(datetime.timezone.utc)
     return when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def human(n):
-    n = float(n)
-    for unit in ("B", "K", "M", "G"):
-        if n < 1024 or unit == "G":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
+def human(n: float) -> str:
+    """Bytes as '512B', '1.5K', '2.0M', '3.1G'."""
+    size = float(n)
+    for unit in ("B", "K", "M"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"

@@ -10,6 +10,9 @@ _quaderno_device_paths() {
   [[ $typed == *[\*\?\[]* ]] && return 1        # a glob pattern: nothing to complete
   local -a lines dirs docs ddisp fdisp expl flag
   [[ $kind == dirs ]] && flag=(--dirs)
+  # --config and --addr from the command line (captured in _quaderno) apply here too
+  [[ -n $_quaderno_config ]] && flag+=(--config "$_quaderno_config")
+  [[ -n $_quaderno_addr ]] && flag+=(--addr "$_quaderno_addr")
   lines=("${(@f)$(quaderno __complete $flag -- "$typed" 2>/dev/null)}")
   local l
   for l in $lines; do
@@ -62,6 +65,8 @@ _quaderno() {
     '(-v --verbose)'{-v,--verbose}'[print credentials, address, TLS mode]' \
     '1:command:->cmd' \
     '*::argument:->args' && ret=0
+  # The global options, before the subcommand's own _arguments call replaces opt_args.
+  local _quaderno_config=${(Q)opt_args[--config]} _quaderno_addr=${(Q)opt_args[--addr]}
 
   case $state in
     cmd) _describe -t commands 'quaderno command' cmds && ret=0 ;;

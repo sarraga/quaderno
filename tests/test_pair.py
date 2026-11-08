@@ -10,55 +10,56 @@ import io
 import os
 import secrets
 import subprocess
-import types
+from pathlib import Path
 
 import pytest
 
 from quaderno import cli, client, credentials, crypto, pairing
 from quaderno.errors import QuadernoError
+from quaderno.util import JsonObject
 
 OPENSSL = "/usr/bin/openssl"
 
 
-def ossl(args, data):
+def ossl(args: list[str], data: bytes) -> bytes:
     return subprocess.run([OPENSSL, *args], input=data, capture_output=True, check=True).stdout
 
 
-def ossl_aes(decrypt, key, iv, data):
+def ossl_aes(decrypt: bool, key: bytes, iv: bytes, data: bytes) -> bytes:
     return ossl(["enc", "-d" if decrypt else "-e", "-aes-128-cbc", "-K", key.hex(), "-iv", iv.hex()], data)
 
 
-def H(key, data):
+def H(key: bytes, data: bytes) -> bytes:
     return hmac.new(key, data, hashlib.sha256).digest()
 
 
-def der(pem):
+def der(pem: str) -> bytes:
     return base64.b64decode("".join(pem.strip().splitlines()[1:-1]))
 
 
 @pytest.fixture(scope="module")
-def keypair():
+def keypair() -> tuple[str, str]:
     return crypto.generate_keypair()
 
 
 # --- 1. AES-CBC + PKCS#7 wiring vs openssl -----------------------------------------
 
 @pytest.mark.parametrize("n", [0, 1, 15, 16, 17, 33, 300])
-def test_aes_cbc_matches_openssl(n):
+def test_aes_cbc_matches_openssl(n: int) -> None:
     key, iv, data = secrets.token_bytes(16), secrets.token_bytes(16), secrets.token_bytes(n)
     ours = crypto.aes_cbc_encrypt(key, iv, data)
     assert ours == ossl_aes(False, key, iv, data)
     assert crypto.aes_cbc_decrypt(key, iv, ours) == data
 
 
-def test_aes_cbc_rejects_bad_padding():
+def test_aes_cbc_rejects_bad_padding() -> None:
     with pytest.raises(QuadernoError):
         crypto.aes_cbc_decrypt(bytes(16), bytes(16), b"\x00" * 16)
 
 
 # --- 2. RSA: key generation, PEM layout, signing -------------------------------------
 
-def test_rsa_keys_and_signatures(keypair, tmp_path):
+def test_rsa_keys_and_signatures(keypair: tuple[str, str], tmp_path: Path) -> None:
     priv, pub = keypair
     pp, sp = tmp_path / "priv.pem", tmp_path / "pub.pem"
     pp.write_text(priv)
@@ -67,7 +68,7 @@ def test_rsa_keys_and_signatures(keypair, tmp_path):
     assert "RSA key ok" in (r.stdout + r.stderr), r.stdout + r.stderr
     sp.write_text(pub.replace("RSA PUBLIC KEY", "PUBLIC KEY"))
 
-    def modulus(*a):
+    def modulus(*a: str | Path) -> str:
         return subprocess.run([OPENSSL, "rsa", *a, "-noout", "-modulus"], capture_output=True,
                               text=True, check=True).stdout
     assert modulus("-pubin", "-in", sp) == modulus("-in", pp)
@@ -80,7 +81,7 @@ def test_rsa_keys_and_signatures(keypair, tmp_path):
     assert pub.endswith("-----\n")
 
 
-def test_openssl_made_pkcs1_key_loads_and_signs(tmp_path):
+def test_openssl_made_pkcs1_key_loads_and_signs(tmp_path: Path) -> None:
     kp = tmp_path / "k1.pem"
     subprocess.run([OPENSSL, "genrsa", "-out", kp, "2048"], capture_output=True, check=True)
     crypto.sign(crypto.load_private_key(kp.read_text()), b"x")
@@ -88,24 +89,39 @@ def test_openssl_made_pkcs1_key_loads_and_signs(tmp_path):
 
 # --- 3. The pairing protocol against a simulated device ------------------------------
 
+def b64(x: bytes) -> str:
+    return base64.b64encode(x).decode()
+
+
 class FakeRegDevice:
-    def __init__(self, pin):
+    """The device's side of pairing, written independently of quaderno.pairing."""
+
+    def __init__(self, pin: str) -> None:
         self.pin = pin.encode()
-        self.registered = None
+        self.registered: tuple[str, str] | None = None
         self.cert = b"-----BEGIN CERTIFICATE-----\nFAKE\n"
         self.cleanups = 0
+        self.n1 = self.mac = self.yb = self.ak = self.kw = self.n2 = self.ya = b""
+        self.psk = self.es = self.eh = self.m3 = self.wes = self.m5 = b""
+        self.x = 0
 
-    def wrap(self, data):
+    def client(self) -> tuple[str, str]:
+        """(client id, public key) the client registered."""
+        assert self.registered is not None
+        return self.registered
+
+    def wrap(self, data: bytes) -> bytes:
         iv = secrets.token_bytes(16)
         return ossl_aes(False, self.kw, iv, data + H(self.ak, data)[:8]) + iv
 
-    def unwrap(self, data):
+    def unwrap(self, data: bytes) -> bytes:
         plain = ossl_aes(True, self.kw, data[-16:], data[:-16])
         assert plain[-8:] == H(self.ak, plain[:-8])[:8], "client's wrap tag is wrong"
         return plain[:-8]
 
-    def __call__(self, addr, method, path, body=None):
-        u, b = base64.b64decode, lambda x: base64.b64encode(x).decode()
+    def __call__(self, addr: str, method: str, path: str,
+                 body: JsonObject | None = None) -> tuple[int, JsonObject | None]:
+        u, b = base64.b64decode, b64
         P = crypto.DH_P
         if path == "/register/cleanup":
             self.cleanups += 1
@@ -117,6 +133,7 @@ class FakeRegDevice:
             self.x = secrets.randbelow(P - 3) + 2
             self.yb = b"\x00" + pow(2, self.x, P).to_bytes(256, "big")  # Java-style sign byte
             return 200, {"a": b(self.n1), "b": b(self.mac), "c": b(self.yb)}
+        assert body is not None, path  # every other call sends a body
         if path == "/register/hash":
             n2, ya, m2 = u(body["b"]), u(body["d"]), u(body["e"])
             assert len(ya) == 257 and ya[0] == 0, "ya must be 0x00 + 256 bytes"
@@ -154,7 +171,7 @@ CID = "11111111-2222-4333-8444-555555555555"
 
 
 @pytest.mark.parametrize("run", range(3))  # fresh DH keys each time
-def test_pairing_round_trip(run, keypair, monkeypatch):
+def test_pairing_round_trip(run: int, keypair: tuple[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
     pub = keypair[1]
     dev = FakeRegDevice("4242")
     monkeypatch.setattr(pairing, "reg_request", dev)
@@ -162,7 +179,7 @@ def test_pairing_round_trip(run, keypair, monkeypatch):
     assert dev.registered == (CID, pub) and cert == dev.cert
 
 
-def test_pairing_with_the_wrong_pin(keypair, monkeypatch):
+def test_pairing_with_the_wrong_pin(keypair: tuple[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
     dev = FakeRegDevice("4242")
     monkeypatch.setattr(pairing, "reg_request", dev)
     with pytest.raises(QuadernoError, match="wrong PIN"):
@@ -172,16 +189,17 @@ def test_pairing_with_the_wrong_pin(keypair, monkeypatch):
 
 # --- 4. `quaderno pair` end to end, config dir isolated, login stubbed --------------
 
-def test_cli_pair(tmp_path, monkeypatch, capsys):
+def test_cli_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     cfg = str(tmp_path / "cfg")
     monkeypatch.setattr(credentials, "CONFIG_DIR", cfg)
     monkeypatch.setattr(client.Client, "authenticate", lambda self: None)
 
-    def run_pair(dev, pin, force=False, config_dir=None):
+    def run_pair(dev: FakeRegDevice, pin: str, force: bool = False,
+                 config_dir: str | None = None) -> str:
         monkeypatch.setattr(pairing, "reg_request", dev)
         monkeypatch.setattr("sys.stdin", io.StringIO(pin + "\n"))
-        cli.cmd_pair(types.SimpleNamespace(addr="fake", verbose=False, force=force, pin_file=None,
-                                           config_dir=config_dir))
+        cli.cmd_pair(cli.Args(addr="fake", verbose=False, force=force, pin_file=None,
+                              config_dir=config_dir))
         return capsys.readouterr().out
 
     dev = FakeRegDevice("1357")
@@ -191,7 +209,7 @@ def test_cli_pair(tmp_path, monkeypatch, capsys):
     assert oct(os.stat(os.path.join(cfg, "privatekey.dat")).st_mode & 0o777) == "0o600"
     assert oct(os.stat(cfg).st_mode & 0o777) == "0o700"
     creds = credentials.load_credentials(credentials.find_credentials_dir())
-    assert creds.source == cfg and creds.client_id == dev.registered[0]
+    assert creds.source == cfg and creds.client_id == dev.client()[0]
     assert creds.serial == "000000000000001"
     assert creds.pinned_cert is None and dev.cleanups == 2  # the fake cert is malformed: not stored
 
@@ -206,7 +224,7 @@ def test_cli_pair(tmp_path, monkeypatch, capsys):
     dev.cert = cp.read_bytes()
     run_pair(dev, "2468", force=True)
     creds = credentials.load_credentials(cfg)
-    assert creds.pinned_cert == crypto.cert_to_der(dev.cert) and creds.client_id == dev.registered[0]
+    assert creds.pinned_cert == crypto.cert_to_der(dev.cert) and creds.client_id == dev.client()[0]
 
     run_pair(FakeRegDevice("1111"), "1111", force=True)    # unreadable cert: stale pin removed
     assert credentials.load_pinned_cert(cfg) is None
@@ -215,4 +233,4 @@ def test_cli_pair(tmp_path, monkeypatch, capsys):
     dev = FakeRegDevice("3690")
     run_pair(dev, "3690", config_dir=other)
     assert credentials.load_credentials(credentials.find_credentials_dir(other)).client_id == \
-        dev.registered[0]
+        dev.client()[0]

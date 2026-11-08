@@ -12,21 +12,32 @@ Remote paths are relative to the top folder 'Document' ('Books/x.pdf',
 '/Books/x.pdf' and 'Document/Books/x.pdf' are the same). Where noted, they may
 be glob patterns ('Books/*.pdf', case-insensitive) or, with regex=True, regular
 expressions; an exact name always wins. Operations that change things accept an
-optional `on_event` callback that receives an Event for each step."""
+optional `on_event` callback that receives an Event for each step.
 
+Errors from the device are QuadernoError subclasses. Local file problems (a
+directory that doesn't exist, no permission, a full disk) are OSError."""
+
+import datetime
+import errno
 import logging
 import os
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from urllib.parse import quote
 
 from . import credentials, usb
 from .client import Client
+from .credentials import Credentials
 from .entry import Entry
 from .errors import ExistsError, NotEmptyError, NotFoundError, ProtocolError, QuadernoError
-from .events import emit
-from .util import ROOT, device_time, human, is_pattern, matcher, nfc, norm, safe_local_name
+from .events import EventHandler, emit
+from .util import (ROOT, JsonObject, device_time, human, is_pattern, json_int, matcher, nfc,
+                   norm, safe_local_name)
 
 log = logging.getLogger("quaderno")
+
+PathOrEntry = str | Entry
+Patterns = str | Sequence[str]  # one path/pattern, or several
 
 
 @dataclass
@@ -38,7 +49,8 @@ class PutResult:
     ignored: int = 0     # non-PDF files inside uploaded folders
 
 
-def connect(addr=None, config_dir=None, timeout=60, on_switch=None):
+def connect(addr: str | None = None, config_dir: str | None = None, timeout: float = 60,
+            on_switch: usb.SwitchHandler | None = None) -> "Device":
     """Find the device (or use `addr`), log in, and return a Device. Credentials
     come from `config_dir`, else $QUADERNO_CONFIG, else ~/.config/quaderno.
     If pairing didn't store the device's certificate (it sent one that couldn't
@@ -55,17 +67,25 @@ def connect(addr=None, config_dir=None, timeout=60, on_switch=None):
     return dev
 
 
+def _need_dir(path: str) -> None:
+    """Raise FileNotFoundError naming the directory if `path` can't be created
+    because its directory doesn't exist (checked before talking to the device)."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise FileNotFoundError(errno.ENOENT, "No such directory", parent)
+
+
 class Device(Client):
     """A logged-in QUADERNO. Use connect() to get one."""
 
-    credentials = None
+    credentials: Credentials | None = None
 
     # --- lookup ----------------------------------------------------------------
-    def resolve(self, path):
+    def resolve(self, path: str) -> Entry:
         """The Entry at `path` (exact, no patterns). Raises NotFoundError."""
-        return Entry.from_api(self.request("GET", "/resolve/entry/" + quote(norm(path), safe="")))
+        return Entry.from_api(self.request_json("GET", "/resolve/entry/" + quote(norm(path), safe="")))
 
-    def try_resolve(self, path):
+    def try_resolve(self, path: str) -> Entry | None:
         try:
             return self.resolve(path)
         except QuadernoError as err:
@@ -73,34 +93,37 @@ class Device(Client):
                 return None
             raise
 
-    def _folder(self, folder):
+    def _folder(self, folder: PathOrEntry) -> Entry:
         f = folder if isinstance(folder, Entry) else self.resolve(folder)
         if not f.is_folder:
             raise QuadernoError(f"{f.path} is not a folder")
         return f
 
-    def _children(self, folder_id):
-        out, offset = [], 0
+    def _children(self, folder_id: str) -> list[Entry]:
+        out: list[Entry] = []
         while True:
-            r = self.request("GET", f"/folders/{folder_id}/entries?offset={offset}&limit=100")
+            path = f"/folders/{folder_id}/entries?offset={len(out)}&limit=100"
+            r = self.request_json("GET", path)
             batch = r.get("entry_list", [])
+            if not isinstance(batch, list) or not all(isinstance(d, dict) for d in batch):
+                raise ProtocolError(f"GET {path}: entry_list isn't a list of entries")
             out += [Entry.from_api(d) for d in batch]
-            offset = len(out)
-            if offset >= int(r.get("count", offset)) or not batch:
+            count = json_int(r, "count") if "count" in r else len(out)
+            if len(out) >= count or not batch:
                 return out
 
-    def entries(self, folder=ROOT):
+    def entries(self, folder: PathOrEntry = ROOT) -> list[Entry]:
         """Direct children of a folder (path or Entry)."""
         return self._children(self._folder(folder).id)
 
-    def walk(self, folder=ROOT):
+    def walk(self, folder: PathOrEntry = ROOT) -> Iterator[Entry]:
         """Everything below a folder, depth-first; parents come before children."""
         for e in self.entries(folder):
             yield e
             if e.is_folder:
                 yield from self.walk(e)
 
-    def find(self, pattern, regex=False):
+    def find(self, pattern: str, regex: bool = False) -> tuple[list[Entry], bool]:
         """Entries matching a path whose components may be patterns.
         Returns (entries sorted by path, matched_by_pattern)."""
         path = norm(pattern)
@@ -112,7 +135,7 @@ class Device(Client):
             self.resolve(path)  # not found and not a pattern: raise the device's 404
         current = [self.resolve(ROOT)]
         for i, part in enumerate(parts):
-            found = []
+            found: list[Entry] = []
             for folder in current:
                 literal = self.try_resolve(folder.path + "/" + part)
                 if literal is not None:
@@ -126,12 +149,12 @@ class Device(Client):
                 raise NotFoundError(f"no match for {pattern!r}")
         return sorted(current, key=lambda x: x.path.lower()), True
 
-    def find_all(self, patterns, regex=False):
+    def find_all(self, patterns: Patterns, regex: bool = False) -> tuple[list[Entry], bool]:
         """find() for several patterns, de-duplicated. Returns (entries, any_pattern)."""
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        seen, out, any_pattern = set(), [], False
-        for p in patterns:
+        seen: set[str] = set()
+        out: list[Entry] = []
+        any_pattern = False
+        for p in [patterns] if isinstance(patterns, str) else patterns:
             entries, by_pattern = self.find(p, regex)
             any_pattern |= by_pattern
             for e in entries:
@@ -140,11 +163,12 @@ class Device(Client):
                     out.append(e)
         return out, any_pattern
 
-    def ls(self, path=ROOT, recursive=False, regex=False):
+    def ls(self, path: str = ROOT, recursive: bool = False,
+           regex: bool = False) -> tuple[list[Entry], bool]:
         """List a folder (or pattern matches; a matched folder is listed itself,
         like `ls -d`, unless recursive). Folders first. Returns (entries, matched_by_pattern)."""
         matches, by_pattern = self.find(path, regex)
-        rows = {}
+        rows: dict[str, Entry] = {}
         for entry in matches:
             if not entry.is_folder:
                 rows[entry.id] = entry
@@ -158,10 +182,11 @@ class Device(Client):
         return sorted(rows.values(), key=lambda e: (not e.is_folder, e.path.lower())), by_pattern
 
     # --- download ---------------------------------------------------------------
-    def download(self, doc, target, on_event=None):
+    def download(self, doc: PathOrEntry, target: str, on_event: EventHandler | None = None) -> int:
         """Save a document (path or Entry) to the local file `target`, atomically,
         with the device's modification time. Returns the size in bytes. If that
         time is unreadable, the file is kept with a warning, without it."""
+        _need_dir(target)
         doc = doc if isinstance(doc, Entry) else self.resolve(doc)
         tmp = target + ".part"
         try:
@@ -183,15 +208,15 @@ class Device(Client):
         emit(on_event, "downloaded", f"{doc.path} -> {target} ({human(n)})", doc.path)
         return n
 
-    def get_tree(self, folder, dest, on_event=None):
+    def get_tree(self, folder: PathOrEntry, dest: str, on_event: EventHandler | None = None) -> int:
         """Download a folder as dest/<folder name>/..., keeping its layout.
         Returns the number of documents."""
-        folder = self._folder(folder)
-        base = os.path.join(dest, safe_local_name(folder.name))
-        prefix = folder.path + "/"
+        top = self._folder(folder)
+        base = os.path.join(dest, safe_local_name(top.name))
+        prefix = top.path + "/"
         os.makedirs(base, exist_ok=True)
         count = 0
-        for e in self.walk(folder):
+        for e in self.walk(top):
             rel = e.path[len(prefix):] if e.path.startswith(prefix) else e.name
             target = os.path.join(base, *[safe_local_name(p) for p in rel.split("/")])
             if e.is_folder:
@@ -199,10 +224,11 @@ class Device(Client):
             else:
                 self.download(e, target, on_event)
                 count += 1
-        emit(on_event, "summary", f"{count} documents from {folder.path} -> {base}", folder.path)
+        emit(on_event, "summary", f"{count} documents from {top.path} -> {base}", top.path)
         return count
 
-    def get(self, patterns, dest=".", recursive=False, regex=False, on_event=None):
+    def get(self, patterns: Patterns, dest: str = ".", recursive: bool = False, regex: bool = False,
+            on_event: EventHandler | None = None) -> int:
         """Download documents (patterns allowed); folders need recursive=True.
         With several items, `dest` must be a directory. Returns the document count."""
         targets, _ = self.find_all(patterns, regex)
@@ -226,7 +252,8 @@ class Device(Client):
         return count
 
     # --- upload -----------------------------------------------------------------
-    def upload(self, local, folder=ROOT, name=None, on_event=None):
+    def upload(self, local: str, folder: PathOrEntry = ROOT, name: str | None = None,
+               on_event: EventHandler | None = None) -> Entry:
         """Upload one PDF into an existing folder (under `name`, default its file
         name). Raises if a document with that name is already there."""
         f = self._folder(folder)
@@ -237,23 +264,23 @@ class Device(Client):
         emit(on_event, "uploaded", f"{local} -> {f.path}/{name}", f"{f.path}/{name}")
         return self.resolve(f"{f.path}/{name}")
 
-    def put(self, paths, dest=None, recursive=False, on_event=None):
+    def put(self, paths: Patterns, dest: str | None = None, recursive: bool = False,
+            on_event: EventHandler | None = None) -> PutResult:
         """Upload PDFs and (with recursive=True) local folders, CLI-style:
         - dest an existing folder: everything goes into it;
         - dest missing and ending in .pdf: the single file is uploaded under that name;
         - dest missing, single folder with recursive: the folder is created as dest.
         Never overwrites (same-named documents are skipped). Paths that can't be
         uploaded are skipped with a warning event instead of aborting."""
-        if isinstance(paths, str):
-            paths = [paths]
+        named = [paths] if isinstance(paths, str) else list(paths)
         target = norm(dest) if dest else ROOT
         d = self.try_resolve(target)
         if d is not None and not d.is_folder:
             raise ExistsError(f"{target} already exists")
-        if d is None and len(paths) > 1:
+        if d is None and len(named) > 1:
             raise self._no_such_folder(target)
         res, items = PutResult(), []
-        for local in paths:
+        for local in named:
             if os.path.isdir(local):
                 if recursive:
                     items.append(local)
@@ -290,7 +317,8 @@ class Device(Client):
                 self._put_file(local, d.id, d.path, os.path.basename(local), existing, res, on_event)
         return res
 
-    def _put_file(self, local, folder_id, folder_path, name, existing, res, on_event):
+    def _put_file(self, local: str, folder_id: str, folder_path: str, name: str,
+                  existing: set[str], res: PutResult, on_event: EventHandler | None) -> bool:
         name = nfc(name)
         if name in existing:
             res.skipped += 1
@@ -303,10 +331,12 @@ class Device(Client):
         emit(on_event, "uploaded", f"{local} -> {folder_path}/{name}", f"{folder_path}/{name}")
         return True
 
-    def _put_tree(self, local_dir, remote_path, res, on_event):
+    def _put_tree(self, local_dir: str, remote_path: str, res: PutResult,
+                  on_event: EventHandler | None) -> None:
         """Mirror local_dir into remote_path. Only PDFs are sent; folders are created
         only where there is a PDF at or below them."""
-        plan, ignored = [], 0
+        plan: list[tuple[str, str, list[str]]] = []
+        ignored = 0
         for root, dirs, files in os.walk(local_dir):
             dirs[:] = sorted(x for x in dirs if not x.startswith("."))
             visible = [f for f in files if not f.startswith(".")]
@@ -332,7 +362,7 @@ class Device(Client):
         emit(on_event, "summary", f"{uploaded} uploaded, {skipped} skipped{extra} -> {remote_path}",
              remote_path)
 
-    def _no_such_folder(self, target):
+    def _no_such_folder(self, target: str) -> NotFoundError:
         name = nfc(target.rsplit("/", 1)[-1]).casefold()
         hits = [e.path for e in self.walk(ROOT) if e.is_folder and nfc(e.name).casefold() == name]
         msg = (f"there is no folder {target} on the device; create it with `quaderno mkdir`, "
@@ -342,7 +372,7 @@ class Device(Client):
         return NotFoundError(msg)
 
     # --- organise ---------------------------------------------------------------
-    def ensure_folder(self, path, on_event=None):
+    def ensure_folder(self, path: str, on_event: EventHandler | None = None) -> str:
         """mkdir -p: create missing folders along `path`; returns the folder id."""
         path = norm(path)
         e = self.try_resolve(path)
@@ -357,7 +387,7 @@ class Device(Client):
         emit(on_event, "created", f"created {path}/", path)
         return folder_id
 
-    def mkdir(self, path, parents=False, on_event=None):
+    def mkdir(self, path: str, parents: bool = False, on_event: EventHandler | None = None) -> str:
         """Create a folder; with parents=True also missing parents (and no error if
         it exists). Returns the folder id."""
         path = norm(path)
@@ -370,7 +400,8 @@ class Device(Client):
         emit(on_event, "created", f"created {path}/", path)
         return folder_id
 
-    def move(self, patterns, dst, regex=False, on_event=None):
+    def move(self, patterns: Patterns, dst: str, regex: bool = False,
+             on_event: EventHandler | None = None) -> list[tuple[str, str]]:
         """Move or rename documents/folders (patterns allowed). Several sources need
         an existing folder as `dst`. Everything is checked before anything moves:
         a name already taken at the destination, or two sources that would land on
@@ -384,8 +415,9 @@ class Device(Client):
             raise QuadernoError(f"{len(sources)} items to move: {dst} must be an existing folder")
         if any(e.path == ROOT for e in sources):
             raise QuadernoError("refusing to move the root folder")
-        taken = {c.name for c in self._children(d.id)} if d is not None else set()
-        plan, claimed = [], {}
+        taken = {nfc(c.name) for c in self._children(d.id)} if d is not None else set()
+        plan: list[tuple[Entry, str, str, str]] = []
+        claimed: dict[str, str] = {}
         for e in sources:
             if d is not None:
                 parent_id, parent_path, name = d.id, d.path, e.name
@@ -393,29 +425,34 @@ class Device(Client):
                 parent_path, name = dst.rsplit("/", 1)
                 parent_id = self.resolve(parent_path).id
             target = f"{parent_path}/{name}"
-            if e.path != target:
+            if nfc(e.path) != nfc(target):
                 if e.is_folder and (parent_path == e.path or parent_path.startswith(e.path + "/")):
                     raise QuadernoError(f"cannot move {e.path} into itself")
-                if name in taken:
+                if nfc(name) in taken:
                     raise ExistsError(f"cannot move {e.path}: {target} already exists")
-                if target in claimed:
-                    raise ExistsError(f"cannot move both {claimed[target]} and {e.path} to {target}")
-                claimed[target] = e.path
+                if nfc(target) in claimed:
+                    raise ExistsError(f"cannot move both {claimed[nfc(target)]} and {e.path} "
+                                      f"to {target}")
+                claimed[nfc(target)] = e.path
             plan.append((e, parent_id, parent_path, name))
         moved = []
         for e, parent_id, parent_path, name in plan:
-            if e.path == f"{parent_path}/{name}":
+            if nfc(e.path) == nfc(f"{parent_path}/{name}"):
                 emit(on_event, "unchanged", f"{e.path}: already there", e.path)
                 continue
             kind, field = ("folders", "folder_name") if e.is_folder else ("documents", "file_name")
             self.request("PUT", f"/{kind}/{e.id}", {"parent_folder_id": parent_id, field: name})
-            new = self.request("GET", f"/{kind}/{e.id}") or {}
-            new_path = new.get("entry_path", f"{parent_path}/{name}").rstrip("/")
+            new_path = (self.request("GET", f"/{kind}/{e.id}") or {}).get("entry_path")
+            if not isinstance(new_path, str):
+                new_path = f"{parent_path}/{name}"
+            new_path = new_path.rstrip("/")
             emit(on_event, "moved", f"{e.path} -> {new_path}", new_path)
             moved.append((e.path, new_path))
         return moved
 
-    def rm(self, patterns, recursive=False, regex=False, confirm=None, on_event=None):
+    def rm(self, patterns: Patterns, recursive: bool = False, regex: bool = False,
+           confirm: Callable[[list[Entry]], bool] | None = None,
+           on_event: EventHandler | None = None) -> list[Entry]:
         """Delete documents, and folders (empty ones, or with contents if
         recursive). Everything is checked before anything is deleted. If a pattern
         matched and `confirm` is given, confirm(entries) must return True to go on.
@@ -448,7 +485,7 @@ class Device(Client):
             self._delete_empty_folder(e, on_event)
         return plan
 
-    def _delete_empty_folder(self, e, on_event):
+    def _delete_empty_folder(self, e: Entry, on_event: EventHandler | None) -> None:
         # The device's behaviour on non-empty folders is undocumented (it may delete
         # recursively), so DELETE is only ever sent for a folder verified to be empty.
         children = self._children(e.id)
@@ -459,7 +496,7 @@ class Device(Client):
         emit(on_event, "deleted", f"deleted {e.path}/", e.path)
 
     # --- the device itself -------------------------------------------------------
-    def open(self, path, page=None, regex=False):
+    def open(self, path: PathOrEntry, page: int | None = None, regex: bool = False) -> Entry:
         """Show a document on the device's screen (at `page`, or where it was left).
         A pattern must match exactly one document. Returns its Entry."""
         matches = [path] if isinstance(path, Entry) else self.find(path, regex)[0]
@@ -482,22 +519,23 @@ class Device(Client):
                 raise
         return e
 
-    def set_time(self, when=None):
+    def set_time(self, when: datetime.datetime | None = None) -> str:
         """Set the device clock (default: now). The clock can't be read back.
         Returns the value sent, 'YYYY-MM-DDTHH:MM:SSZ'."""
         value = device_time(when)
         self.request("PUT", "/system/configs/datetime", {"value": value})
         return value
 
-    def timezone(self):
-        return (self.request("GET", "/system/configs/timezone") or {}).get("value")
+    def timezone(self) -> str | None:
+        value = (self.request("GET", "/system/configs/timezone") or {}).get("value")
+        return value if isinstance(value, str) else None
 
-    def info(self):
+    def info(self) -> dict[str, JsonObject]:
         """Firmware, storage, battery, owner, MAC: the device's raw answers
         (a part that failed holds {'error': ...})."""
-        def get(path):
+        def get(path: str) -> JsonObject:
             try:
-                return self.request("GET", path)
+                return self.request("GET", path) or {}
             except QuadernoError as err:
                 return {"error": str(err)}
         return {"api_version": get("/api_version"),
@@ -507,13 +545,15 @@ class Device(Client):
                 "owner": get("/system/configs/owner"),
                 "mac_address": get("/system/status/mac_address")}
 
-    def screenshot(self, path):
+    def screenshot(self, path: str) -> int:
         """Save the current screen as a PNG file. Returns its size in bytes."""
+        _need_dir(path)
         with open(path, "wb") as fh:
-            return self.request("GET", "/system/controls/screen_shot", stream_to=fh,
-                                headers={"Accept": "*/*"})
+            return self.request_stream("GET", "/system/controls/screen_shot", fh,
+                                       headers={"Accept": "*/*"})
 
-    def sync(self, local, remote=ROOT, delete=False, dry_run=False, force=False, on_event=None):
+    def sync(self, local: str, remote: str = ROOT, delete: bool = False, dry_run: bool = False,
+             force: bool = False, on_event: EventHandler | None = None) -> dict[str, int]:
         """One-way incremental mirror of a device folder into `local`; see
         quaderno.sync.sync_folder. Returns counts per action."""
         from .sync import sync_folder

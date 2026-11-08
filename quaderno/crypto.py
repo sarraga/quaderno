@@ -36,13 +36,13 @@ DH_G = 2
 
 # --- RSA ---------------------------------------------------------------------
 
-def pem_encode(label, der):
+def pem_encode(label: str, der: bytes) -> str:
     b64 = base64.b64encode(der).decode()
     lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
     return f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----\n"
 
 
-def generate_keypair(bits=2048):
+def generate_keypair(bits: int = 2048) -> tuple[str, str]:
     """(private_pem, public_pem): PKCS#1 'RSA PRIVATE KEY', and the public key as
     SubjectPublicKeyInfo DER under an 'RSA PUBLIC KEY' label, the layout the device
     accepts at pairing (see the module docstring)."""
@@ -55,35 +55,35 @@ def generate_keypair(bits=2048):
     return private_pem, pem_encode("RSA PUBLIC KEY", spki)
 
 
-def load_private_key(pem):
+def load_private_key(pem: str | bytes) -> rsa.RSAPrivateKey:
     try:
         key = serialization.load_pem_private_key(pem.encode() if isinstance(pem, str) else pem,
                                                  password=None)
     except (ValueError, TypeError) as err:
-        raise AuthError(f"cannot read the private key: {err}")
+        raise AuthError(f"cannot read the private key: {err}") from err
     if not isinstance(key, rsa.RSAPrivateKey):
         raise AuthError("the private key is not an RSA key")
     return key
 
 
-def sign(key, data):
+def sign(key: rsa.RSAPrivateKey, data: bytes) -> bytes:
     """RSA-SHA256, PKCS#1 v1.5 (the login nonce signature)."""
     return key.sign(data, padding.PKCS1v15(), hashes.SHA256())
 
 
 # --- symmetric pieces of pairing ---------------------------------------------
 
-def hmac_sha256(key, data):
+def hmac_sha256(key: bytes, data: bytes) -> bytes:
     return hmac.new(key, data, hashlib.sha256).digest()
 
 
-def aes_cbc_encrypt(key, iv, data):
+def aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     padder = sym_padding.PKCS7(128).padder()
     enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
     return enc.update(padder.update(data) + padder.finalize()) + enc.finalize()
 
 
-def aes_cbc_decrypt(key, iv, data):
+def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     try:
         dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
         unpadder = sym_padding.PKCS7(128).unpadder()
@@ -92,14 +92,14 @@ def aes_cbc_decrypt(key, iv, data):
         raise PairingError(f"pairing: undecryptable message ({err})")
 
 
-def wrap(data, auth_key, kw_key):
+def wrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
     """AES-128-CBC(data + first 8 bytes of HMAC-SHA256(data)) + IV: the format the
     device uses in both directions during pairing."""
     iv = secrets.token_bytes(16)
     return aes_cbc_encrypt(kw_key, iv, data + hmac_sha256(auth_key, data)[:8]) + iv
 
 
-def unwrap(data, auth_key, kw_key):
+def unwrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
     plain = aes_cbc_decrypt(kw_key, data[-16:], data[:-16])
     body, tag = plain[:-8], plain[-8:]
     if not hmac.compare_digest(tag, hmac_sha256(auth_key, body)[:8]):
@@ -107,7 +107,7 @@ def unwrap(data, auth_key, kw_key):
     return body
 
 
-def dh_exchange(peer_public):
+def dh_exchange(peer_public: int) -> tuple[bytes, bytes]:
     """Diffie-Hellman against the device's public value. Returns (ya, zz): our
     public value as 0x00 + 256 bytes (see the module docstring) and the 256-byte
     shared secret. Keys are regenerated until both values have their full length,
@@ -127,7 +127,7 @@ def dh_exchange(peer_public):
 
 # --- certificates ------------------------------------------------------------
 
-def cert_to_der(data):
+def cert_to_der(data: bytes) -> bytes | None:
     """PEM or DER certificate bytes -> DER, or None if it is not readable."""
     try:
         if data.startswith(b"-----BEGIN"):

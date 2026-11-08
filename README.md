@@ -39,6 +39,7 @@ How it behaves:
 - **Letter case** is ignored in the part you're completing.
 - **Patterns** containing `*`, `?` or `[` are left untouched.
 - **With the device unplugged**, nothing is offered, without any delay.
+- **`--config DIR` and `--addr ADDR`** typed before the command apply to completion too.
 - **Right after plugging in**, the first Tab switches the device to USB networking, which takes about 4 s. Later Tabs take about 0.4 s.
 
 `pip install` doesn't install this file: zsh reads it straight from the checkout. To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
@@ -178,8 +179,9 @@ with quaderno.connect() as dev:                  # find it on USB, log in (close
 ```
 
 - **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
-- **Errors:** every failure is a `quaderno.QuadernoError`. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
+- **Errors:** every failure on the device side is a `quaderno.QuadernoError`; local file problems (a directory that doesn't exist, no permission) are ordinary `OSError`s. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
 - **Pairing:** `quaderno.pair(read_pin)` pairs from code. `read_pin` is a function that returns the PIN shown on the device.
+- **Types:** the package is fully annotated and ships `py.typed`, so mypy and editors check code that uses it. Answers from the device are checked where they come in: a reply that isn't a JSON object, or lacks an id the API needs, raises `ProtocolError` rather than surfacing later as a `KeyError`.
 
 ## Pairing
 
@@ -240,7 +242,8 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 
 ```
 .venv/bin/pip install -e '.[test]'   # once: adds pytest
-.venv/bin/python -m pytest           # all offline tests, about 3 s
+.venv/bin/python -m pytest           # all offline tests, about 3 s, including mypy --strict
+.venv/bin/python -m mypy             # type checking alone (settings in pyproject.toml)
 .venv/bin/python -m pytest tests/test_sync.py -k guards   # one file, or one test
 ```
 
@@ -251,7 +254,8 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_sync.py` | sync: edits, moves, deletes, local changes, name clashes, dry run |
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
 | `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
-| `tests/test_errors.py` | discovery states (stuck serial mode...), HTTP/connection errors, malformed answers, exit codes |
+| `tests/test_errors.py` | discovery states (stuck serial mode...), HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
+| `tests/test_types.py` | `mypy --strict` over the package and the tests (skipped if mypy isn't installed) |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
 
@@ -324,7 +328,7 @@ QuadernoError                    base: .status (HTTP status, when there is one)
 └── NotEmptyError                folder not empty                                        exit 1
 ```
 
-Exit code 2 is a command-line usage error, and 130 means you pressed Ctrl-C. Network failures in the middle of a command, such as the cable being pulled, become `DeviceUnreachableError`, not a Python traceback.
+A local file problem, such as `get -o` into a directory that doesn't exist, prints `quaderno: PATH: reason` and exits 1. Exit code 2 is a command-line usage error, and 130 means you pressed Ctrl-C. Network failures in the middle of a command, such as the cable being pulled, become `DeviceUnreachableError`, not a Python traceback.
 
 A malformed value that only affects what is shown or a file's date doesn't stop a command: an unreadable size or page count shows as missing, and `get` saves the file without the device's modification time. Both print a warning on stderr.
 

@@ -8,6 +8,7 @@ The client sends its ID and public key wrapped; the device answers with its TLS
 certificate, which is kept for pinning."""
 
 import base64
+import binascii
 import hashlib
 import hmac
 import http.client
@@ -15,17 +16,21 @@ import json
 import os
 import secrets
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import credentials, crypto, usb
 from .client import Client
-from .errors import DeviceUnreachableError, PairingError, ProtocolError, WrongPinError
-from .events import emit
-from .util import REG_PORT
+from .errors import (DeviceUnreachableError, PairingError, ProtocolError, QuadernoError,
+                     WrongPinError)
+from .events import EventHandler, emit
+from .util import REG_PORT, JsonObject, json_str
 
 
-def reg_request(addr, method, path, body=None):
-    """One call to the registration API; returns (status, decoded JSON or raw text)."""
+def reg_request(addr: str, method: str, path: str,
+                body: JsonObject | None = None) -> tuple[int, JsonObject | bytes | None]:
+    """One call to the registration API; returns (status, the JSON object answered,
+    else the first 200 bytes of the answer, or None if it was empty)."""
     conn = http.client.HTTPConnection(addr.strip("[]"), REG_PORT, timeout=150)
     hdrs = {"Host": f"digitalpaper.local:{REG_PORT}", "Accept": "application/json"}
     data = None
@@ -40,35 +45,48 @@ def reg_request(addr, method, path, body=None):
         raise DeviceUnreachableError(f"pairing: lost contact with the device ({err})") from err
     finally:
         conn.close()
+    if not raw:
+        return resp.status, None
     try:
-        return resp.status, (json.loads(raw) if raw else None)
+        value = json.loads(raw)
     except ValueError:
         return resp.status, raw[:200]
+    return resp.status, value if isinstance(value, dict) else raw[:200]
 
 
-def _b64(b):
+def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
 
-def register(addr, client_id, public_pem, read_pin):
+def _field(m: JsonObject, key: str) -> bytes:
+    """A base64 field of a pairing message, decoded."""
+    try:
+        return base64.b64decode(json_str(m, key), validate=True)
+    except binascii.Error as err:
+        raise ProtocolError(f"pairing: field {key!r} isn't base64: {err}") from err
+
+
+def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], str]) -> bytes:
     """Run the PIN exchange; returns the certificate the device hands over.
     `read_pin()` is called once the device shows the PIN."""
     H = crypto.hmac_sha256
-    u = base64.b64decode
+    u = _field
 
-    def call(path, body, want):
+    def call(path: str, body: JsonObject | None, want: int) -> JsonObject:
         status, res = reg_request(addr, "POST", path, body)
         if status != want:
             code = res.get("error_code") if isinstance(res, dict) else None
             if path == "/register/ca" and status == 403 and code == "40301":
                 raise WrongPinError("pairing failed: wrong PIN")
-            raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res}")
-        if want != 204 and not isinstance(res, dict):  # 204: no body expected
-            raise ProtocolError(f"pairing: POST {path}: the device's answer isn't JSON: {res!r}")
-        return res
+            raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res!r}")
+        if isinstance(res, dict):
+            return res
+        if want == 204:  # no body expected
+            return {}
+        raise ProtocolError(f"pairing: POST {path}: the device's answer isn't JSON: {res!r}")
 
     m1 = call("/register/pin", None, 200)
-    n1, mac, yb = u(m1["a"]), u(m1["b"]), u(m1["c"])  # yb as sent (may carry a 0x00 sign byte)
+    n1, mac, yb = u(m1, "a"), u(m1, "b"), u(m1, "c")  # yb as sent (may carry a 0x00 sign byte)
     ya, zz = crypto.dh_exchange(int.from_bytes(yb, "big"))
     n2 = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", zz, n1 + mac + n2, 10000, 48)
@@ -77,9 +95,9 @@ def register(addr, client_id, public_pem, read_pin):
     m2hmac = H(auth_key, n1 + mac + yb + n1 + n2 + mac + ya)
     m3 = call("/register/hash", {"a": _b64(n1), "b": _b64(n2), "c": _b64(mac),
                                  "d": _b64(ya), "e": _b64(m2hmac)}, 200)
-    if u(m3["a"]) != n2:
+    if u(m3, "a") != n2:
         raise PairingError("pairing: nonce mismatch")
-    e_hash, m3hmac = u(m3["b"]), u(m3["e"])
+    e_hash, m3hmac = u(m3, "b"), u(m3, "e")
     if not hmac.compare_digest(m3hmac, H(auth_key, n1 + n2 + mac + ya + m2hmac + n2 + e_hash)):
         raise PairingError("pairing: device message failed HMAC check")
 
@@ -90,9 +108,9 @@ def register(addr, client_id, public_pem, read_pin):
     m4hmac = H(auth_key, n2 + e_hash + m3hmac + n1 + r_hash + wrapped_rs)
     m5 = call("/register/ca", {"a": _b64(n1), "b": _b64(r_hash), "d": _b64(wrapped_rs),
                                "e": _b64(m4hmac)}, 200)
-    if u(m5["a"]) != n2:
+    if u(m5, "a") != n2:
         raise PairingError("pairing: nonce mismatch")
-    wrapped_es_cert, m5hmac = u(m5["d"]), u(m5["e"])
+    wrapped_es_cert, m5hmac = u(m5, "d"), u(m5, "e")
     if not hmac.compare_digest(m5hmac, H(auth_key, n1 + r_hash + wrapped_rs + m4hmac + n2
                                           + wrapped_es_cert)):
         raise PairingError("pairing: device message failed HMAC check")
@@ -117,7 +135,8 @@ class PairResult:
     pinned: bool
 
 
-def pair(read_pin, addr=None, force=False, cred_dir=None, on_event=None):
+def pair(read_pin: Callable[[], str], addr: str | None = None, force: bool = False,
+         cred_dir: str | None = None, on_event: EventHandler | None = None) -> PairResult:
     """Pair with the device (it shows a PIN; `read_pin()` must return it) and store
     new credentials in `cred_dir` (default ~/.config/quaderno). Refuses to replace
     an existing pairing unless `force`."""
@@ -127,7 +146,8 @@ def pair(read_pin, addr=None, force=False, cred_dir=None, on_event=None):
                             "use --force to pair again and replace them")
     addr = addr or os.environ.get("QUADERNO_ADDR") or usb.discover()
     status, info = reg_request(addr, "GET", "/register/information")
-    serial = info.get("serial_number") if status == 200 and isinstance(info, dict) else None
+    found = info.get("serial_number") if status == 200 and isinstance(info, dict) else None
+    serial = found if isinstance(found, str) else None
     if not serial:
         serial = next((d.serial for d in usb.usb_devices() if d.serial), None)
     emit(on_event, "device", f"device {serial or '?'} at {addr}")
@@ -140,8 +160,8 @@ def pair(read_pin, addr=None, force=False, cred_dir=None, on_event=None):
     finally:
         try:
             reg_request(addr, "PUT", "/register/cleanup")
-        except OSError:
-            pass
+        except (QuadernoError, OSError):
+            pass  # keep the error that got us here, if any
     pinned = credentials.save_pairing(cred_dir, client_id, private_pem, public_pem, cert, serial)
     if not pinned:
         emit(on_event, "warning", "warning: device sent an unreadable certificate; "
