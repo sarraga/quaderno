@@ -53,9 +53,11 @@ def cmd_get(dev, args):
 
 
 def cmd_put(dev, args):
-    """Exit status 1 only if a named local file does not exist."""
+    """Uploads what it can, like cp. Exit status 1 if anything named couldn't be
+    uploaded (missing, not a PDF, a folder without -r). Files already on the
+    device and non-PDFs inside folders uploaded with -r don't count."""
     res = dev.put(args.local, args.remote, recursive=args.recursive, on_event=show)
-    return 1 if res.missing else None
+    return 1 if res.missing or res.rejected else None
 
 
 def cmd_rm(dev, args):

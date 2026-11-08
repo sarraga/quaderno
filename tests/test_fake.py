@@ -71,8 +71,29 @@ def test_put_skips_bad_arguments_and_uploads_the_rest(fake, src, mkpdf, tmp_path
     assert "Document/T/good.pdf" in fake.paths()
     for frag in ("book.epub: not a PDF", "src: is a directory (use -r)", "missing.pdf: no such file"):
         assert frag in err, frag
-    assert rc == 1  # a named file was missing
-    assert Q.cmd_put(fake, ns(local=[str(epub)], remote="T", recursive=False)) is None  # only a skip
+    assert rc == 1
+
+
+@pytest.mark.parametrize("named,want", [
+    (["book.epub"], 1),                 # not a PDF: nothing uploaded
+    (["book.epub", "good.pdf"], 1),     # one rejected, one uploaded: still 1, as with cp
+    (["src"], 1),                       # a folder without -r
+    (["good.pdf"], None),               # all uploaded
+])
+def test_put_exit_status(named, want, fake, src, mkpdf, tmp_path):
+    fake.mkdirs("T")
+    (tmp_path / "book.epub").write_text("not a pdf")
+    mkpdf("good.pdf", "G")
+    assert Q.cmd_put(fake, ns(local=[str(tmp_path / n) for n in named], remote="T",
+                              recursive=False)) == want
+
+
+def test_put_exit_status_ignores_skips_and_non_pdfs_inside_folders(fake, src, mkpdf):
+    fake.mkdirs("T")
+    good = mkpdf("good.pdf", "G")
+    assert Q.cmd_put(fake, ns(local=[good], remote="T", recursive=False)) is None
+    assert Q.cmd_put(fake, ns(local=[good], remote="T", recursive=False)) is None  # already there
+    assert Q.cmd_put(fake, ns(local=[src], remote="T", recursive=True)) is None    # 2 non-PDF inside
 
 
 def test_get_r(loaded, src, tmp_path):
