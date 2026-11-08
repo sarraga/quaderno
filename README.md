@@ -2,9 +2,9 @@
 
 A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected to a Mac over USB.
 It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io); its compiled module loads fine under Santa.
-It pairs with the device by itself and does not need the QUADERNO PC App.
+It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
-Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2, Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) works with the PC App closed.
+Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2, Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed.
 
 ## Install
 
@@ -69,7 +69,7 @@ quaderno addr                           print the device address (switches USB m
 
 Global options:
 - `--addr ADDR` (or `$QUADERNO_ADDR`) skips discovery.
-- `--workspace DIR` uses the credentials in another directory.
+- `--config DIR` (or `$QUADERNO_CONFIG`) keeps the credentials in another directory, for every command including `pair`.
 - `-v` prints which credentials, address and TLS mode are in use.
 
 ### Paths and folders
@@ -151,7 +151,7 @@ The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors ex
 ## open and time
 
 - **`open DOC`** shows the document on the device at the page you last read. `open DOC -p N` opens it at page N. The device reports the new page a few seconds later.
-- **`time`** sets the device clock to the Mac's current time. The PC App does this on every connection; without the app, run it now and then. The device clock can be set but not read.
+- **`time`** sets the device clock to the Mac's current time. Run it now and then to keep the clock right. The device clock can be set but not read.
 
   The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time.
 
@@ -200,22 +200,19 @@ The credentials are stored in `~/.config/quaderno/` (set `$QUADERNO_CONFIG` to c
 | `devicecert.bin` | the device's TLS certificate, received during pairing | 644 |
 | `serial.dat` | device serial number, used to compute its address | 644 |
 
-Pairing adds a client on the device next to the PC App. The PC App's own pairing keeps working; both were checked after pairing this unit. `pair` refuses to replace an existing pairing unless you pass `--force`.
+`pair` refuses to replace an existing pairing unless you pass `--force`.
 
-**Where credentials come from**, in order:
-1. `--workspace DIR`
-2. `~/.config/quaderno`
-3. The PC App's pairing under `~/Library/Application Support/Fujitsu/QUADERNO PC App/QUADERNO_PCApp/ws*/`. This is only a fallback for a Mac that hasn't been paired with `pair`, and the files are only read.
+**Where credentials come from**, in order: `--config DIR`, then `$QUADERNO_CONFIG`, then `~/.config/quaderno`.
 
 ## TLS
 
-The device uses a self-signed certificate for `digitalpaper.local` (valid until 2035), and hands that same certificate over during pairing. With our own pairing, every HTTPS connection must present exactly that certificate. Anything else is refused with an error.
+The device uses a self-signed certificate for `digitalpaper.local` (valid until 2035), and hands that same certificate over during pairing. Every HTTPS connection must present exactly that certificate. Anything else is refused with an error.
 
-When the PC App's credentials are used, there is no stored certificate, so the connection is not verified. Every command then prints a warning on stderr. Running `quaderno pair` once fixes that: its credentials in `~/.config/quaderno` take precedence and include the certificate. The same applies if pairing received a certificate it couldn't read. If a firmware update replaces the certificate, run `pair --force`.
+If pairing received a certificate it couldn't read, none is stored and connections are not verified; every command then prints a warning on stderr, and `pair --force` fixes it. If a firmware update replaces the certificate, run `pair --force` as well.
 
 ## How the connection works
 
-1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*`. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new `enN` interface. The script writes only to a tty whose USB VID/PID match. If the PC App is running, it does this switch itself.
+1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*`. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new `enN` interface. The script writes only to a tty whose USB VID/PID match.
 2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For this unit it is `fe80::c8d3:84ff:fec2:323b%en8`. The script tries that address on every `en*` interface.
 3. **Pairing.** Plain HTTP on port 8080, in five calls:
    - `POST /register/pin`: the device sends nonce `n1`, its MAC and its Diffie-Hellman public value.
@@ -252,7 +249,7 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_fake.py` | CLI folder commands (put/get/mv/rm/mkdir) |
 | `tests/test_sync.py` | sync: edits, moves, deletes, local changes, name clashes, dry run |
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
-| `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device; key layout vs the PC App's `publickey.dat` (read only; skipped without a PC App pairing) |
+| `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
 | `tests/test_errors.py` | discovery states (stuck serial mode...), HTTP/connection errors, malformed answers, exit codes |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
@@ -286,6 +283,14 @@ tests/                  offline tests (fake device) and manual device checks
 ## Wi-Fi
 
 If the device is on Wi-Fi, pass its address explicitly with `--addr 192.168.x.y`. This is untested here. dpt-rp1-py finds Fujitsu units on Wi-Fi by browsing the mDNS service `_dp_fujitsu._tcp`.
+
+## If you also use the official QUADERNO app
+
+`quaderno` never reads or changes the app's files, and the two can be used side by side:
+- **Pairing:** `quaderno pair` adds a second client on the device. The app's own pairing keeps working; both were checked after pairing this unit. Moving over from the app takes one `quaderno pair`.
+- **USB switch:** when the app is running, it switches the device to USB networking itself.
+- **Clock:** the app sets the device clock each time it connects; `quaderno time` does the same on demand.
+- **App errors such as `EADDRINUSE:8081` or status 0** come from the app's own local port forwarding. They don't affect the USB link or `quaderno`.
 
 ## Alternative: dpt-rp1-py
 
@@ -342,4 +347,3 @@ slept. Wake it with its power button, or unplug and re-plug it, then try again.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
 - **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.
-- **PC App errors such as `EADDRINUSE:8081` or status 0**: these come from the app's own local port forwarding and affect only the app, not the USB link or this script.

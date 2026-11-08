@@ -2,11 +2,8 @@
 
 The simulated device uses independent implementations (Python pow() for DH, the
 system's /usr/bin/openssl for AES-CBC, stdlib hmac), so a mistake in how quaderno
-calls the `cryptography` library can't be mirrored on the other side.
-If the PC App has a pairing on this Mac, its publickey.dat is read (never written)
-to compare the public key layout."""
+calls the `cryptography` library can't be mirrored on the other side."""
 import base64
-import glob
 import hashlib
 import hmac
 import io
@@ -87,17 +84,6 @@ def test_openssl_made_pkcs1_key_loads_and_signs(tmp_path):
     kp = tmp_path / "k1.pem"
     subprocess.run([OPENSSL, "genrsa", "-out", kp, "2048"], capture_output=True, check=True)
     crypto.sign(crypto.load_private_key(kp.read_text()), b"x")
-
-
-def test_public_key_layout_matches_the_pc_app(keypair):
-    found = glob.glob(os.path.join(credentials.APP_DIR, "ws*", "publickey.dat"))
-    if not found:
-        pytest.skip("no PC App pairing on this Mac")
-    with open(found[0]) as f:
-        app_pub = f.read()
-    pub = keypair[1]
-    assert der(pub)[:32] == der(app_pub)[:32] and len(der(pub)) == len(der(app_pub))
-    assert [len(line) for line in pub.splitlines()] == [len(line) for line in app_pub.splitlines()]
 
 
 # --- 3. The pairing protocol against a simulated device ------------------------------
@@ -189,13 +175,13 @@ def test_pairing_with_the_wrong_pin(keypair, monkeypatch):
 def test_cli_pair(tmp_path, monkeypatch, capsys):
     cfg = str(tmp_path / "cfg")
     monkeypatch.setattr(credentials, "CONFIG_DIR", cfg)
-    monkeypatch.setattr(credentials, "APP_DIR", str(tmp_path / "app"))
     monkeypatch.setattr(client.Client, "authenticate", lambda self: None)
 
-    def run_pair(dev, pin, force=False):
+    def run_pair(dev, pin, force=False, config_dir=None):
         monkeypatch.setattr(pairing, "reg_request", dev)
         monkeypatch.setattr("sys.stdin", io.StringIO(pin + "\n"))
-        cli.cmd_pair(types.SimpleNamespace(addr="fake", verbose=False, force=force, pin_file=None))
+        cli.cmd_pair(types.SimpleNamespace(addr="fake", verbose=False, force=force, pin_file=None,
+                                           config_dir=config_dir))
         return capsys.readouterr().out
 
     dev = FakeRegDevice("1357")
@@ -224,3 +210,9 @@ def test_cli_pair(tmp_path, monkeypatch, capsys):
 
     run_pair(FakeRegDevice("1111"), "1111", force=True)    # unreadable cert: stale pin removed
     assert credentials.load_pinned_cert(cfg) is None
+
+    other = str(tmp_path / "other")                        # pair --config DIR writes there
+    dev = FakeRegDevice("3690")
+    run_pair(dev, "3690", config_dir=other)
+    assert credentials.load_credentials(credentials.find_credentials_dir(other)).client_id == \
+        dev.registered[0]

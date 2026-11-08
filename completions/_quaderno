@@ -58,7 +58,7 @@ _quaderno() {
   _arguments -C \
     '(- *)'{-h,--help}'[show help]' \
     '--addr=[device address]:address' \
-    '--workspace=[credentials directory]:directory:_files -/' \
+    '--config=[credentials directory]:directory:_files -/' \
     '(-v --verbose)'{-v,--verbose}'[print credentials, address, TLS mode]' \
     '1:command:->cmd' \
     '*::argument:->args' && ret=0

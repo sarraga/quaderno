@@ -23,7 +23,7 @@ def open_device(args):
     def on_switch(tty, serial):
         if args.verbose:
             print(f"switching {tty} ({serial}) to USB Ethernet", file=sys.stderr)
-    dev = connect(addr=args.addr, workspace=args.workspace, on_switch=on_switch)
+    dev = connect(addr=args.addr, config_dir=args.config_dir, on_switch=on_switch)
     if args.verbose:
         tls = "pinned to devicecert.bin" if dev.pinned_cert else "unverified (no pinned cert)"
         print(f"credentials: {dev.credentials.source}\ndevice: {dev.addr}\ntls: {tls}",
@@ -177,7 +177,8 @@ def cmd_pair(args):
         print(ev.message, file=sys.stderr if ev.warning else sys.stdout, flush=True)
     addr = args.addr or os.environ.get("QUADERNO_ADDR") or usb.discover(
         on_switch=lambda tty, s: args.verbose and print(f"switching {tty} ({s})", file=sys.stderr))
-    pairing.pair(read_pin, addr=addr, force=args.force, on_event=on_event)
+    pairing.pair(read_pin, addr=addr, force=args.force, cred_dir=args.config_dir,
+                 on_event=on_event)
 
 
 def complete(argv):
@@ -215,8 +216,9 @@ def build_parser():
     ap = argparse.ArgumentParser(prog="quaderno",
                                  description="Fujitsu QUADERNO over USB: files, sync, pairing.")
     ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' (default: auto)")
-    ap.add_argument("--workspace", help="credentials dir (default: ~/.config/quaderno, "
-                                        "else the PC App's pairing)")
+    ap.add_argument("--config", dest="config_dir", metavar="DIR",
+                    help="credentials directory, for reading and for `pair` "
+                         "(default: $QUADERNO_CONFIG or ~/.config/quaderno)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     # Remote paths in ls/get/mv/rm/open accept glob patterns ('Fighter*'); -E makes
@@ -283,7 +285,7 @@ def build_parser():
 
     p = add("pair", None, "pair with the device using the PIN on its screen")
     p.add_argument("--force", action="store_true",
-                   help="replace an existing pairing in ~/.config/quaderno")
+                   help="replace an existing pairing")
     p.add_argument("--pin-file", help="read the PIN from this file once it appears (instead of a prompt)")
     return ap
 
@@ -313,7 +315,7 @@ def main(argv=None):
         if args.cmd == "addr":
             try:
                 serial = credentials.load_credentials(
-                    credentials.find_credentials_dir(args.workspace)).serial
+                    credentials.find_credentials_dir(args.config_dir)).serial
             except QuadernoError:
                 serial = None
             print(args.addr or usb.discover(serial))

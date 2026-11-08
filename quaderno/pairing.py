@@ -1,4 +1,4 @@
-"""PIN pairing ("registration").
+"""PIN pairing ("registration") with the device.
 
 Plain HTTP on port 8080: /register/pin, /register/hash, /register/ca, /register,
 /register/cleanup. A Diffie-Hellman exchange (RFC 3526 group 14) feeds PBKDF2-SHA256,

@@ -1,18 +1,12 @@
-"""Where pairing credentials live, and loading/saving them.
+"""Where pairing credentials live, and loading/saving them: an explicit
+directory, else CONFIG_DIR (~/.config/quaderno, or $QUADERNO_CONFIG)."""
 
-Lookup order: an explicit directory, else our own pairing in CONFIG_DIR
-(~/.config/quaderno, or $QUADERNO_CONFIG), else the QUADERNO PC App's pairing,
-which is only ever read."""
-
-import glob
 import os
 from dataclasses import dataclass
 
 from . import crypto
 from .errors import CertificateError, NotPairedError
 
-APP_DIR = os.path.expanduser(
-    "~/Library/Application Support/Fujitsu/QUADERNO PC App/QUADERNO_PCApp")
 CONFIG_DIR = os.path.expanduser(os.environ.get("QUADERNO_CONFIG", "~/.config/quaderno"))
 
 
@@ -25,17 +19,6 @@ class Credentials:
     source: str                    # directory they were read from
 
 
-def find_app_workspace():
-    last = os.path.join(APP_DIR, "lastworkspaceid.dat")
-    if os.path.exists(last):
-        with open(last) as f:
-            path = os.path.join(APP_DIR, f.read().strip())
-        if os.path.isdir(path):
-            return path
-    cands = sorted(glob.glob(os.path.join(APP_DIR, "ws*")), key=os.path.getmtime)
-    return cands[-1] if cands else None
-
-
 def is_paired(cred_dir=None):
     return os.path.exists(os.path.join(cred_dir or CONFIG_DIR, "deviceid.dat"))
 
@@ -45,9 +28,6 @@ def find_credentials_dir(explicit=None):
         return explicit
     if is_paired(CONFIG_DIR):
         return CONFIG_DIR
-    ws = find_app_workspace()
-    if ws:
-        return ws
     raise NotPairedError("not paired: run `quaderno pair` with the device connected")
 
 
@@ -71,11 +51,8 @@ def load_credentials(cred_dir=None):
             raise NotPairedError(f"incomplete pairing: {p} is missing; run `quaderno pair --force`")
         with open(p) as f:
             return f.read().strip()
-    serial = None
-    for name in ("serial.dat", "workspace.dat"):  # ours, the PC App's
-        if os.path.exists(os.path.join(cred_dir, name)):
-            serial = read(name) or None
-            break
+    has_serial = os.path.exists(os.path.join(cred_dir, "serial.dat"))
+    serial = (read("serial.dat") or None) if has_serial else None
     return Credentials(client_id=read("deviceid.dat"),
                        key=crypto.load_private_key(read("privatekey.dat")),
                        serial=serial, pinned_cert=load_pinned_cert(cred_dir), source=cred_dir)

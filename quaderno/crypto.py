@@ -3,8 +3,10 @@
 Diffie-Hellman exchange with pow() (see dh_exchange).
 
 Only the encodings the device expects are done here: an SPKI public key under an
-'RSA PUBLIC KEY' PEM label, the 0x00-prefixed DH public
-value, and the HMAC-tagged AES-CBC "wrap" used inside pairing messages."""
+'RSA PUBLIC KEY' PEM label, the 0x00-prefixed DH public value, and the HMAC-tagged
+AES-CBC "wrap" used inside pairing messages. The first two copy the official
+QUADERNO app byte for byte; whether the device also accepts the standard forms (a
+'PUBLIC KEY' label, an unprefixed value) has not been tested."""
 
 import base64
 import hashlib
@@ -19,7 +21,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .errors import AuthError, PairingError
 
-# RFC 3526 group 14 (2048-bit MODP), generator 2.
+# RFC 3526 group 14 (2048-bit MODP), generator 2: the group the device pairs with.
 DH_P = int(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74"
     "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437"
@@ -42,8 +44,8 @@ def pem_encode(label, der):
 
 def generate_keypair(bits=2048):
     """(private_pem, public_pem): PKCS#1 'RSA PRIVATE KEY', and the public key as
-    SubjectPublicKeyInfo DER under an 'RSA PUBLIC KEY' label, byte-for-byte the
-    layout the device expects."""
+    SubjectPublicKeyInfo DER under an 'RSA PUBLIC KEY' label, the layout the device
+    accepts at pairing (see the module docstring)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
     private_pem = key.private_bytes(serialization.Encoding.PEM,
                                     serialization.PrivateFormat.TraditionalOpenSSL,
@@ -91,7 +93,8 @@ def aes_cbc_decrypt(key, iv, data):
 
 
 def wrap(data, auth_key, kw_key):
-    """AES-128-CBC(data + first 8 bytes of HMAC-SHA256(data)) + IV."""
+    """AES-128-CBC(data + first 8 bytes of HMAC-SHA256(data)) + IV: the format the
+    device uses in both directions during pairing."""
     iv = secrets.token_bytes(16)
     return aes_cbc_encrypt(kw_key, iv, data + hmac_sha256(auth_key, data)[:8]) + iv
 
@@ -106,7 +109,7 @@ def unwrap(data, auth_key, kw_key):
 
 def dh_exchange(peer_public):
     """Diffie-Hellman against the device's public value. Returns (ya, zz): our
-    public value encoded as 0x00 + 256 bytes and the 256-byte
+    public value as 0x00 + 256 bytes (see the module docstring) and the 256-byte
     shared secret. Keys are regenerated until both values have their full length,
     so leading-zero encoding conventions cannot differ from the device's.
 

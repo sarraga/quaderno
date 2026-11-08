@@ -21,7 +21,7 @@ from .errors import (AuthError, CertificateError, ConnectError, DeviceNotFoundEr
 from .events import Event
 from .pairing import PairResult, pair
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = ["connect", "pair", "Device", "Entry", "Event", "PutResult", "PairResult",
            "QuadernoError", "ConnectError", "DeviceNotFoundError", "SerialModeError",
            "DeviceUnreachableError", "AuthError", "NotPairedError", "LoginError",
