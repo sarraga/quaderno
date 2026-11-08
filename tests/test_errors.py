@@ -285,3 +285,21 @@ def test_cli_exit_codes(exc, want, monkeypatch, capsys):
     monkeypatch.setattr(cli, "connect", fake_connect)
     assert cli.main(["ls"]) == want
     assert capsys.readouterr().err.startswith("quaderno: ")
+
+
+# --- TLS without a pinned certificate ------------------------------------------------
+
+@pytest.mark.parametrize("pinned", [None, b"0\x82der"])
+def test_connect_warns_when_tls_is_not_checked(pinned, monkeypatch, caplog):
+    creds = credentials.Credentials(client_id="id", key=None, serial=None, pinned_cert=pinned,
+                                    source="/pc-app/ws1")
+    monkeypatch.setattr(credentials, "find_credentials_dir", lambda workspace=None: creds.source)
+    monkeypatch.setattr(credentials, "load_credentials", lambda cred_dir=None: creds)
+    monkeypatch.setattr(quaderno.Device, "authenticate", lambda self: None)
+    dev = quaderno.connect(addr="fe80::1%en9")
+    assert dev.pinned_cert == pinned
+    msgs = warnings_from(caplog)
+    if pinned is None:
+        assert len(msgs) == 1 and "not checked" in msgs[0] and "/pc-app/ws1" in msgs[0], msgs
+    else:
+        assert not msgs

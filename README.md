@@ -211,7 +211,7 @@ Pairing adds a client on the device next to the PC App. The PC App's own pairing
 
 The device uses a self-signed certificate for `digitalpaper.local` (valid until 2035), and hands that same certificate over during pairing. With our own pairing, every HTTPS connection must present exactly that certificate. Anything else is refused with an error.
 
-When the PC App's credentials are used, there is no stored certificate, so the connection is not verified. If a firmware update replaces the certificate, run `pair --force`.
+When the PC App's credentials are used, there is no stored certificate, so the connection is not verified. Every command then prints a warning on stderr. Running `quaderno pair` once fixes that: its credentials in `~/.config/quaderno` take precedence and include the certificate. The same applies if pairing received a certificate it couldn't read. If a firmware update replaces the certificate, run `pair --force`.
 
 ## How the connection works
 

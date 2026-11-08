@@ -40,8 +40,14 @@ class PutResult:
 
 def connect(addr=None, workspace=None, timeout=60, on_switch=None):
     """Find the device (or use `addr`), log in, and return a Device.
-    Credentials: `workspace` dir, else ~/.config/quaderno, else the PC App's."""
+    Credentials: `workspace` dir, else ~/.config/quaderno, else the PC App's.
+    Without a certificate saved at pairing (the PC App's credentials never have
+    one), TLS is not verified, and every call warns about it."""
     creds = credentials.load_credentials(credentials.find_credentials_dir(workspace))
+    if creds.pinned_cert is None:
+        log.warning("warning: the device's TLS certificate is not checked: the credentials in "
+                    "%s include none; run `quaderno pair` to pair this client and save it",
+                    creds.source)
     addr = addr or os.environ.get("QUADERNO_ADDR") or usb.discover(creds.serial, on_switch=on_switch)
     dev = Device(addr, creds.client_id, creds.key, timeout=timeout, pinned_cert=creds.pinned_cert)
     dev.credentials = creds
