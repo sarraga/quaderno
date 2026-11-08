@@ -100,8 +100,8 @@ def first_reachable(cands, timeout=1.5):
 
 
 def _leave_serial_mode(on_switch, timeout, resend_every):
-    """Send the switch command until no device is left in serial mode. Like the PC
-    App, resend it: a device in standby may ignore the first ones."""
+    """Send the switch command until no device is left in serial mode, resending
+    it: a device in standby may ignore the first ones."""
     deadline = time.time() + timeout
     next_send = 0.0
     while True:
