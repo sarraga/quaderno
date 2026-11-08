@@ -1,32 +1,23 @@
-#!/usr/bin/env python3
 """Error detection and the exception hierarchy, offline: USB discovery states (fake
 USB bus and clock), HTTP errors, dropped connections, login rejection, malformed
 answers (not JSON: error; unreadable date or size: warning), CLI exit codes."""
-import contextlib
 import http.client
-import io
 import json
 import logging
-import os
-import sys
-import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import quaderno  # noqa: E402
-from quaderno import cli, client, credentials, usb  # noqa: E402
-from quaderno.entry import Entry  # noqa: E402
-from quaderno.usb import PID_ETHERNET, PID_SERIAL, UsbDevice  # noqa: E402
-from quaderno.util import parse_device_time  # noqa: E402
-from fakedevice import FakeDevice  # noqa: E402
+import pytest
+from fakedevice import FakeDevice
+
+import quaderno
+from quaderno import cli, client, credentials, usb
+from quaderno.entry import Entry
+from quaderno.usb import PID_ETHERNET, PID_SERIAL, UsbDevice
+from quaderno.util import parse_device_time
 
 
-def raises(exc, fn):
-    try:
-        fn()
-    except exc as e:
-        return e
-    raise AssertionError(f"expected {exc.__name__}")
+def warnings_from(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "quaderno"]
 
 
 # --- USB discovery ---------------------------------------------------------------
@@ -67,45 +58,50 @@ class FakeBus:
         return cands[0] if self.mode == "ethernet" and self.answers and self.usb_devices() else None
 
 
-def with_bus(bus, fn):
-    clock = FakeClock()
-    saved = (usb.usb_devices, usb.switch_to_ethernet, usb.first_reachable, usb.time)
-    usb.usb_devices, usb.switch_to_ethernet, usb.first_reachable = \
-        bus.usb_devices, bus.switch_to_ethernet, bus.first_reachable
-    usb.time = clock
-    try:
-        return fn(), clock
-    finally:
-        usb.usb_devices, usb.switch_to_ethernet, usb.first_reachable, usb.time = saved
+@pytest.fixture
+def on_bus(monkeypatch):
+    """on_bus(bus, **kw) runs usb.discover against a FakeBus with a fake clock."""
+    def run(bus, **kw):
+        monkeypatch.setattr(usb, "usb_devices", bus.usb_devices)
+        monkeypatch.setattr(usb, "switch_to_ethernet", bus.switch_to_ethernet)
+        monkeypatch.setattr(usb, "first_reachable", bus.first_reachable)
+        monkeypatch.setattr(usb, "time", FakeClock())
+        return usb.discover(**kw)
+    return run
 
 
-print("discover: not plugged in")
-e = raises(quaderno.DeviceNotFoundError, lambda: with_bus(FakeBus(None), usb.discover))
-assert isinstance(e, quaderno.ConnectError) and "plug it in" in str(e)
+def test_discover_not_plugged_in(on_bus):
+    with pytest.raises(quaderno.DeviceNotFoundError, match="plug it in") as e:
+        on_bus(FakeBus(None))
+    assert isinstance(e.value, quaderno.ConnectError)
 
-print("discover: already in network mode")
-(addr, clock), = [with_bus(FakeBus("ethernet"), usb.discover)]
-assert addr.startswith("fe80::c8d3:84ff:fec2:323b%")
 
-print("discover: serial mode, ignores the first command, switches on the resend")
-bus = FakeBus("serial", switch_after=2)
-switches = []
-(addr, clock), = [with_bus(bus, lambda: usb.discover(on_switch=lambda tty, s: switches.append(tty)))]
-assert addr and len(bus.sent) == 2 and len(switches) == 2
+def test_discover_already_in_network_mode(on_bus):
+    assert on_bus(FakeBus("ethernet")).startswith("fe80::c8d3:84ff:fec2:323b%")
 
-print("discover: stuck in serial mode -> SerialModeError, after resending")
-bus = FakeBus("serial", switch_after=None)
-e = raises(quaderno.SerialModeError, lambda: with_bus(bus, lambda: usb.discover(switch_timeout=15)))
-assert len(bus.sent) == 5, bus.sent            # t = 0, 3, 6, 9, 12 s
-assert "stayed in USB serial mode" in str(e) and "re-plug" in str(e)
 
-print("discover: network mode but not answering -> DeviceUnreachableError")
-e = raises(quaderno.DeviceUnreachableError, lambda: with_bus(FakeBus("ethernet", answers=False), usb.discover))
-assert "doesn't answer" in str(e)
+def test_discover_switches_on_the_resend(on_bus):
+    bus, switches = FakeBus("serial", switch_after=2), []
+    assert on_bus(bus, on_switch=lambda tty, s: switches.append(tty))
+    assert len(bus.sent) == 2 and len(switches) == 2
 
-print("discover: unplugged while waiting -> DeviceNotFoundError")
-raises(quaderno.DeviceNotFoundError,
-       lambda: with_bus(FakeBus("ethernet", answers=False, unplug_after=1), usb.discover))
+
+def test_discover_stuck_in_serial_mode(on_bus):
+    bus = FakeBus("serial", switch_after=None)
+    with pytest.raises(quaderno.SerialModeError) as e:
+        on_bus(bus, switch_timeout=15)
+    assert len(bus.sent) == 5, bus.sent            # t = 0, 3, 6, 9, 12 s
+    assert "stayed in USB serial mode" in str(e.value) and "re-plug" in str(e.value)
+
+
+def test_discover_network_mode_but_silent(on_bus):
+    with pytest.raises(quaderno.DeviceUnreachableError, match="doesn't answer"):
+        on_bus(FakeBus("ethernet", answers=False))
+
+
+def test_discover_unplugged_while_waiting(on_bus):
+    with pytest.raises(quaderno.DeviceNotFoundError):
+        on_bus(FakeBus("ethernet", answers=False, unplug_after=1))
 
 
 # --- HTTP client ------------------------------------------------------------------
@@ -141,11 +137,11 @@ class FakeConn:
         pass
 
 
-client.PinnedHTTPSConnection = FakeConn
-
-
-def make():
-    FakeConn.made = 0
+@pytest.fixture
+def c(monkeypatch):
+    """A Client whose connections replay FakeConn.script."""
+    monkeypatch.setattr(client, "PinnedHTTPSConnection", FakeConn)
+    FakeConn.script, FakeConn.made = [], 0
     return client.Client("fe80::1%en9", "id", key=None)
 
 
@@ -153,139 +149,139 @@ def err_body(code, msg):
     return json.dumps({"error_code": code, "message": msg}).encode()
 
 
-print("HTTP 404 -> NotFoundError with the device's code; 400 -> RequestError")
-c = make()
-FakeConn.script = [FakeResponse(404, err_body("40401", "not found"))]
-e = raises(quaderno.NotFoundError, lambda: c.request("GET", "/resolve/entry/x"))
-assert e.status == 404 and e.code == "40401"
-FakeConn.script = [FakeResponse(400, err_body("40006", "fileName(unsupported)"))]
-e = raises(quaderno.RequestError, lambda: c.request("POST", "/documents", {}))
-assert e.status == 400 and e.code == "40006" and "fileName" in str(e)
+def test_http_404_and_400(c):
+    FakeConn.script = [FakeResponse(404, err_body("40401", "not found"))]
+    with pytest.raises(quaderno.NotFoundError) as e:
+        c.request("GET", "/resolve/entry/x")
+    assert e.value.status == 404 and e.value.code == "40401"
+    FakeConn.script = [FakeResponse(400, err_body("40006", "fileName(unsupported)"))]
+    with pytest.raises(quaderno.RequestError) as e:
+        c.request("POST", "/documents", {})
+    assert e.value.status == 400 and e.value.code == "40006" and "fileName" in str(e.value)
 
-print("connection refused / timeout -> DeviceUnreachableError (no raw OSError)")
-c = make()
-FakeConn.script = [ConnectionRefusedError(61, "Connection refused")]
-e = raises(quaderno.DeviceUnreachableError, lambda: c.request("GET", "/ping"))
-assert isinstance(e, quaderno.ConnectError) and "Connection refused" in str(e)
-FakeConn.script = [TimeoutError("timed out")]
-raises(quaderno.DeviceUnreachableError, lambda: c.request("GET", "/ping"))
 
-print("stale kept-alive connection: reconnects once and succeeds")
-c = make()
-FakeConn.script = [FakeResponse(200, b'{"value": 1}')]
-assert c.request("GET", "/a") == {"value": 1} and FakeConn.made == 1
-FakeConn.script = [http.client.RemoteDisconnected("closed"), FakeResponse(200, b'{"value": 2}')]
-assert c.request("GET", "/b") == {"value": 2} and FakeConn.made == 2
-print("...but a fresh connection that drops is not retried")
-c = make()
-FakeConn.script = [http.client.RemoteDisconnected("closed"), FakeResponse(200, b"{}")]
-raises(quaderno.DeviceUnreachableError, lambda: c.request("GET", "/c"))
-assert FakeConn.made == 1
+def test_refused_or_timed_out_is_unreachable(c):
+    FakeConn.script = [ConnectionRefusedError(61, "Connection refused")]
+    with pytest.raises(quaderno.DeviceUnreachableError, match="Connection refused") as e:
+        c.request("GET", "/ping")
+    assert isinstance(e.value, quaderno.ConnectError)
+    FakeConn.script = [TimeoutError("timed out")]
+    with pytest.raises(quaderno.DeviceUnreachableError):
+        c.request("GET", "/ping")
 
-print("login rejected -> LoginError (an AuthError)")
-c = make()
-FakeConn.script = [FakeResponse(404, err_body("40401", "client not found"))]
-e = raises(quaderno.LoginError, c.authenticate)
-assert isinstance(e, quaderno.AuthError) and "pair --force" in str(e)
 
-print("200 with a body that isn't JSON -> ProtocolError (no raw ValueError)")
-c = make()
-FakeConn.script = [FakeResponse(200, b"<html>oops</html>")]
-e = raises(quaderno.ProtocolError, lambda: c.request("GET", "/folders/x/entries"))
-assert "isn't JSON" in str(e) and "/folders/x/entries" in str(e)
+def test_stale_kept_alive_connection_reconnects_once(c):
+    FakeConn.script = [FakeResponse(200, b'{"value": 1}')]
+    assert c.request("GET", "/a") == {"value": 1} and FakeConn.made == 1
+    FakeConn.script = [http.client.RemoteDisconnected("closed"), FakeResponse(200, b'{"value": 2}')]
+    assert c.request("GET", "/b") == {"value": 2} and FakeConn.made == 2
+
+
+def test_fresh_connection_that_drops_is_not_retried(c):
+    FakeConn.script = [http.client.RemoteDisconnected("closed"), FakeResponse(200, b"{}")]
+    with pytest.raises(quaderno.DeviceUnreachableError):
+        c.request("GET", "/c")
+    assert FakeConn.made == 1
+
+
+def test_login_rejected(c):
+    FakeConn.script = [FakeResponse(404, err_body("40401", "client not found"))]
+    with pytest.raises(quaderno.LoginError, match="pair --force") as e:
+        c.authenticate()
+    assert isinstance(e.value, quaderno.AuthError)
+
+
+def test_answer_that_is_not_json(c):
+    FakeConn.script = [FakeResponse(200, b"<html>oops</html>")]
+    with pytest.raises(quaderno.ProtocolError, match="isn't JSON") as e:
+        c.request("GET", "/folders/x/entries")
+    assert "/folders/x/entries" in str(e.value)
 
 
 # --- malformed fields: absent is None; unreadable warns, or errors where it matters --
 
-class Captured(logging.Handler):
-    """Collects the package's log warnings (and keeps them off the test output)."""
-
-    def __init__(self):
-        super().__init__()
-        self.msgs = []
-
-    def emit(self, record):
-        self.msgs.append(record.getMessage())
-
-
-cap = Captured()
-logging.getLogger("quaderno").addHandler(cap)
-
-print("parse_device_time: absent -> None; malformed or offset-less -> ValueError")
-assert parse_device_time(None) is None
-assert parse_device_time("2024-04-08T11:31:43Z") == 1712575903
-assert parse_device_time("2024-04-08T13:31:43+02:00") == 1712575903
-for bad in ("", "yesterday", "2024-04-08T11:31:43", 1712575903):
-    raises(ValueError, lambda: parse_device_time(bad))
-
-doc = {"entry_id": "d1", "entry_name": "x.pdf", "entry_path": "Document/x.pdf",
+DOC = {"entry_id": "d1", "entry_name": "x.pdf", "entry_path": "Document/x.pdf",
        "entry_type": "document", "file_size": "1234", "total_page": "7",
        "modified_date": "2024-04-08T11:31:43Z", "created_date": "2024-04-01T09:00:00Z"}
-print("Entry.from_api: well-formed and absent fields")
-e = Entry.from_api(doc)
-assert (e.size, e.pages, e.mtime) == (1234, 7, 1712575903)
-bare = Entry.from_api({"entry_id": "f1", "entry_path": "Document/F", "entry_type": "folder"})
-assert (bare.size, bare.pages, bare.mtime) == (None, None, None)
 
-print("Entry.from_api: a malformed date doesn't stop a listing; mtime raises ProtocolError")
-e = Entry.from_api({**doc, "modified_date": "08/04/2024", "created_date": ""})
-assert e.modified == "08/04/2024" and e.created == "" and not cap.msgs
-err = raises(quaderno.ProtocolError, lambda: e.mtime)
-assert "modified_date" in str(err) and "Document/x.pdf" in str(err), str(err)
 
-print("Entry.from_api: malformed size or page count -> None, with a warning")
-for key, val in [("file_size", "12kB"), ("total_page", [7])]:
-    cap.msgs.clear()
-    e = Entry.from_api({**doc, key: val})
-    assert getattr(e, "size" if key == "file_size" else "pages") is None
-    assert len(cap.msgs) == 1 and key in cap.msgs[0] and "Document/x.pdf" in cap.msgs[0], cap.msgs
+def test_parse_device_time():
+    assert parse_device_time(None) is None
+    assert parse_device_time("2024-04-08T11:31:43Z") == 1712575903
+    assert parse_device_time("2024-04-08T13:31:43+02:00") == 1712575903
 
-print("get with a malformed date: file saved (exit 0), date not applied, warning")
-dev = FakeDevice()
-dev.e[dev.put_doc("Document/Books/x.pdf", b"%PDF-1.7 body")]["modified_date"] = "08/04/2024"
-out = tempfile.mkdtemp()
-cli.connect = lambda **kw: dev
-cap.msgs.clear()
-with contextlib.redirect_stdout(io.StringIO()):
-    assert cli.main(["get", "Books/x.pdf", "-o", out]) == 0
-saved = os.path.join(out, "x.pdf")
-with open(saved, "rb") as fh:
-    assert fh.read() == b"%PDF-1.7 body"
-assert abs(os.stat(saved).st_mtime - time.time()) < 60       # not a device time
-assert len(cap.msgs) == 1 and "saved" in cap.msgs[0] and "08/04/2024" in cap.msgs[0], cap.msgs
 
-print("sync (no event callback) with a malformed date: completes, warning still shown")
-cap.msgs.clear()
-mirror = tempfile.mkdtemp()
-dev.sync(mirror)
-assert os.path.exists(os.path.join(mirror, "Books", "x.pdf"))
-assert len(cap.msgs) == 1 and "modified_date" in cap.msgs[0], cap.msgs
+@pytest.mark.parametrize("bad", ["", "yesterday", "2024-04-08T11:31:43", 1712575903])
+def test_parse_device_time_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_device_time(bad)
+
+
+def test_entry_fields_well_formed_and_absent():
+    e = Entry.from_api(DOC)
+    assert (e.size, e.pages, e.mtime) == (1234, 7, 1712575903)
+    bare = Entry.from_api({"entry_id": "f1", "entry_path": "Document/F", "entry_type": "folder"})
+    assert (bare.size, bare.pages, bare.mtime) == (None, None, None)
+
+
+def test_malformed_date_does_not_stop_a_listing(caplog):
+    e = Entry.from_api({**DOC, "modified_date": "08/04/2024", "created_date": ""})
+    assert e.modified == "08/04/2024" and e.created == "" and not warnings_from(caplog)
+    with pytest.raises(quaderno.ProtocolError) as err:
+        e.mtime
+    assert "modified_date" in str(err.value) and "Document/x.pdf" in str(err.value)
+
+
+@pytest.mark.parametrize("key,val,attr", [("file_size", "12kB", "size"), ("total_page", [7], "pages")])
+def test_malformed_size_or_pages_reads_as_missing_with_a_warning(key, val, attr, caplog):
+    e = Entry.from_api({**DOC, key: val})
+    assert getattr(e, attr) is None
+    msgs = warnings_from(caplog)
+    assert len(msgs) == 1 and key in msgs[0] and "Document/x.pdf" in msgs[0], msgs
+
+
+@pytest.fixture
+def bad_date_device():
+    dev = FakeDevice()
+    dev.e[dev.put_doc("Document/Books/x.pdf", b"%PDF-1.7 body")]["modified_date"] = "08/04/2024"
+    return dev
+
+
+def test_get_with_a_malformed_date_keeps_the_file(bad_date_device, tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(cli, "connect", lambda **kw: bad_date_device)
+    assert cli.main(["get", "Books/x.pdf", "-o", str(tmp_path)]) == 0
+    saved = tmp_path / "x.pdf"
+    assert saved.read_bytes() == b"%PDF-1.7 body"
+    assert abs(saved.stat().st_mtime - time.time()) < 60       # not a device time
+    msgs = warnings_from(caplog)
+    assert len(msgs) == 1 and "saved" in msgs[0] and "08/04/2024" in msgs[0], msgs
+
+
+def test_sync_with_a_malformed_date_completes_and_warns(bad_date_device, tmp_path, caplog):
+    bad_date_device.sync(str(tmp_path))                        # no event callback
+    assert (tmp_path / "Books" / "x.pdf").exists()
+    msgs = warnings_from(caplog)
+    assert len(msgs) == 1 and "modified_date" in msgs[0], msgs
 
 
 # --- credentials and CLI exit codes ------------------------------------------------
 
-print("no credentials anywhere -> NotPairedError")
-empty = tempfile.mkdtemp()
-credentials.CONFIG_DIR, credentials.APP_DIR = os.path.join(empty, "cfg"), os.path.join(empty, "app")
-raises(quaderno.NotPairedError, credentials.find_credentials_dir)
+def test_no_credentials_anywhere(tmp_path, monkeypatch):
+    monkeypatch.setattr(credentials, "CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(credentials, "APP_DIR", str(tmp_path / "app"))
+    with pytest.raises(quaderno.NotPairedError):
+        credentials.find_credentials_dir()
 
 
-def run_cli(exc, argv=("ls",)):
+@pytest.mark.parametrize("exc,want", [
+    (quaderno.SerialModeError("stuck"), 3), (quaderno.DeviceNotFoundError("none"), 3),
+    (quaderno.DeviceUnreachableError("silent"), 3), (quaderno.NotPairedError("np"), 4),
+    (quaderno.CertificateError("cert"), 4), (quaderno.WrongPinError("pin"), 4),
+    (quaderno.ExistsError("exists"), 1), (quaderno.NotFoundError("nf"), 1),
+    (quaderno.ProtocolError("bad json"), 1)])
+def test_cli_exit_codes(exc, want, monkeypatch, capsys):
     def fake_connect(**kw):
         raise exc
-    cli.connect = fake_connect
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        code = cli.main(list(argv))
-    return code, err.getvalue()
-
-
-print("CLI exit codes: 3 connect, 4 auth/pairing, 1 other")
-for exc, want in [(quaderno.SerialModeError("stuck"), 3), (quaderno.DeviceNotFoundError("none"), 3),
-                  (quaderno.DeviceUnreachableError("silent"), 3), (quaderno.NotPairedError("np"), 4),
-                  (quaderno.CertificateError("cert"), 4), (quaderno.WrongPinError("pin"), 4),
-                  (quaderno.ExistsError("exists"), 1), (quaderno.NotFoundError("nf"), 1),
-                  (quaderno.ProtocolError("bad json"), 1)]:
-    code, err = run_cli(exc)
-    assert code == want and err.startswith("quaderno: "), (exc, code, err)
-print("ALL ERROR TESTS PASSED")
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    assert cli.main(["ls"]) == want
+    assert capsys.readouterr().err.startswith("quaderno: ")

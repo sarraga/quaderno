@@ -240,17 +240,26 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 ## Tests
 
 ```
-.venv/bin/python tests/test_api.py      # the Python API used directly
-.venv/bin/python tests/test_fake.py     # CLI folder commands (put/get/mv/rm/mkdir)
-.venv/bin/python tests/test_sync.py     # sync: edits, moves, deletes, local changes, name clashes, dry run
-.venv/bin/python tests/test_patterns.py # globs/regex in ls, get, mv, rm, open; rm confirmation
-.venv/bin/python tests/test_pair.py     # crypto wiring vs openssl; pairing vs a simulated device
-.venv/bin/python tests/test_errors.py   # discovery states (stuck serial mode...), HTTP/connection errors, exit codes
-.venv/bin/python tests/hw_replug_watch.py   # manual: re-plug the device; the CLI must do the USB switch
-zsh tests/hw_zsh_completion.zsh             # manual: presses Tab in a real zsh against the device
+.venv/bin/pip install -e '.[test]'   # once: adds pytest
+.venv/bin/python -m pytest           # all offline tests, about 3 s
+.venv/bin/python -m pytest tests/test_sync.py -k guards   # one file, or one test
 ```
 
-The first six need no device. `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code.
+| File | Covers |
+|---|---|
+| `tests/test_api.py` | the Python API used directly |
+| `tests/test_fake.py` | CLI folder commands (put/get/mv/rm/mkdir) |
+| `tests/test_sync.py` | sync: edits, moves, deletes, local changes, name clashes, dry run |
+| `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
+| `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device; key layout vs the PC App's `publickey.dat` (read only; skipped without a PC App pairing) |
+| `tests/test_errors.py` | discovery states (stuck serial mode...), HTTP/connection errors, malformed answers, exit codes |
+
+None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
+
+```
+.venv/bin/python tests/hw_replug_watch.py   # re-plug the device; the CLI must do the USB switch
+zsh tests/hw_zsh_completion.zsh             # presses Tab in a real zsh against the device
+```
 
 ## Code layout
 

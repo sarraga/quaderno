@@ -1,13 +1,11 @@
-#!/usr/bin/env python3
-"""Folder commands (mkdir -p, put -r, get -r, mv, rm -r) against the in-memory fake device."""
-import io, json, os, re, sys, tempfile, types, uuid
-from urllib.parse import unquote, urlsplit, parse_qs
+"""Folder commands (mkdir -p, put -r, get -r, mv, rm -r) through the CLI command
+functions, against the in-memory fake device."""
+import os
+import types
+from pathlib import Path
 
-sys.path.insert(0, sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quaderno import cli as Q
-
-
-from fakedevice import FakeDevice  # noqa: E402
+import pytest
+from fakedevice import FakeDevice, Q, expect
 
 
 def ns(**kw):
@@ -18,116 +16,122 @@ def ns(**kw):
     return types.SimpleNamespace(**kw)
 
 
-def mkpdf(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(b"%PDF-1.4\n" + text.encode() + b"\n%%EOF\n")
+@pytest.fixture
+def src(mkpdf, tmp_path):
+    mkpdf("src/a.pdf", "A")
+    mkpdf("src/sub/b.pdf", "B")
+    mkpdf("src/sub/deep/c.pdf", "C")
+    mkpdf("src/Café.pdf", "NFD name")                 # NFD on disk, as macOS may store it
+    (tmp_path / "src" / "nopdfs").mkdir()
+    (tmp_path / "src" / "nopdfs" / "x.txt").write_text("x")
+    (tmp_path / "src" / "notes.txt").write_text("ignored")
+    return str(tmp_path / "src")
 
 
-def expect_error(fn, frag):
-    try:
-        fn()
-    except Q.QuadernoError as e:
-        assert frag in str(e), (frag, str(e))
-        print("  ok error:", e)
-        return
-    raise AssertionError("expected error containing " + frag)
+@pytest.fixture
+def loaded(src):
+    """A device with T/x/y and `src` uploaded as T/src."""
+    d = FakeDevice()
+    Q.cmd_mkdir(d, ns(remote=["T/x/y"], parents=True))
+    Q.cmd_put(d, ns(local=[src], remote="T", recursive=True))
+    return d
 
 
-tmp = tempfile.mkdtemp()
-src = os.path.join(tmp, "src")
-mkpdf(f"{src}/a.pdf", "A")
-mkpdf(f"{src}/sub/b.pdf", "B")
-mkpdf(f"{src}/sub/deep/c.pdf", "C")
-mkpdf(f"{src}/Café.pdf", "NFD name")       # NFD on disk
-os.makedirs(f"{src}/nopdfs"); open(f"{src}/nopdfs/x.txt", "w").write("x")
-open(f"{src}/notes.txt", "w").write("ignored")
+def test_mkdir_p(fake):
+    Q.cmd_mkdir(fake, ns(remote=["T/x/y"], parents=True))
+    Q.cmd_mkdir(fake, ns(remote=["T/x/y"], parents=True))  # idempotent
+    assert "Document/T/x/y" in fake.paths()
+    with expect("404"):
+        Q.cmd_mkdir(fake, ns(remote=["T/missing/z"], parents=False))
 
-d = FakeDevice()
-print("mkdir -p")
-Q.cmd_mkdir(d, ns(remote=["T/x/y"], parents=True))
-Q.cmd_mkdir(d, ns(remote=["T/x/y"], parents=True))  # idempotent
-expect_error(lambda: Q.cmd_mkdir(d, ns(remote=["T/missing/z"], parents=False)), "404")
 
-print("put -r into existing folder")
-Q.cmd_put(d, ns(local=[src], remote="T", recursive=True))
-assert "Document/T/src/sub/deep/c.pdf" in d.paths()
-assert "Document/T/src/Café.pdf" in d.paths()          # stored NFC
-assert not any("nopdfs" in p for p in d.paths()), d.paths()
-print("put -r again -> all skipped")
-Q.cmd_put(d, ns(local=[src], remote="T", recursive=True))
-print("put -r to new path (rename dir)")
-Q.cmd_put(d, ns(local=[src], remote="T/copy2", recursive=True))
-assert "Document/T/copy2/sub/b.pdf" in d.paths()
-print("put with bad arguments mixed in: skip each with a stderr line, upload the rest")
-import contextlib  # noqa: E402
-epub = os.path.join(tmp, "book.epub")
-open(epub, "w").write("not a pdf")
-good = os.path.join(tmp, "good.pdf")
-mkpdf(good, "G")
-err, out = io.StringIO(), io.StringIO()
-with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
-    rc = Q.cmd_put(d, ns(local=[epub, good, src, os.path.join(tmp, "missing.pdf")],
-                         remote="T", recursive=False))
-print("  ", err.getvalue().strip().replace("\n", "\n   "))
-assert "Document/T/good.pdf" in d.paths()
-for frag in ("book.epub: not a PDF", "src: is a directory (use -r)", "missing.pdf: no such file"):
-    assert frag in err.getvalue(), frag
-assert rc == 1  # a named file was missing
-with contextlib.redirect_stderr(io.StringIO()):
-    assert Q.cmd_put(d, ns(local=[epub], remote="T", recursive=False)) is None  # only a skip: exit 0
-print("put -r reports non-PDFs it ignored inside folders")
-with contextlib.redirect_stdout(out):
+def test_put_r(loaded, src, capsys):
+    d = loaded
+    assert "Document/T/src/sub/deep/c.pdf" in d.paths()
+    assert "Document/T/src/Café.pdf" in d.paths()      # stored NFC
+    assert not any("nopdfs" in p for p in d.paths()), d.paths()
+    before = d.paths()
+    Q.cmd_put(d, ns(local=[src], remote="T", recursive=True))         # again: all skipped
+    assert d.paths() == before
+    Q.cmd_put(d, ns(local=[src], remote="T/copy2", recursive=True))   # new path: renames the dir
+    assert "Document/T/copy2/sub/b.pdf" in d.paths()
+    capsys.readouterr()
     Q.cmd_put(d, ns(local=[src], remote="T/copy3", recursive=True))
-assert "2 non-PDF ignored" in out.getvalue(), out.getvalue()
+    assert "2 non-PDF ignored" in capsys.readouterr().out
 
-print("get -r")
-out = os.path.join(tmp, "out")
-Q.cmd_get(d, ns(remote=["T/src"], output=out, recursive=True))
-for rel in ["a.pdf", "sub/b.pdf", "sub/deep/c.pdf", "Café.pdf"]:
-    got = open(os.path.join(out, "src", rel), "rb").read()
-    assert got.startswith(b"%PDF"), rel
-assert open(f"{out}/src/sub/deep/c.pdf", "rb").read() == open(f"{src}/sub/deep/c.pdf", "rb").read()
-expect_error(lambda: Q.cmd_get(d, ns(remote=["T/src"], output=out, recursive=False)), "use -r")
 
-print("mv folder")
-Q.cmd_mv(d, ns(src="T/src/sub", dst="T/x"))            # into existing folder
-assert "Document/T/x/sub/deep/c.pdf" in d.paths()
-Q.cmd_mv(d, ns(src="T/x/sub", dst="T/renamed"))        # rename + move
-assert "Document/T/renamed/deep/c.pdf" in d.paths()
-expect_error(lambda: Q.cmd_mv(d, ns(src="T", dst="T/x/y")), "into itself")
-expect_error(lambda: Q.cmd_mv(d, ns(src="/", dst="T")), "root")
+def test_put_skips_bad_arguments_and_uploads_the_rest(fake, src, mkpdf, tmp_path, capsys):
+    fake.mkdirs("T")
+    epub = tmp_path / "book.epub"
+    epub.write_text("not a pdf")
+    good = mkpdf("good.pdf", "G")
+    rc = Q.cmd_put(fake, ns(local=[str(epub), good, src, str(tmp_path / "missing.pdf")],
+                            remote="T", recursive=False))
+    err = capsys.readouterr().err
+    assert "Document/T/good.pdf" in fake.paths()
+    for frag in ("book.epub: not a PDF", "src: is a directory (use -r)", "missing.pdf: no such file"):
+        assert frag in err, frag
+    assert rc == 1  # a named file was missing
+    assert Q.cmd_put(fake, ns(local=[str(epub)], remote="T", recursive=False)) is None  # only a skip
 
-print("rm guards")
-expect_error(lambda: Q.cmd_rm(d, ns(remote=["T"], recursive=False)), "not empty")
-expect_error(lambda: Q.cmd_rm(d, ns(remote=["/"], recursive=True)), "root")
-print("rm -r")
-Q.cmd_rm(d, ns(remote=["T"], recursive=True))
-assert d.paths() == ["Document"], d.paths()
-print("put -d to a folder that doesn't exist: clear error with suggestions, nothing created")
-d2 = FakeDevice()
-d2.mkdirs("Books/Military History")
-book = os.path.join(tmp, "Submarine Torpedo Tactics - Edward Monroe Jones & Shawn S. Roderick.pdf")
-mkpdf(book, "sub")
-before = d2.paths()
-with contextlib.redirect_stdout(io.StringIO()):
-    expect_error(lambda: Q.cmd_put(d2, ns(local=[book], remote="Military History", recursive=False)),
-                 "did you mean: 'Books/Military History'")
-    expect_error(lambda: Q.cmd_put(d2, ns(local=[book, good], remote="Military History",
-                                          recursive=False)), "no folder Document/Military History")
-assert d2.paths() == before
-print("...the full folder path works, & and . in the name are fine")
-with contextlib.redirect_stdout(io.StringIO()):
-    Q.cmd_put(d2, ns(local=[book], remote="Books/Military History", recursive=False))
-assert f"Document/Books/Military History/{os.path.basename(book)}" in d2.paths()
-print("...a new name ending in .pdf still renames on upload")
-with contextlib.redirect_stdout(io.StringIO()):
-    Q.cmd_put(d2, ns(local=[good], remote="Books/renamed.pdf", recursive=False))
-assert "Document/Books/renamed.pdf" in d2.paths()
 
-print("failed upload removes the half-created document")
-d2.fail_upload = True
-before = d2.paths()
-expect_error(lambda: Q.cmd_put(d2, ns(local=[good], remote="Books", recursive=False)), "simulated failure")
-assert d2.paths() == before, set(d2.paths()) ^ set(before)
-print("ALL FAKE-DEVICE TESTS PASSED")
+def test_get_r(loaded, src, tmp_path):
+    out = tmp_path / "out"
+    Q.cmd_get(loaded, ns(remote=["T/src"], output=str(out), recursive=True))
+    for rel in ["a.pdf", "sub/b.pdf", "sub/deep/c.pdf", "Café.pdf"]:
+        assert (out / "src" / rel).read_bytes().startswith(b"%PDF"), rel
+    assert (out / "src/sub/deep/c.pdf").read_bytes() == (Path(src) / "sub/deep/c.pdf").read_bytes()
+    with expect("use -r"):
+        Q.cmd_get(loaded, ns(remote=["T/src"], output=str(out), recursive=False))
+
+
+def test_mv_folder(loaded):
+    d = loaded
+    Q.cmd_mv(d, ns(src="T/src/sub", dst="T/x"))            # into existing folder
+    assert "Document/T/x/sub/deep/c.pdf" in d.paths()
+    Q.cmd_mv(d, ns(src="T/x/sub", dst="T/renamed"))        # rename + move
+    assert "Document/T/renamed/deep/c.pdf" in d.paths()
+    with expect("into itself"):
+        Q.cmd_mv(d, ns(src="T", dst="T/x/y"))
+    with expect("root"):
+        Q.cmd_mv(d, ns(src="/", dst="T"))
+
+
+def test_rm_r(loaded):
+    d = loaded
+    with expect("not empty"):
+        Q.cmd_rm(d, ns(remote=["T"], recursive=False))
+    with expect("root"):
+        Q.cmd_rm(d, ns(remote=["/"], recursive=True))
+    Q.cmd_rm(d, ns(remote=["T"], recursive=True))
+    assert d.paths() == ["Document"], d.paths()
+
+
+def test_put_to_a_folder_that_does_not_exist(mkpdf):
+    d = FakeDevice()
+    d.mkdirs("Books/Military History")
+    book = mkpdf("Submarine Torpedo Tactics - Edward Monroe Jones & Shawn S. Roderick.pdf", "sub")
+    good = mkpdf("good.pdf", "G")
+    before = d.paths()
+    with expect("did you mean: 'Books/Military History'"):
+        Q.cmd_put(d, ns(local=[book], remote="Military History", recursive=False))
+    with expect("no folder Document/Military History"):
+        Q.cmd_put(d, ns(local=[book, good], remote="Military History", recursive=False))
+    assert d.paths() == before                             # nothing created
+    # the full folder path works; & and . in the name are fine
+    Q.cmd_put(d, ns(local=[book], remote="Books/Military History", recursive=False))
+    assert f"Document/Books/Military History/{os.path.basename(book)}" in d.paths()
+    # a new name ending in .pdf still renames on upload
+    Q.cmd_put(d, ns(local=[good], remote="Books/renamed.pdf", recursive=False))
+    assert "Document/Books/renamed.pdf" in d.paths()
+
+
+def test_failed_upload_removes_the_half_created_document(mkpdf):
+    d = FakeDevice()
+    d.mkdirs("Books")
+    good = mkpdf("good.pdf", "G")
+    d.fail_upload = True
+    before = d.paths()
+    with expect("simulated failure"):
+        Q.cmd_put(d, ns(local=[good], remote="Books", recursive=False))
+    assert d.paths() == before, set(d.paths()) ^ set(before)

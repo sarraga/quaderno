@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 quaderno = "quaderno.cli:main"
 
@@ -15,3 +18,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["quaderno"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["error::DeprecationWarning"]

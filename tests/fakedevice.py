@@ -2,18 +2,22 @@
 
 Subclasses quaderno.Device and replaces only `request`, so every CLI command runs its
 real code paths (path resolution, pagination, chunked upload, downloads)."""
-import os
 import re
-import sys
 import time
 import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quaderno import cli as Q  # noqa: E402  (CLI commands, for the CLI-level tests)
-from quaderno.device import Device  # noqa: E402
-from quaderno.errors import NotFoundError, QuadernoError  # noqa: E402
-from quaderno.util import norm  # noqa: E402
+import pytest
+
+from quaderno import cli as Q  # noqa: F401  (CLI commands, for the CLI-level tests)
+from quaderno.device import Device
+from quaderno.errors import NotFoundError, QuadernoError
+from quaderno.util import norm
+
+
+def expect(fragment, exc=QuadernoError):
+    """pytest.raises for `exc` whose message contains `fragment` literally."""
+    return pytest.raises(exc, match=re.escape(fragment))
 
 
 class FakeDevice(Device):
