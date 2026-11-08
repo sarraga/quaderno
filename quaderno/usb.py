@@ -29,7 +29,9 @@ class UsbDevice(NamedTuple):
     serial: str | None
     tty: str | None = None     # /dev/cu.usbmodem* while in serial mode
     iface: str | None = None   # its network interface, e.g. 'en8', while in network mode
-    link: bool | None = None   # whether that interface's link is up (None: not reported)
+    link: bool | None = None   # link up, per the registry (None: not reported). Only used to
+                               # explain a failure: right after a plug-in it read 0 (not
+                               # valid) while the device answered on that interface.
 
 
 def ipv6_from_serial(serial):
@@ -213,7 +215,7 @@ def discover(serial_hint=None, on_switch=None, switch_timeout=15, answer_timeout
         cur = next((d for d in usb_devices() if d.serial == dev.serial), None)
         if cur is None:
             raise DeviceNotFoundError("the QUADERNO was disconnected")
-        if cur.iface and cur.link is not False and probe(f"{ip}%{cur.iface}"):
+        if cur.iface and probe(f"{ip}%{cur.iface}"):
             return f"{ip}%{cur.iface}"
         if time.time() > deadline:
             raise _no_answer(cur, ip)

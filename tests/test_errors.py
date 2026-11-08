@@ -105,13 +105,18 @@ def test_discover_stuck_in_serial_mode(on_bus):
 
 @pytest.mark.parametrize("bus,message", [
     (FakeBus("ethernet", iface=None), "lists no network interface"),
-    (FakeBus("ethernet", link=False), "link (en8) is down"),
+    (FakeBus("ethernet", link=False, answers=False), "link (en8) is down"),
     (FakeBus("ethernet", answers=False), "link is up, but it doesn't answer at fe80::c8d3"),
 ])
 def test_discover_says_why_the_device_does_not_answer(on_bus, bus, message):
     with pytest.raises(quaderno.DeviceUnreachableError) as e:
         on_bus(bus)
     assert message in str(e.value), str(e.value)
+
+
+def test_discover_does_not_trust_the_registry_link_status(on_bus):
+    """Seen on the device: IOLinkStatus read 0 right after a plug-in while it answered."""
+    assert on_bus(FakeBus("ethernet", link=False)) == "fe80::c8d3:84ff:fec2:323b%en8"
 
 
 def test_discover_unplugged_while_waiting(on_bus):
