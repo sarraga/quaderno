@@ -57,6 +57,7 @@ class FakeDevice(Device):
         self.fail_upload = False  # make PUT /documents/{id}/file fail, to test cleanup
         self.clock = 1_700_000_000
         self.clock_set: str | None = None
+        self._configs: dict[str, str] = {}
 
     # --- helpers for tests ---------------------------------------------------
     def _stamp(self, x: FakeEntry) -> None:
@@ -152,15 +153,48 @@ class FakeDevice(Device):
             off, lim = int(qs.get("offset", 0)), int(qs.get("limit", 100))
             lim = min(lim, 2)  # force pagination
             return {"count": len(kids), "entry_list": [dict(x) for x in kids[off:off + lim]]}
+        if method == "GET" and p == "/documents":  # search; matches on the name here
+            kw = qs.get("search_keyword", "").casefold()
+            docs = [x for x in self.e.values() if x["entry_type"] == "document"]
+            if qs.get("entry_type") == "notes":
+                docs = [x for x in docs if x.get("document_type") == "note"]
+            hits = sorted((x for x in docs if kw in str(x["entry_name"]).casefold()),
+                          key=lambda x: str(x["entry_name"]))
+            off, lim = int(qs.get("offset", 0)), int(qs.get("limit", 100))
+            lim = min(lim, 2)  # force pagination, like /folders/{id}/entries
+            return {"count": len(hits), "entry_list": [dict(x) for x in hits[off:off + lim]]}
         if method == "PUT" and p in ("/viewer/controls/open", "/viewer/controls/open2"):
             b = _obj(body)
             self.opened.append((b["document_id"], b.get("page")))
             return None
+        if method == "GET" and p == "/viewer/status/current_viewing":
+            cur = self.e.get(self.opened[-1][0]) if self.opened else None
+            if cur is None:
+                return {"views": []}
+            doc_id, page = self.opened[-1]
+            return {"orientation": "portrait", "view_mode": "single",
+                    "views": [{"entry_id": doc_id, "entry_path": cur["entry_path"],
+                               "current_page": str(page or 1), "total_page": "10",
+                               "title": str(cur["entry_name"]).removesuffix(".pdf")}]}
         if method == "PUT" and p == "/system/configs/datetime":
             self.clock_set = _obj(body)["value"]
             return None
         if method == "GET" and p == "/system/configs/timezone":
             return {"value": "UTC"}
+        _config_defaults = {"owner": "tester", "timezone": "UTC", "date_format": "yyyy/M/d",
+                            "time_format": "24hour", "timeout_to_standby": "60"}
+        if method == "GET" and p == "/system/configs":
+            return {k: {"value": self._configs.get(k, dv)} for k, dv in _config_defaults.items()}
+        m = re.fullmatch(r"/system/configs/([^/]+)", p)
+        if m and p != "/system/configs/datetime":
+            key = m.group(1)
+            if method == "PUT":
+                self._configs[key] = _obj(body)["value"]
+                return None
+            if method == "GET":
+                if key in self._configs or key in _config_defaults:
+                    return {"value": self._configs.get(key, _config_defaults.get(key, ""))}
+                raise NotFoundError("404")
         status = {"/api_version": {"value": "2.1"},
                   "/system/status/firmware_version": {"value": "fake"},
                   "/system/status/storage": {"capacity": "1000", "available": "400"},
@@ -179,6 +213,13 @@ class FakeDevice(Device):
                 raise QuadernoError("POST /documents -> HTTP 400: 40006 The value of a parameter "
                                     "is invalid format. Bad parameter : fileName(unsupported)", 400)
             return {"document_id": self._new("document", b["parent_folder_id"], b["file_name"])}
+        m = re.fullmatch(r"/documents/([^/]+)/copy", p)
+        if m and method == "POST":
+            b = _obj(body)
+            nid = self._new("document", b["parent_folder_id"], b["file_name"])
+            self.files[nid] = bytearray(self.files.get(m.group(1), bytearray()))
+            self.e[nid]["file_size"] = str(len(self.files[nid]))
+            return {"document_id": nid}
         m = re.fullmatch(r"/documents/([^/]+)/file", p)
         if m and method == "PUT":
             if self.fail_upload:

@@ -63,6 +63,10 @@ quaderno mv SRC... DST                  move/rename; several sources -> into fol
 quaderno rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
 quaderno sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
 quaderno open DOC [-p PAGE]             open a document on the device's screen
+quaderno search KEYWORD [-t TARGET]     find documents by name, text, or annotation mark
+quaderno cp SRC... DST                  copy documents on the device; several -> into folder DST
+quaderno viewing                        show which document is open on the device
+quaderno config [KEY [VALUE]]           show device settings, or change one
 quaderno time                           set the device clock from the Mac
 quaderno info [--json]                  firmware, storage, battery, MAC, owner
 quaderno screenshot [OUT.png]           PNG of the current screen
@@ -94,7 +98,7 @@ quaderno rm -r Books/Old
 
 ### Patterns
 
-`ls`, `get`, `mv`, `rm` and `open` accept patterns in remote paths, so you don't have to type long names. **Quote patterns** so your shell doesn't try to expand them against files on the Mac (zsh fails with `no matches found`).
+`ls`, `get`, `mv`, `cp`, `rm` and `open` accept patterns in remote paths, so you don't have to type long names. **Quote patterns** so your shell doesn't try to expand them against files on the Mac (zsh fails with `no matches found`).
 
 ```
 quaderno ls 'fighter*'                    # glob: * ? [abc]; letter case is ignored
@@ -155,7 +159,41 @@ The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors ex
 - **`open DOC`** shows the document on the device at the page you last read. `open DOC -p N` opens it at page N. The device reports the new page a few seconds later.
 - **`time`** sets the device clock to the Mac's current time. Run it now and then to keep the clock right. The device clock can be set but not read.
 
-  The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time.
+  The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time. (`config timezone` can set one of those zones; see below.)
+
+## search
+
+`search` asks the device to find documents, far faster than listing everything and filtering it yourself. The keyword is required.
+
+```
+quaderno search rust                      # names, titles and authors (the default)
+quaderno search rust -l                    # with size, date and pages, like ls -l
+quaderno search --docs borrow -t body      # text inside documents, excluding notebooks
+quaderno search star -t mark               # documents carrying the "star" annotation mark
+quaderno search a --sort read --desc       # most recently read first
+```
+
+- **`-t` chooses where to look:** `meta` (names, titles and authors; the default), `body` (the text inside documents), or `mark` (by annotation-mark name, such as `star` or `asterisk`).
+- **`--notes` / `--docs`** limit the results to notebooks, or to documents (everything else).
+- **`--sort`** orders by `name`, `title`, `author`, `date`, `read` (last read), `size` or `created`; add `--desc` to reverse it.
+- **`--mark`** (only with `-t mark`) narrows to `hand` (handwriting) or `highlight`; the default is both.
+- Results are printed as full paths, like `ls -R`. When nothing matches, nothing is printed and a short note goes to stderr.
+
+## cp, viewing and config
+
+```
+quaderno cp Books/a.pdf Note              # copy into a folder (keeping the name)
+quaderno cp Books/a.pdf Books/a-copy.pdf   # copy to a new name
+quaderno cp 'Books/*.pdf' Archive          # patterns; several sources -> DST must be a folder
+quaderno viewing                           # what's open on the screen right now
+quaderno config                            # list every device setting
+quaderno config timeout_to_standby         # read one setting
+quaderno config owner "Santiago"           # change one setting
+```
+
+- **`cp` copies on the device itself**, with no download and re-upload, so it's quick even for large files. Only documents can be copied, not folders. Like `mv`, several sources need an existing folder as the destination, while a single source may instead name a new file; name clashes are checked before anything is copied.
+- **`viewing`** prints the open document's path and page, for example `Document/Books/x.pdf  page 59 of 736`, or `nothing is open on the device`. It pairs with `open`.
+- **`config`** with no arguments lists every setting; with a name it prints that one; with a name and a value it changes it. Settable: `owner`, `timezone`, `date_format`, `time_format`, `timeout_to_standby`. Values are device-specific — in particular `timezone` accepts only the zones the device itself offers (see `time` above), and the device rejects anything else.
 
 ## Python API
 
@@ -171,10 +209,15 @@ with quaderno.connect() as dev:                  # find it on USB, log in (close
     res = dev.put(["a.pdf", "b.pdf"], "Books")         # PutResult(uploaded=, skipped=, missing=, ...)
     dev.upload("c.pdf", "Books")                       # one file; raises if the name exists
     dev.move("Fighter*", "Books")                      # -> [(old_path, new_path), ...]
+    dev.copy("Books/x.pdf", "Archive")                 # server-side copy -> [(old, new), ...]
     dev.rm("Received/*", confirm=lambda entries: True) # confirm is asked only when a pattern matched
     dev.sync("~/QUADERNO", "Note")                     # -> counts per action
+    for e in dev.search("rust", target="meta"):        # -> [Entry, ...]; target meta/body/mark
+        print(e.relpath)
     dev.open("Books/x.pdf", page=5)
+    print(dev.current_viewing()["views"])              # what's on the screen now
     dev.set_time()
+    dev.set_config("owner", "Santiago")                # dev.configs() / dev.get_config(key)
     print(dev.info()["storage"])
 ```
 

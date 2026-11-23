@@ -11,7 +11,7 @@ from collections.abc import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import credentials, pairing, usb
-from .device import Device, connect
+from .device import SETTABLE_CONFIGS, Device, connect
 from .entry import Entry
 from .errors import AuthError, ConnectError, PairingError, QuadernoError
 from .events import Event
@@ -25,27 +25,35 @@ class Args(argparse.Namespace):
     addr: str | None
     config_dir: str | None
     verbose: bool
-    regex: bool           # ls, get, mv, rm, open
+    regex: bool           # ls, get, mv, cp, rm, open
     recursive: bool       # ls, get, put, rm
     path: str             # ls
-    long: bool            # ls
+    long: bool            # ls, search
     remote: list[str]     # get, rm, mkdir: device paths
     output: str | None    # get -o; screenshot
     local: list[str]      # put: local files and directories
     dest: str | None      # put -d
     yes: bool             # rm
     parents: bool         # mkdir
-    src: list[str]        # mv
-    dst: str              # mv
+    src: list[str]        # mv, cp
+    dst: str              # mv, cp
     json: bool            # info
     directory: str        # sync: local directory
     folder: str           # sync: device folder
     delete: bool          # sync
     dry_run: bool         # sync
     force: bool           # sync, pair
-    target: str           # open
+    target: str           # open: document; search: -t (meta/body/mark)
     page: int | None      # open
     pin_file: str | None  # pair
+    keyword: str          # search
+    notes: bool           # search
+    docs: bool            # search
+    sort: str | None      # search
+    desc: bool            # search
+    mark: str             # search
+    key: str | None       # config
+    value: str | None     # config
 
 
 Command = Callable[[Device, Args], "int | None"]
@@ -70,18 +78,69 @@ def open_device(args: Args) -> Device:
 
 # --- commands (each takes a Device and the parsed args) ---------------------------
 
+def _row(e: Entry, long: bool, full_path: bool) -> str:
+    """One listing line: the name or full path, and with -l size, date and pages."""
+    name = (e.path if full_path else e.name) + ("/" if e.is_folder else "")
+    if not long:
+        return name
+    size = human(e.size) if e.size is not None else "-"
+    date = (e.modified or e.created or "")[:16].replace("T", " ")
+    pages = e.pages if e.pages is not None else ""
+    return f"{size:>8}  {date:16}  {str(pages):>4}  {name}"
+
+
 def cmd_ls(dev: Device, args: Args) -> None:
     rows, by_pattern = dev.ls(args.path, recursive=args.recursive, regex=args.regex)
     full_path = args.recursive or by_pattern
     for e in rows:
-        name = (e.path if full_path else e.name) + ("/" if e.is_folder else "")
-        if args.long:
-            size = human(e.size) if e.size is not None else "-"
-            date = (e.modified or e.created or "")[:16].replace("T", " ")
-            pages = e.pages if e.pages is not None else ""
-            print(f"{size:>8}  {date:16}  {str(pages):>4}  {name}")
-        else:
-            print(name)
+        print(_row(e, args.long, full_path))
+
+
+_SORT_FIELDS = {"name": "entry_name", "title": "title", "author": "author",
+                "date": "modified_date", "read": "reading_date", "size": "file_size",
+                "created": "created_date"}
+
+
+def cmd_search(dev: Device, args: Args) -> None:
+    order = f"{_SORT_FIELDS[args.sort]}_{'desc' if args.desc else 'asc'}" if args.sort else None
+    entry_type = "notes" if args.notes else "docs" if args.docs else "all"
+    rows = dev.search(args.keyword, target=args.target, entry_type=entry_type,
+                      mark=args.mark, order=order)
+    for e in rows:
+        print(_row(e, args.long, full_path=True))
+    if not rows:
+        print(f"no matches for {args.keyword!r}", file=sys.stderr)
+
+
+def cmd_cp(dev: Device, args: Args) -> None:
+    dev.copy(args.src, args.dst, regex=args.regex, on_event=show)
+
+
+def cmd_viewing(dev: Device, args: Args) -> None:
+    views = dev.current_viewing().get("views")
+    if not isinstance(views, list) or not views:
+        print("nothing is open on the device")
+        return
+    for v in views:
+        path = str(v.get("entry_path", "?")).rstrip("/")
+        page = ""
+        if v.get("current_page"):
+            page = f"  page {v['current_page']}"
+            if v.get("total_page"):
+                page += f" of {v['total_page']}"
+        title = v.get("title")
+        print(path + page + (f"  ({title})" if title else ""))
+
+
+def cmd_config(dev: Device, args: Args) -> None:
+    if args.key is None:
+        for k, val in sorted(dev.configs().items()):
+            print(f"{k:22} {val}")
+    elif args.value is None:
+        print(dev.get_config(args.key))
+    else:
+        dev.set_config(args.key, args.value)
+        print(f"{args.key} = {dev.get_config(args.key)}")
 
 
 def cmd_get(dev: Device, args: Args) -> None:
@@ -337,6 +396,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("open", cmd_open, "open a document on the device's screen", patterns=True)
     p.add_argument("target", metavar="remote")
     p.add_argument("-p", "--page", type=int, help="page number")
+
+    p = add("search", cmd_search, "find documents by name, text, or annotation mark")
+    p.add_argument("keyword")
+    p.add_argument("-t", "--target", choices=["meta", "body", "mark"], default="meta",
+                   help="names/titles/authors (meta, default), document text (body), "
+                        "or annotation-mark name (mark)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--notes", action="store_true", help="only notebooks")
+    g.add_argument("--docs", action="store_true", help="only documents (exclude notebooks)")
+    p.add_argument("--sort", choices=list(_SORT_FIELDS),
+                   help="order by name, title, author, date, read, size or created")
+    p.add_argument("--desc", action="store_true", help="descending order (with --sort)")
+    p.add_argument("--mark", choices=["all", "hand", "highlight"], default="all",
+                   help="annotation kind for -t mark (default: all)")
+    p.add_argument("-l", "--long", action="store_true", help="size, date, pages")
+
+    p = add("cp", cmd_cp, "copy documents on the device (into a folder, or to a new name)",
+            patterns=True)
+    p.add_argument("src", nargs="+")
+    p.add_argument("dst")
+
+    add("viewing", cmd_viewing, "show which document is open on the device")
+
+    p = add("config", cmd_config, "show device settings, or change one")
+    p.add_argument("key", nargs="?", help="setting name; omit to list all settings")
+    p.add_argument("value", nargs="?",
+                   help="new value (settable: " + ", ".join(SETTABLE_CONFIGS) + ")")
 
     add("time", cmd_time, "set the device clock from the Mac")
     add("addr", None, "print the device address (switches USB mode if needed)")

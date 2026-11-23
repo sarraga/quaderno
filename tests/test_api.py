@@ -3,7 +3,7 @@ import datetime
 from pathlib import Path
 
 import pytest
-from fakedevice import FakeDevice, MakePdf
+from fakedevice import FakeDevice, MakePdf, expect
 
 import quaderno
 from quaderno import (Entry, Event, ExistsError, NotEmptyError, NotFoundError, PutResult,
@@ -130,3 +130,47 @@ def test_device_controls(d: FakeDevice) -> None:
     assert d.timezone() == "UTC"
     info = d.info()
     assert info["firmware_version"] == {"value": "fake"} and "error" in info["battery"]
+
+
+def test_search(d: FakeDevice) -> None:
+    d.put_doc("Books/Rust in Action.pdf", b"R")
+    d.put_doc("Note/rusty notes.pdf", b"N")
+    hits = d.search("rust")                                    # case-insensitive, across folders
+    assert all(isinstance(e, Entry) for e in hits)
+    assert sorted(e.relpath for e in hits) == ["Books/Rust in Action.pdf", "Note/rusty notes.pdf"]
+    assert d.search("nothing-here") == []
+    for i in range(3):
+        d.put_doc(f"Books/match{i}.pdf", b"x")                 # 3 hits > page size: paginated
+    assert [e.name for e in d.search("match")] == ["match0.pdf", "match1.pdf", "match2.pdf"]
+    assert [e.name for e in d.search("match", limit=2)] == ["match0.pdf", "match1.pdf"]
+
+
+def test_copy(d: FakeDevice) -> None:
+    events: list[Event] = []
+    copied = d.copy("Books/a.pdf", "Note", on_event=events.append)          # into a folder
+    assert copied == [("Document/Books/a.pdf", "Document/Note/a.pdf")]
+    assert d.resolve("Note/a.pdf").size == d.resolve("Books/a.pdf").size and d.downloads == 0
+    assert events[-1].kind == "copied"
+    assert d.copy("Books/a.pdf", "Books/a-copy.pdf")[0][1] == "Document/Books/a-copy.pdf"  # rename
+    with expect("already exists", ExistsError):
+        d.copy("Books/a.pdf", "Note")                                       # Note/a.pdf exists now
+    with expect("only documents"):
+        d.copy("Books", "Note")                                             # folders can't be copied
+    with expect("must be an existing folder"):
+        d.copy(["Books/a.pdf", "Note/n.pdf"], "Note/new")                   # 2 sources, missing dst
+
+
+def test_viewing(d: FakeDevice) -> None:
+    assert d.current_viewing()["views"] == []                  # nothing open yet
+    e = d.open("Books/a.pdf", page=4)
+    view = d.current_viewing()["views"][0]
+    assert view["entry_path"] == e.path and view["current_page"] == "4"
+
+
+def test_config(d: FakeDevice) -> None:
+    cfg = d.configs()
+    assert cfg["timezone"] == "UTC" and cfg["timeout_to_standby"] == "60"
+    d.set_config("timeout_to_standby", "300")
+    assert d.get_config("timeout_to_standby") == "300" and d.configs()["timeout_to_standby"] == "300"
+    with expect("can't be set"):
+        d.set_config("firmware_version", "9")

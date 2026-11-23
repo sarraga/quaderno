@@ -23,7 +23,7 @@ import logging
 import os
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from . import credentials, usb
 from .client import Client
@@ -31,13 +31,20 @@ from .credentials import Credentials
 from .entry import Entry
 from .errors import ExistsError, NotEmptyError, NotFoundError, ProtocolError, QuadernoError
 from .events import EventHandler, emit
-from .util import (ROOT, JsonObject, device_time, human, is_pattern, json_int, matcher, nfc,
-                   norm, safe_local_name)
+from .util import (ROOT, JsonObject, device_time, human, is_pattern, json_int, json_str, matcher,
+                   nfc, norm, safe_local_name)
 
 log = logging.getLogger("quaderno")
 
 PathOrEntry = str | Entry
 Patterns = str | Sequence[str]  # one path/pattern, or several
+
+# search(): friendly names for the device's query values
+SEARCH_TARGETS = {"meta": "document_meta", "body": "document_body", "mark": "annotation_pattern"}
+SEARCH_ENTRY_TYPES = {"all": "all", "docs": "documents", "notes": "notes"}
+ANNOTATION_TYPES = {"all": "all", "hand": "handwritings", "highlight": "highlights"}
+# config settings safe to change through set_config() (the rest are read-only here)
+SETTABLE_CONFIGS = ("owner", "timezone", "date_format", "time_format", "timeout_to_standby")
 
 
 @dataclass
@@ -99,18 +106,41 @@ class Device(Client):
             raise QuadernoError(f"{f.path} is not a folder")
         return f
 
-    def _children(self, folder_id: str) -> list[Entry]:
+    def _paged(self, base: str, limit: int | None = None) -> list[Entry]:
+        """Collect entries from a {count, entry_list} endpoint, following offset
+        pagination. `base` carries its own query string, if any; `limit` caps how
+        many are fetched in all."""
         out: list[Entry] = []
         while True:
-            path = f"/folders/{folder_id}/entries?offset={len(out)}&limit=100"
-            r = self.request_json("GET", path)
+            sep = "&" if "?" in base else "?"
+            page = f"{base}{sep}offset={len(out)}&limit=100"
+            r = self.request_json("GET", page)
             batch = r.get("entry_list", [])
             if not isinstance(batch, list) or not all(isinstance(d, dict) for d in batch):
-                raise ProtocolError(f"GET {path}: entry_list isn't a list of entries")
+                raise ProtocolError(f"GET {page}: entry_list isn't a list of entries")
             out += [Entry.from_api(d) for d in batch]
             count = json_int(r, "count") if "count" in r else len(out)
-            if len(out) >= count or not batch:
-                return out
+            if not batch or len(out) >= count or (limit is not None and len(out) >= limit):
+                return out[:limit] if limit is not None else out
+
+    def _children(self, folder_id: str) -> list[Entry]:
+        return self._paged(f"/folders/{folder_id}/entries")
+
+    def search(self, keyword: str, target: str = "meta", entry_type: str = "all",
+               mark: str = "all", order: str | None = None,
+               limit: int | None = None) -> list[Entry]:
+        """Search documents on the device. `target`: 'meta' (names, titles and
+        authors), 'body' (text inside documents) or 'mark' (by annotation-mark
+        name, e.g. 'star'). `entry_type` may narrow to 'docs' or 'notes'; `mark`
+        ('all'/'hand'/'highlight') applies to a mark search; `order` is a device
+        order_type such as 'reading_date_desc'. Returns the matching Entries."""
+        q = {"entry_type": SEARCH_ENTRY_TYPES[entry_type],
+             "search_target": SEARCH_TARGETS[target], "search_keyword": keyword}
+        if target == "mark":
+            q["annotation_type"] = ANNOTATION_TYPES[mark]
+        if order:
+            q["order_type"] = order
+        return self._paged("/documents?" + urlencode(q), limit=limit)
 
     def entries(self, folder: PathOrEntry = ROOT) -> list[Entry]:
         """Direct children of a folder (path or Entry)."""
@@ -450,6 +480,52 @@ class Device(Client):
             moved.append((e.path, new_path))
         return moved
 
+    def copy(self, patterns: Patterns, dst: str, regex: bool = False,
+             on_event: EventHandler | None = None) -> list[tuple[str, str]]:
+        """Copy documents on the device itself (no download/upload). Folders can't
+        be copied. Several sources need an existing folder as `dst`; a single source
+        may instead name a new file. Name clashes are checked before anything is
+        copied. Returns [(source_path, new_path), ...]."""
+        sources, _ = self.find_all(patterns, regex)
+        dst = norm(dst)
+        d = self.try_resolve(dst)
+        if d is not None and not d.is_folder:
+            raise ExistsError(f"{dst} already exists")
+        folders = [e.path for e in sources if e.is_folder]
+        if folders:
+            raise QuadernoError(f"cannot copy the folder {folders[0]} (only documents can be copied)")
+        if len(sources) > 1 and d is None:
+            raise QuadernoError(f"{len(sources)} items to copy: {dst} must be an existing folder")
+        taken = {nfc(c.name) for c in self._children(d.id)} if d is not None else set()
+        plan: list[tuple[Entry, str, str, str]] = []
+        claimed: dict[str, str] = {}
+        for e in sources:
+            if d is not None:
+                parent_id, parent_path, name = d.id, d.path, e.name
+            else:  # copy to `dst`, which doesn't exist: a new name
+                parent_path, name = dst.rsplit("/", 1)
+                parent_id = self.resolve(parent_path).id
+            target = f"{parent_path}/{name}"
+            if nfc(name) in taken:
+                raise ExistsError(f"cannot copy {e.path}: {target} already exists")
+            if nfc(target) in claimed:
+                raise ExistsError(f"cannot copy both {claimed[nfc(target)]} and {e.path} to {target}")
+            claimed[nfc(target)] = e.path
+            plan.append((e, parent_id, parent_path, name))
+        copied = []
+        for e, parent_id, parent_path, name in plan:
+            r = self.request("POST", f"/documents/{e.id}/copy",
+                             {"parent_folder_id": parent_id, "file_name": name}, ok=(200, 201))
+            new_id = (r or {}).get("document_id")
+            new_path = f"{parent_path}/{name}"
+            if isinstance(new_id, str):  # confirm the real path (the device may adjust the name)
+                got = (self.request("GET", f"/documents/{new_id}") or {}).get("entry_path")
+                if isinstance(got, str):
+                    new_path = got.rstrip("/")
+            emit(on_event, "copied", f"{e.path} -> {new_path}", new_path)
+            copied.append((e.path, new_path))
+        return copied
+
     def rm(self, patterns: Patterns, recursive: bool = False, regex: bool = False,
            confirm: Callable[[list[Entry]], bool] | None = None,
            on_event: EventHandler | None = None) -> list[Entry]:
@@ -529,6 +605,28 @@ class Device(Client):
     def timezone(self) -> str | None:
         value = (self.request("GET", "/system/configs/timezone") or {}).get("value")
         return value if isinstance(value, str) else None
+
+    def current_viewing(self) -> JsonObject:
+        """What the device is showing now (GET /viewer/status/current_viewing):
+        a 'views' list, each with entry_path, current_page, total_page and title."""
+        return self.request_json("GET", "/viewer/status/current_viewing")
+
+    def configs(self) -> dict[str, str]:
+        """All device settings as a flat {name: value} map (GET /system/configs)."""
+        r = self.request_json("GET", "/system/configs")
+        return {k: v["value"] for k, v in r.items()
+                if isinstance(v, dict) and isinstance(v.get("value"), str)}
+
+    def get_config(self, key: str) -> str:
+        """One setting's value (GET /system/configs/<key>)."""
+        return json_str(self.request_json("GET", "/system/configs/" + quote(key)), "value")
+
+    def set_config(self, key: str, value: str) -> None:
+        """Change a device setting (PUT /system/configs/<key>). Only a known-safe
+        set of keys may be changed; see SETTABLE_CONFIGS."""
+        if key not in SETTABLE_CONFIGS:
+            raise QuadernoError(f"{key!r} can't be set; settable: {', '.join(SETTABLE_CONFIGS)}")
+        self.request("PUT", "/system/configs/" + quote(key), {"value": value})
 
     def info(self) -> dict[str, JsonObject]:
         """Firmware, storage, battery, owner, MAC: the device's raw answers

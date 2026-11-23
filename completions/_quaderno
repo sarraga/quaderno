@@ -50,6 +50,10 @@ _quaderno() {
     'rm:delete documents or folders'
     'sync:mirror a device folder to the Mac'
     'open:open a document on the device screen'
+    'search:find documents by name, text, or mark'
+    'cp:copy documents on the device'
+    'viewing:show which document is open'
+    'config:show or change device settings'
     'time:set the device clock from the Mac'
     'info:firmware, storage, battery'
     'screenshot:save the device screen as PNG'
@@ -110,6 +114,23 @@ _quaderno() {
           _arguments $regex \
             '(-p --page)'{-p,--page}'[page number]:page' \
             '1:device document:_quaderno_remote' && ret=0 ;;
+        search)
+          _arguments \
+            '(-t --target)'{-t,--target}'[where to search]:target:(meta body mark)' \
+            '(--notes --docs)--notes[only notebooks]' \
+            '(--notes --docs)--docs[only documents]' \
+            '--sort[order results]:field:(name title author date read size created)' \
+            '--desc[descending order]' \
+            '--mark[annotation kind for -t mark]:kind:(all hand highlight)' \
+            '(-l --long)'{-l,--long}'[size, date, pages]' \
+            '1:keyword' && ret=0 ;;
+        cp)
+          _arguments $regex '*:device path:_quaderno_remote' && ret=0 ;;
+        viewing) ret=0 ;;
+        config)
+          _arguments \
+            '1::setting:(owner timezone date_format time_format timeout_to_standby)' \
+            '2::value' && ret=0 ;;
         info)
           _arguments '--json[JSON output]' && ret=0 ;;
         screenshot)

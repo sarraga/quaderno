@@ -158,3 +158,42 @@ def test_failed_upload_removes_the_half_created_document(mkpdf: MakePdf) -> None
     with expect("simulated failure"):
         Q.cmd_put(d, ns(local=[good], dest="Books", recursive=False))
     assert d.paths() == before, set(d.paths()) ^ set(before)
+
+
+def _search_ns(keyword: str, **kw: Any) -> Q.Args:
+    kw = {"target": "meta", "notes": False, "docs": False, "sort": None, "desc": False,
+          "mark": "all", "long": False, **kw}
+    return ns(keyword=keyword, **kw)
+
+
+def test_search_cli(fake: FakeDevice, capsys: pytest.CaptureFixture[str]) -> None:
+    fake.put_doc("Books/Rust.pdf", b"R")
+    fake.put_doc("Note/misc.pdf", b"M")
+    Q.cmd_search(fake, _search_ns("rust"))
+    assert capsys.readouterr().out == "Document/Books/Rust.pdf\n"
+    Q.cmd_search(fake, _search_ns("zzz"))
+    assert "no matches for 'zzz'" in capsys.readouterr().err
+
+
+def test_cp_cli(loaded: FakeDevice) -> None:
+    Q.cmd_cp(loaded, ns(src="T/src/a.pdf", dst="T/x"))
+    assert "Document/T/x/a.pdf" in loaded.paths()
+
+
+def test_viewing_cli(fake: FakeDevice, capsys: pytest.CaptureFixture[str]) -> None:
+    fake.put_doc("Books/a.pdf", b"A")
+    Q.cmd_viewing(fake, ns())
+    assert "nothing is open" in capsys.readouterr().out
+    Q.cmd_open(fake, ns(target="Books/a.pdf", page=2))
+    capsys.readouterr()
+    Q.cmd_viewing(fake, ns())
+    out = capsys.readouterr().out
+    assert "Document/Books/a.pdf" in out and "page 2 of 10" in out
+
+
+def test_config_cli(fake: FakeDevice, capsys: pytest.CaptureFixture[str]) -> None:
+    Q.cmd_config(fake, ns(key=None, value=None))
+    assert "timezone" in capsys.readouterr().out
+    Q.cmd_config(fake, ns(key="timeout_to_standby", value="120"))
+    assert fake.get_config("timeout_to_standby") == "120"
+    assert capsys.readouterr().out == "timeout_to_standby = 120\n"
