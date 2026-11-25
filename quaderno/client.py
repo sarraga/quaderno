@@ -7,15 +7,16 @@ import logging
 import os
 import ssl
 import uuid
-from collections.abc import Collection
-from typing import BinaryIO, Self
-from urllib.parse import quote
+from collections.abc import Collection, Mapping
+from typing import Any, BinaryIO, Self, cast
+from urllib.parse import quote, urlencode
 
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from . import crypto
-from .errors import (AuthError, CertificateError, DeviceUnreachableError, LoginError,
-                     NotFoundError, ProtocolError, QuadernoError, RequestError)
+from .errors import (AuthError, CertificateError, DeviceUnreachableError, LockedError, LoginError,
+                     NotFoundError, ProtocolError, QuadernoError, RequestError, StorageFullError)
+from .models import FileUploadResult
 from .util import HTTPS_PORT, JsonObject, json_int, json_str
 
 log = logging.getLogger("quaderno")
@@ -24,7 +25,7 @@ _STALE: tuple[type[BaseException], ...] = (
     http.client.RemoteDisconnected, http.client.CannotSendRequest,
     http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError)
 
-Body = JsonObject | bytes | None  # a JSON object is sent as JSON, bytes as they are
+Body = Mapping[str, Any] | bytes | None  # any JSON mapping/TypedDict is sent as JSON; bytes raw
 
 
 def _unreachable(err: BaseException) -> DeviceUnreachableError:
@@ -114,7 +115,8 @@ class Client:
 
     def _request(self, method: str, path: str, body: Body = None,
                  headers: dict[str, str] | None = None, ok: Collection[int] = (200, 204),
-                 stream_to: BinaryIO | None = None) -> JsonObject | int | None:
+                 stream_to: BinaryIO | None = None,
+                 _reauth: bool = True) -> JsonObject | int | None:
         """One Web API call. A JSON object body is encoded; the answer is decoded
         (None if empty), or with `stream_to`, written there and its size returned.
         The typed entry points are request, request_json and request_stream."""
@@ -122,7 +124,7 @@ class Client:
         if self.cookies:
             hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
         data: bytes | None
-        if isinstance(body, dict):
+        if isinstance(body, Mapping):
             data = json.dumps(body).encode()
             hdrs["Content-Type"] = "application/json"
         else:
@@ -130,13 +132,19 @@ class Client:
         hdrs.update(headers or {})
         resp = self._send(method, path, data, hdrs)
         result: JsonObject | int | None
+        reauth_needed = False
         try:
             for h in resp.headers.get_all("Set-Cookie") or []:
                 name, _, rest = h.partition("=")
                 self.cookies[name.strip()] = rest.split(";", 1)[0]
             if resp.status not in ok:
-                raise self._http_error(method, path, resp.status, resp.read())
-            if stream_to is not None:
+                err_data = resp.read()
+                if (resp.status == 401 and _reauth and self.key is not None
+                        and self.cookies and not path.startswith("/auth")):
+                    reauth_needed = True
+                else:
+                    raise self._http_error(method, path, resp.status, err_data)
+            elif stream_to is not None:
                 total = 0
                 while chunk := resp.read(1 << 20):
                     stream_to.write(chunk)
@@ -157,6 +165,9 @@ class Client:
             raise
         if resp.will_close:
             self.close()
+        if reauth_needed:
+            self.authenticate()
+            return self._request(method, path, body, headers, ok, stream_to, _reauth=False)
         return result
 
     def request(self, method: str, path: str, body: Body = None,
@@ -178,9 +189,17 @@ class Client:
         return result
 
     def request_stream(self, method: str, path: str, fh: BinaryIO,
-                       headers: dict[str, str] | None = None) -> int:
-        """Write the answer's body to `fh`; returns its size in bytes."""
-        result = self._request(method, path, None, headers, (200, 204), fh)
+                       headers: dict[str, str] | None = None,
+                       byte_range: tuple[int, int | None] | None = None) -> int:
+        """Write the answer's body to `fh`; returns its size in bytes.
+        Optional `byte_range=(start, end)` sends an HTTP Range header."""
+        hdrs = dict(headers or {})
+        ok: tuple[int, ...] = (200, 204)
+        if byte_range is not None:
+            start, end = byte_range
+            hdrs["Range"] = f"bytes={start}-{'' if end is None else end}"
+            ok = (200, 204, 206)
+        result = self._request(method, path, None, hdrs, ok, fh)
         if not isinstance(result, int):
             raise ProtocolError(f"{method} {path}: unexpected answer")
         return result
@@ -202,6 +221,10 @@ class Client:
         text = f"{method} {path} -> HTTP {status}: {msg}"
         if status == 404:
             return NotFoundError(text, status, code)
+        if status == 423:
+            return LockedError(text, status, code)
+        if status == 507:
+            return StorageFullError(text, status, code)
         return RequestError(text, status, code)
 
     @staticmethod
@@ -233,31 +256,56 @@ class Client:
                                  err.status) from err
             raise
 
-    # --- raw document transfer ---------------------------------------------------
-    def download_to(self, doc_id: str, fh: BinaryIO) -> int:
-        return self.request_stream("GET", f"/documents/{doc_id}/file", fh,
-                                   headers={"Accept": "*/*"})
+    # --- raw document & binary transfer ----------------------------------------
+    def download_to(self, doc_id: str, fh: BinaryIO,
+                    byte_range: tuple[int, int | None] | None = None) -> int:
+        return self.request_stream("GET", f"/documents/{quote(doc_id, safe='')}/file", fh,
+                                   headers={"Accept": "*/*"}, byte_range=byte_range)
 
-    def upload_file(self, local: str, folder_id: str, name: str) -> str:
+    def download_annotation_to(self, doc_id: str, page: int, fh: BinaryIO,
+                               byte_range: tuple[int, int | None] | None = None) -> int:
+        return self.request_stream(
+            "GET", f"/documents/{quote(doc_id, safe='')}/annotations/{int(page)}", fh,
+            headers={"Accept": "*/*"}, byte_range=byte_range)
+
+    def download_pastlog_to(self, fh: BinaryIO,
+                            byte_range: tuple[int, int | None] | None = None) -> int:
+        return self.request_stream("GET", "/system/controls/pastlog", fh,
+                                   headers={"Accept": "*/*"}, byte_range=byte_range)
+
+    def upload_file(self, local: str, folder_id: str, name: str,
+                    ext_id: str | None = None) -> str:
         """Create a document `name` in folder `folder_id` with the contents of
-        `local`; returns its id. A failed transfer deletes the half-made entry."""
-        doc_id = json_str(self.request_json("POST", "/documents", {
-            "parent_folder_id": folder_id, "file_name": name, "document_source": ""}),
-            "document_id")
+        `local`; returns its id. Uses /documents2 when `ext_id` is given.
+        A failed transfer deletes the half-made entry."""
+        if ext_id is not None:
+            doc_id = json_str(self.request_json("POST", "/documents2", {
+                "parent_folder_id": folder_id, "file_name": name, "ext_id": ext_id}),
+                "document_id")
+        else:
+            doc_id = json_str(self.request_json("POST", "/documents", {
+                "parent_folder_id": folder_id, "file_name": name, "document_source": ""}),
+                "document_id")
         try:
             self._send_file(local, doc_id)
             return doc_id
         except BaseException:
             try:
-                self.request("DELETE", f"/documents/{doc_id}")
+                self.request("DELETE", f"/documents/{quote(doc_id, safe='')}")
             except (QuadernoError, OSError):
                 log.warning("warning: could not remove the incomplete upload %s", name)
             raise
 
-    def _send_file(self, local: str, doc_id: str) -> None:
-        # The multipart filename is ignored: the document's name was set by the
-        # POST in upload_file. A fixed ASCII value keeps arbitrary file names
-        # (quotes, non-ASCII) out of a header the device has to parse.
+    def replace_file(self, doc_id: str, local: str, *, target_revision: str | None = None,
+                     file_hash: str | None = None) -> FileUploadResult:
+        """Upload new PDF bytes into an existing document entry in place.
+        Optional `target_revision` guards against concurrent edits (40017)."""
+        return self._send_file(local, doc_id, target_revision=target_revision, file_hash=file_hash)
+
+    def _send_chunked_multipart(self, path: str, local: str, *, filename: str = "altair.pdf",
+                                extra_params: dict[str, str] | None = None) -> FileUploadResult:
+        """Send `local` in CHUNK-sized multipart/form-data PUT requests with
+        offset_bytes/total_bytes until the device reports completed='yes'."""
         size = os.path.getsize(local)
         with open(local, "rb") as fh:
             offset = 0
@@ -265,23 +313,67 @@ class Client:
                 chunk = fh.read(CHUNK)
                 boundary = uuid.uuid4().hex
                 body = (f"--{boundary}\r\n"
-                        f'Content-Disposition: form-data; name="file"; filename="altair.pdf"\r\n'
+                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
                         f"Content-Type: application/octet-stream\r\n\r\n").encode() + chunk + \
                     f"\r\n--{boundary}--\r\n".encode()
+                params: dict[str, str] = {"offset_bytes": str(offset), "total_bytes": str(size)}
+                if extra_params:
+                    params.update(extra_params)
                 r = self.request_json(
-                    "PUT", f"/documents/{doc_id}/file?offset_bytes={offset}&total_bytes={size}",
-                    body, {"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                    ok=(200, 206))
+                    "PUT", f"{path}?{urlencode(params)}", body,
+                    {"Content-Type": f"multipart/form-data; boundary={boundary}"}, ok=(200, 206))
                 offset = json_int(r, "current_bytes")
                 if offset >= size:
                     if r.get("completed") != "yes":
                         raise RequestError("upload finished but device did not mark it complete")
-                    return
+                    return cast(FileUploadResult, r)
                 if not chunk:
                     raise RequestError("upload stalled")
                 fh.seek(offset)
 
-    def create_folder(self, parent_id: str, name: str) -> str:
+    def _send_file(self, local: str, doc_id: str, *, target_revision: str | None = None,
+                   file_hash: str | None = None) -> FileUploadResult:
+        # The multipart filename is ignored: the document's name was set by the
+        # POST in upload_file. A fixed ASCII value keeps arbitrary file names
+        # (quotes, non-ASCII) out of a header the device has to parse.
+        extra: dict[str, str] = {}
+        if target_revision is not None:
+            extra["target_revision"] = target_revision
+        if file_hash is not None:
+            extra["file_hash"] = file_hash
+        return self._send_chunked_multipart(
+            f"/documents/{quote(doc_id, safe='')}/file", local, extra_params=extra or None)
+
+    def upload_note_template_file(self, template_id: str, local: str) -> FileUploadResult:
+        """Upload PDF contents for a created note template."""
+        return self._send_chunked_multipart(
+            f"/viewer/configs/note_templates/{quote(template_id, safe='')}/file", local)
+
+    def upload_firmware_file(self, local: str) -> FileUploadResult:
+        """Upload a firmware update package (FwUpdater.pkg) in chunks."""
+        return self._send_chunked_multipart(
+            "/system/controls/update_firmware/file", local, filename="FwUpdater.pkg")
+
+    def upload_custom_app(self, local: str, application_id: str, signature: str,
+                          encrypted_key_crypto: str, iv: str) -> None:
+        """Install a signed & encrypted custom app package (POST /custom_apps/install)."""
+        with open(local, "rb") as fh:
+            data = fh.read()
+        boundary = uuid.uuid4().hex
+        body = (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="app.pkg"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + \
+            f"\r\n--{boundary}--\r\n".encode()
+        qs = urlencode({"application_id": application_id, "signature": signature,
+                        "encrypted_key_crypto": encrypted_key_crypto, "iv": iv})
+        self.request("POST", f"/custom_apps/install?{qs}", body,
+                     {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def create_folder(self, parent_id: str, name: str, ext_id: str | None = None) -> str:
+        if ext_id is not None:
+            return json_str(self.request_json("POST", "/folders2", {
+                "parent_folder_id": parent_id, "folder_name": name, "ext_id": ext_id}),
+                "folder_id")
         return json_str(self.request_json("POST", "/folders", {"parent_folder_id": parent_id,
                                                                "folder_name": name}),
                         "folder_id")

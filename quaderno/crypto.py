@@ -4,9 +4,9 @@ Diffie-Hellman exchange with pow() (see dh_exchange).
 
 Only the encodings the device expects are done here: an SPKI public key under an
 'RSA PUBLIC KEY' PEM label, the 0x00-prefixed DH public value, and the HMAC-tagged
-AES-CBC "wrap" used inside pairing messages. The first two copy the official
-QUADERNO app byte for byte; whether the device also accepts the standard forms (a
-'PUBLIC KEY' label, an unprefixed value) has not been tested."""
+AES-CBC "wrap" used inside pairing messages. The device's AuthDatabaseHelper strips
+any '-----BEGIN ...-----'/'-----END ...-----' PEM header before base64-decoding as
+X.509 SPKI DER, so 'PUBLIC KEY' is also accepted."""
 
 import base64
 import hashlib

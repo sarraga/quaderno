@@ -197,3 +197,66 @@ def test_config_cli(fake: FakeDevice, capsys: pytest.CaptureFixture[str]) -> Non
     Q.cmd_config(fake, ns(key="timeout_to_standby", value="120"))
     assert fake.get_config("timeout_to_standby") == "120"
     assert capsys.readouterr().out == "timeout_to_standby = 120\n"
+
+
+def test_new_cli_commands(fake: FakeDevice, mkpdf: MakePdf, tmp_path: Path,
+                          capsys: pytest.CaptureFixture[str]) -> None:
+    fake.put_doc("Books/a.pdf", b"A")
+    fake.annotations[(fake.resolve("Books/a.pdf").id, 1)] = b"\xaa\xbb"
+    Q.cmd_ping(fake, ns())
+    assert capsys.readouterr().out.strip() == "ok"
+    Q.cmd_marks(fake, ns())
+    assert capsys.readouterr().out.splitlines() == ["star", "asterisk"]
+    Q.cmd_replace(fake, ns(file=mkpdf("new.pdf", "NEW"), remote_doc="Books/a.pdf", revision=None))
+    assert "revision:" in capsys.readouterr().out
+    ann = tmp_path / "ann.bin"
+    Q.cmd_annotations(fake, ns(remote_doc="Books/a.pdf", page=1, output=str(ann)))
+    assert ann.read_bytes() == b"\xaa\xbb"
+    capsys.readouterr()
+    Q.cmd_templates(fake, ns(action="add", file=mkpdf("tpl.pdf", "T"), name="Lined"))
+    tid = capsys.readouterr().out.splitlines()[-1].strip()
+    Q.cmd_templates(fake, ns(action="ls"))
+    assert "Lined" in capsys.readouterr().out
+    Q.cmd_templates(fake, ns(action="rename", template_id=tid, name="Ruled"))
+    Q.cmd_templates(fake, ns(action="rm", template_id=tid))
+    Q.cmd_wifi(fake, ns(action="status"))
+    assert "HomeWiFi" in capsys.readouterr().out
+    Q.cmd_wifi(fake, ns(action="add", ssid="Lab", security="psk", password="pw"))
+    Q.cmd_wifi(fake, ns(action="ls"))
+    assert "Lab" in capsys.readouterr().out
+    Q.cmd_wifi(fake, ns(action="rm", ssid="Lab", security="psk"))
+    Q.cmd_power(fake, ns(action="sleep"))
+    Q.cmd_pen_buttons(fake, ns(action="ls"))
+    assert "eraser" in capsys.readouterr().out
+    Q.cmd_pen_buttons(fake, ns(action="set", button="side", function="highlight"))
+    cert = tmp_path / "ca.pem"
+    cert.write_bytes(b"CA")
+    Q.cmd_certs(fake, ns(action="add-ca", name="TestCA", file=str(cert)))
+    Q.cmd_certs(fake, ns(action="ls"))
+    assert "TestCA" in capsys.readouterr().out
+    Q.cmd_certs(fake, ns(action="clear", yes=True))
+    pkg = tmp_path / "fw.pkg"
+    pkg.write_bytes(b"DPUP" + b"\x00" * 16)
+    Q.cmd_firmware(fake, ns(action="upload", file=str(pkg)))
+    Q.cmd_firmware(fake, ns(action="precheck"))
+    assert '"image_file": "ok"' in capsys.readouterr().out
+    with expect("--yes"):
+        Q.cmd_firmware(fake, ns(action="update", yes=False))
+    Q.cmd_firmware(fake, ns(action="update", yes=True))
+    plog = tmp_path / "past.bin"
+    Q.cmd_pastlog(fake, ns(output=str(plog)))
+    assert plog.read_bytes() == b"ENCRYPTED-PASTLOG"
+    shot = tmp_path / "screen.jpg"
+    Q.cmd_screenshot(fake, ns(output=str(shot), format="jpeg"))
+    assert shot.read_bytes().startswith(b"\xff\xd8\xff")
+    # Ensure argparse accepts every new subcommand
+    parser = Q.build_parser()
+    for argv in [
+        ["ping"], ["marks"], ["replace", "a.pdf", "Books/a.pdf"],
+        ["annotations", "Books/a.pdf", "1"], ["templates", "ls"],
+        ["wifi", "scan"], ["power", "sleep"], ["firmware", "precheck"],
+        ["pen-buttons", "ls"], ["certs", "ls"], ["pastlog"],
+        ["screenshot", "--format", "jpeg"], ["search", "x", "-f", "Books"],
+        ["config", "--all"],
+    ]:
+        assert parser.parse_args(argv, namespace=Q.Args()).cmd == argv[0]

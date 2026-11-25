@@ -40,6 +40,13 @@ class Entry:
     revision: str | None = None    # changes whenever the document's file changes
     modified: str | None = None    # device time, 'YYYY-MM-DDTHH:MM:SSZ'
     created: str | None = None
+    ext_id: str | None = None
+    title: str | None = None
+    author: str | None = None
+    document_type: str | None = None  # "normal" or "note"
+    current_page: int | None = None
+    file_hash: str | None = None
+    reading_date: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
@@ -72,4 +79,8 @@ class Entry:
                    path=d.get("entry_path", "").rstrip("/"), type=d.get("entry_type", ""),
                    parent_id=d.get("parent_folder_id"), size=_int_field(d, "file_size"),
                    pages=_int_field(d, "total_page"), revision=d.get("file_revision"),
-                   modified=d.get("modified_date"), created=d.get("created_date"), raw=dict(d))
+                   modified=d.get("modified_date"), created=d.get("created_date"),
+                   ext_id=d.get("ext_id"), title=d.get("title"), author=d.get("author"),
+                   document_type=d.get("document_type"),
+                   current_page=_int_field(d, "current_page"), file_hash=d.get("file_hash"),
+                   reading_date=d.get("reading_date"), raw=dict(d))

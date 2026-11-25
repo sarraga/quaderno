@@ -53,10 +53,21 @@ _quaderno() {
     'search:find documents by name, text, or mark'
     'cp:copy documents on the device'
     'viewing:show which document is open'
+    'marks:list preset annotation marks'
+    'ping:verify authenticated connection'
+    'replace:replace a document PDF in place'
+    'annotations:download raw page annotation bytes'
+    'templates:manage note templates'
+    'wifi:inspect or configure Wi-Fi'
+    'power:sleep, wake, reboot, or shut down'
+    'firmware:precheck, upload, or apply firmware updates'
+    'pen-buttons:show or assign pen button functions'
+    'certs:manage CA and client certificates'
+    'pastlog:download diagnostic pastlog archive'
     'config:show or change device settings'
     'time:set the device clock from the Mac'
     'info:firmware, storage, battery'
-    'screenshot:save the device screen as PNG'
+    'screenshot:save the device screen as PNG or JPEG'
     'addr:print the device address'
     'pair:pair with the device (PIN on its screen)'
   )
@@ -117,6 +128,7 @@ _quaderno() {
         search)
           _arguments \
             '(-t --target)'{-t,--target}'[where to search]:target:(meta body mark)' \
+            '(-f --folder)'{-f,--folder}'[limit search to folder]:device folder:_quaderno_remote_dirs' \
             '(--notes --docs)--notes[only notebooks]' \
             '(--notes --docs)--docs[only documents]' \
             '--sort[order results]:field:(name title author date read size created)' \
@@ -126,15 +138,42 @@ _quaderno() {
             '1:keyword' && ret=0 ;;
         cp)
           _arguments $regex '*:device path:_quaderno_remote' && ret=0 ;;
-        viewing) ret=0 ;;
+        replace)
+          _arguments \
+            '--revision=[expected file_revision guard]:revision' \
+            '1:local PDF:_files -g "*.pdf"' \
+            '2:device document:_quaderno_remote' && ret=0 ;;
+        annotations)
+          _arguments \
+            '(-o --output)'{-o,--output}'[output file]:local file:_files' \
+            '1:device document:_quaderno_remote' \
+            '2:page number' && ret=0 ;;
+        templates)
+          _arguments '1:action:(ls add rename rm)' '*:argument:_files' && ret=0 ;;
+        wifi)
+          _arguments '1:action:(status on off scan ls add rm)' '*:argument' && ret=0 ;;
+        power)
+          _arguments '1:action:(sleep wake reboot shutdown)' && ret=0 ;;
+        firmware)
+          _arguments '1:action:(precheck upload update)' '*:argument:_files' && ret=0 ;;
+        pen-buttons)
+          _arguments '1:action:(ls set)' '*:argument' && ret=0 ;;
+        certs)
+          _arguments '1:action:(ls add-ca add-client clear)' '*:argument:_files' && ret=0 ;;
+        pastlog)
+          _arguments '1::output file:_files' && ret=0 ;;
+        viewing|marks|ping) ret=0 ;;
         config)
           _arguments \
-            '1::setting:(owner timezone date_format time_format timeout_to_standby)' \
+            '--all[print full /system/configs3 JSON]' \
+            '1::setting:(owner timezone date_format time_format timeout_to_standby mtp regulation_voltage use_mode annotations_permission additional_client_registration control_servers_editable initialized_flag wifi wifi_apmode wifi_sleep_policy pen_buttons_function wifi_accesspoints)' \
             '2::value' && ret=0 ;;
         info)
           _arguments '--json[JSON output]' && ret=0 ;;
         screenshot)
-          _arguments '1::output PNG:_files -g "*.png"' && ret=0 ;;
+          _arguments \
+            '--format=[image format]:format:(png jpeg)' \
+            '1::output image:_files -g "*.(png|jpg|jpeg)"' && ret=0 ;;
         pair)
           _arguments '--force[replace an existing pairing]' \
             '--pin-file[read the PIN from this file]:file:_files' && ret=0 ;;

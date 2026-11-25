@@ -54,6 +54,20 @@ class Args(argparse.Namespace):
     mark: str             # search
     key: str | None       # config
     value: str | None     # config
+    origin_folder: str | None  # search -f
+    format: str | None    # screenshot --format
+    action: str           # templates / wifi / power / firmware / pen-buttons / certs
+    name: str | None      # templates add/rename; certs
+    template_id: str      # templates rename/rm
+    ssid: str             # wifi add/rm
+    security: str         # wifi add/rm
+    password: str | None  # wifi add; certs add-client
+    file: str             # replace; templates add; firmware upload; certs
+    remote_doc: str       # replace; annotations
+    revision: str | None  # replace
+    button: str           # pen-buttons set
+    function: str         # pen-buttons set
+    all_configs: bool     # config --all
 
 
 Command = Callable[[Device, Args], "int | None"]
@@ -104,8 +118,9 @@ _SORT_FIELDS = {"name": "entry_name", "title": "title", "author": "author",
 def cmd_search(dev: Device, args: Args) -> None:
     order = f"{_SORT_FIELDS[args.sort]}_{'desc' if args.desc else 'asc'}" if args.sort else None
     entry_type = "notes" if args.notes else "docs" if args.docs else "all"
+    origin = getattr(args, "origin_folder", None)
     rows = dev.search(args.keyword, target=args.target, entry_type=entry_type,
-                      mark=args.mark, order=order)
+                      mark=args.mark, order=order, origin_folder=origin)
     for e in rows:
         print(_row(e, args.long, full_path=True))
     if not rows:
@@ -133,11 +148,17 @@ def cmd_viewing(dev: Device, args: Args) -> None:
 
 
 def cmd_config(dev: Device, args: Args) -> None:
+    if getattr(args, "all_configs", False):
+        print(json.dumps(dev.configs_v3(), indent=2))
+        return
     if args.key is None:
         for k, val in sorted(dev.configs().items()):
-            print(f"{k:22} {val}")
+            print(f"{k:32} {val}")
     elif args.value is None:
-        print(dev.get_config(args.key))
+        if args.key in ("pen_buttons_function", "wifi_accesspoints"):
+            print(json.dumps(dev.get_config_raw(args.key), indent=2))
+        else:
+            print(dev.get_config(args.key))
     else:
         dev.set_config(args.key, args.value)
         print(f"{args.key} = {dev.get_config(args.key)}")
@@ -204,12 +225,140 @@ def cmd_info(dev: Device, args: Args) -> None:
         print(f"battery        {b['level']}% ({b.get('status', '?')}, {b.get('plugged', '?')})")
     else:
         print(f"battery        {val(b)}")
+    w = info.get("wifi_state")
+    if isinstance(w, dict) and "state" in w:
+        ssid = w.get("ssid")
+        print(f"wifi           {w['state']}" + (f" ({ssid})" if ssid else ""))
 
 
 def cmd_screenshot(dev: Device, args: Args) -> None:
-    output = args.output or "quaderno-screen.png"
-    dev.screenshot(output)
+    fmt = getattr(args, "format", None)
+    default_out = "quaderno-screen.jpg" if fmt == "jpeg" else "quaderno-screen.png"
+    output = args.output or default_out
+    dev.screenshot(output, fmt=fmt)
     print(f"saved {output}")
+
+
+def cmd_ping(dev: Device, args: Args) -> None:
+    dev.ping()
+    print("ok")
+
+
+def cmd_marks(dev: Device, args: Args) -> None:
+    for m in dev.preset_marks():
+        print(m)
+
+
+def cmd_replace(dev: Device, args: Args) -> None:
+    res = dev.replace_document(args.remote_doc, args.file, target_revision=args.revision,
+                               on_event=show)
+    rev = res.get("file_revision")
+    if rev:
+        print(f"revision: {rev}")
+
+
+def cmd_annotations(dev: Device, args: Args) -> None:
+    output = args.output or f"annotations-p{args.page}.bin"
+    assert args.page is not None
+    n = dev.download_annotation(args.remote_doc, args.page, output)
+    print(f"saved {output} ({human(n)})")
+
+
+def cmd_pastlog(dev: Device, args: Args) -> None:
+    output = args.output or "quaderno-pastlog.bin"
+    n = dev.download_pastlog(output)
+    print(f"saved {output} ({human(n)})")
+
+
+def cmd_templates(dev: Device, args: Args) -> None:
+    if args.action == "ls":
+        for t in dev.note_templates():
+            tid = t.get("note_template_id", "?")
+            name = t.get("template_name", "?")
+            mod = t.get("is_modifiable", "")
+            print(f"{tid}  {name}" + (f"  (modifiable={mod})" if mod else ""))
+    elif args.action == "add":
+        tid = dev.upload_note_template(args.file, name=args.name, on_event=show)
+        print(tid)
+    elif args.action == "rename":
+        assert args.name is not None
+        dev.rename_note_template(args.template_id, args.name)
+        print(f"renamed {args.template_id} -> {args.name}")
+    elif args.action == "rm":
+        dev.delete_note_template(args.template_id)
+        print(f"deleted {args.template_id}")
+
+
+def cmd_wifi(dev: Device, args: Args) -> None:
+    if args.action == "status":
+        print(json.dumps(dev.wifi_state(), indent=2))
+    elif args.action in ("on", "off"):
+        dev.set_config("wifi", args.action)
+        print(f"wifi = {args.action}")
+    elif args.action == "scan":
+        for ap in dev.wifi_scan():
+            print(f"{ap.get('ssid', '')}\t{ap.get('security', '')}\t"
+                  f"{ap.get('frequency_band', '')}\t{ap.get('rssi_level', '')}\t"
+                  f"{ap.get('state', '')}")
+    elif args.action == "ls":
+        for cfg in dev.wifi_accesspoints():
+            print(f"{cfg.get('ssid', '')}\t{cfg.get('security', '')}")
+    elif args.action == "add":
+        dev.add_wifi_accesspoint(args.ssid, security=args.security, passwd=args.password or "")
+        print(f"added {args.ssid} ({args.security})")
+    elif args.action == "rm":
+        dev.delete_wifi_accesspoint(args.ssid, args.security)
+        print(f"deleted {args.ssid} ({args.security})")
+
+
+def cmd_power(dev: Device, args: Args) -> None:
+    actions: dict[str, Callable[[], None]] = {
+        "sleep": dev.sleep, "wake": dev.wake, "reboot": dev.reboot, "shutdown": dev.shutdown,
+    }
+    actions[args.action]()
+    print(f"sent {args.action}")
+
+
+def cmd_firmware(dev: Device, args: Args) -> None:
+    if args.action == "precheck":
+        print(json.dumps(dev.firmware_precheck(), indent=2))
+    elif args.action == "upload":
+        res = dev.upload_firmware(args.file, on_event=show)
+        print(json.dumps(res, indent=2))
+    elif args.action == "update":
+        if not args.yes:
+            raise QuadernoError("starting a firmware update reboots the device; pass --yes to proceed")
+        dev.start_firmware_update()
+        print("firmware update started")
+
+
+def cmd_pen_buttons(dev: Device, args: Args) -> None:
+    if args.action == "ls":
+        print(json.dumps(dev.pen_buttons(), indent=2))
+    elif args.action == "set":
+        dev.set_pen_buttons([{"button_id": args.button, "function": args.function}])
+        print(f"{args.button} = {args.function}")
+
+
+def cmd_certs(dev: Device, args: Args) -> None:
+    if args.action == "ls":
+        print(json.dumps({"ca": dev.ca_certificates(), "client": dev.client_certificates()}, indent=2))
+    elif args.action == "add-ca":
+        assert args.name is not None
+        with open(args.file, "rb") as fh:
+            dev.install_ca_certificate(args.name, os.path.basename(args.file), fh.read())
+        print(f"installed CA cert {args.name}")
+    elif args.action == "add-client":
+        assert args.name is not None
+        with open(args.file, "rb") as fh:
+            dev.install_client_certificate(args.name, os.path.basename(args.file), fh.read(),
+                                           password=args.password or "")
+        print(f"installed client cert {args.name}")
+    elif args.action == "clear":
+        if not args.yes:
+            raise QuadernoError("clearing all installed certificates requires --yes")
+        dev.clear_certificates()
+        print("cleared certificates")
 
 
 def cmd_open(dev: Device, args: Args) -> None:
@@ -240,8 +389,8 @@ def cmd_time(dev: Device, args: Args) -> None:
     if dev_off is not None and mac_off is not None and dev_off != mac_off:
         hours = (mac_off - dev_off).total_seconds() / 3600
         print(f"note: the device shows {abs(hours):g} h {'behind' if hours > 0 else 'ahead of'} "
-              f"the Mac's local time because its timezone differs; change it in the "
-              f"QUADERNO's own settings")
+              f"the Mac's local time because its timezone differs; change it with "
+              f"`quaderno config timezone <zone>` or in the QUADERNO's settings")
 
 
 def cmd_sync(dev: Device, args: Args) -> None:
@@ -380,8 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("info", cmd_info, "firmware, storage, battery, owner")
     p.add_argument("--json", action="store_true")
 
-    p = add("screenshot", cmd_screenshot, "save a PNG of the current screen")
-    p.add_argument("output", nargs="?", default="quaderno-screen.png")
+    p = add("screenshot", cmd_screenshot, "save a PNG or JPEG of the current screen")
+    p.add_argument("output", nargs="?", default=None)
+    p.add_argument("--format", choices=["png", "jpeg"], default=None,
+                   help="image format (default: inferred from filename, else png)")
 
     p = add("sync", cmd_sync, "mirror a device folder into a local directory (incremental)")
     p.add_argument("directory", metavar="local", help="local directory (created if missing)")
@@ -402,6 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--target", choices=["meta", "body", "mark"], default="meta",
                    help="names/titles/authors (meta, default), document text (body), "
                         "or annotation-mark name (mark)")
+    p.add_argument("-f", "--folder", dest="origin_folder", default=None,
+                   help="limit search to a device folder")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--notes", action="store_true", help="only notebooks")
     g.add_argument("--docs", action="store_true", help="only documents (exclude notebooks)")
@@ -417,12 +570,87 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", nargs="+")
     p.add_argument("dst")
 
+    p = add("replace", cmd_replace, "replace an existing document's PDF content in place")
+    p.add_argument("file", metavar="local")
+    p.add_argument("remote_doc", metavar="remote")
+    p.add_argument("--revision", default=None, help="expected file_revision guard")
+
+    p = add("annotations", cmd_annotations, "download raw annotation bytes for one page")
+    p.add_argument("remote_doc", metavar="remote")
+    p.add_argument("page", type=int)
+    p.add_argument("-o", "--output", default=None)
+
     add("viewing", cmd_viewing, "show which document is open on the device")
+    add("marks", cmd_marks, "list preset annotation marks")
+    add("ping", cmd_ping, "verify authenticated connection to the device")
+
+    p = add("pastlog", cmd_pastlog, "download encrypted diagnostic pastlog archive")
+    p.add_argument("output", nargs="?", default=None)
 
     p = add("config", cmd_config, "show device settings, or change one")
+    p.add_argument("--all", dest="all_configs", action="store_true",
+                   help="print full /system/configs3 JSON")
     p.add_argument("key", nargs="?", help="setting name; omit to list all settings")
     p.add_argument("value", nargs="?",
                    help="new value (settable: " + ", ".join(SETTABLE_CONFIGS) + ")")
+
+    p = add("templates", cmd_templates, "manage note templates")
+    tsub = p.add_subparsers(dest="action", required=True)
+    tsub.add_parser("ls", help="list note templates")
+    tp = tsub.add_parser("add", help="upload a PDF note template")
+    tp.add_argument("file", metavar="local")
+    tp.add_argument("--name", default=None)
+    tp = tsub.add_parser("rename", help="rename a note template")
+    tp.add_argument("template_id")
+    tp.add_argument("name")
+    tp = tsub.add_parser("rm", help="delete a note template")
+    tp.add_argument("template_id")
+
+    p = add("wifi", cmd_wifi, "inspect or configure Wi-Fi")
+    wsub = p.add_subparsers(dest="action", required=True)
+    wsub.add_parser("status", help="current Wi-Fi connection")
+    wsub.add_parser("on", help="enable Wi-Fi")
+    wsub.add_parser("off", help="disable Wi-Fi")
+    wsub.add_parser("scan", help="scan nearby access points")
+    wsub.add_parser("ls", help="list saved access points")
+    wp = wsub.add_parser("add", help="register a Wi-Fi access point")
+    wp.add_argument("ssid")
+    wp.add_argument("--security", choices=["nonsec", "psk", "eap"], default="psk")
+    wp.add_argument("--password", default=None)
+    wp = wsub.add_parser("rm", help="delete a saved Wi-Fi access point")
+    wp.add_argument("ssid")
+    wp.add_argument("security", choices=["nonsec", "psk", "eap"])
+
+    p = add("power", cmd_power, "sleep, wake, reboot, or shut down the device")
+    p.add_argument("action", choices=["sleep", "wake", "reboot", "shutdown"])
+
+    p = add("firmware", cmd_firmware, "precheck, upload, or trigger a firmware update")
+    fsub = p.add_subparsers(dest="action", required=True)
+    fsub.add_parser("precheck", help="check battery and uploaded image readiness")
+    fp = fsub.add_parser("upload", help="upload FwUpdater.pkg")
+    fp.add_argument("file", metavar="pkg")
+    fp = fsub.add_parser("update", help="reboot into recovery and apply uploaded update")
+    fp.add_argument("-y", "--yes", action="store_true", help="confirm firmware update")
+
+    p = add("pen-buttons", cmd_pen_buttons, "show or assign pen button functions")
+    pbsub = p.add_subparsers(dest="action", required=True)
+    pbsub.add_parser("ls", help="show current pen button assignments and choices")
+    pbp = pbsub.add_parser("set", help="assign a pen button function")
+    pbp.add_argument("button")
+    pbp.add_argument("function")
+
+    p = add("certs", cmd_certs, "manage CA and client certificates")
+    csub = p.add_subparsers(dest="action", required=True)
+    csub.add_parser("ls", help="list installed certificates")
+    cp = csub.add_parser("add-ca", help="install a CA certificate")
+    cp.add_argument("name")
+    cp.add_argument("file")
+    cp = csub.add_parser("add-client", help="install a client PKCS#12 certificate")
+    cp.add_argument("name")
+    cp.add_argument("file")
+    cp.add_argument("--password", default=None)
+    cp = csub.add_parser("clear", help="remove all installed certificates")
+    cp.add_argument("-y", "--yes", action="store_true", help="confirm certificate wipe")
 
     add("time", cmd_time, "set the device clock from the Mac")
     add("addr", None, "print the device address (switches USB mode if needed)")

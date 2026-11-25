@@ -278,6 +278,25 @@ def test_http_404_and_400(c: client.Client) -> None:
     with pytest.raises(quaderno.RequestError) as bad:
         c.request("POST", "/documents", {})
     assert bad.value.status == 400 and bad.value.code == "40006" and "fileName" in str(bad.value)
+    FakeConn.script = [FakeResponse(423, err_body("42300", "The designated resource is locked."))]
+    with pytest.raises(quaderno.LockedError) as locked:
+        c.request("DELETE", "/documents/d1")
+    assert locked.value.status == 423 and locked.value.code == "42300"
+    FakeConn.script = [FakeResponse(507, err_body("50700", "Insufficient storage."))]
+    with pytest.raises(quaderno.StorageFullError) as full:
+        c.request("POST", "/documents", {})
+    assert full.value.status == 507 and full.value.code == "50700"
+
+
+def test_session_expiry_401_reauthenticates_once(c: client.Client) -> None:
+    c.cookies["Credentials"] = "expired-session"
+    FakeConn.script = [
+        FakeResponse(401, err_body("40100", "Authentication is required.")),
+        FakeResponse(200, b'{"nonce": "FRESH_NONCE"}'),
+        FakeResponse(204),
+        FakeResponse(200, b'{"value": "ok"}'),
+    ]
+    assert c.request("GET", "/system/configs/owner") == {"value": "ok"}
 
 
 def test_refused_or_timed_out_is_unreachable(c: client.Client) -> None:

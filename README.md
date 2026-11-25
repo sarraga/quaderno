@@ -63,13 +63,24 @@ quaderno mv SRC... DST                  move/rename; several sources -> into fol
 quaderno rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
 quaderno sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
 quaderno open DOC [-p PAGE]             open a document on the device's screen
-quaderno search KEYWORD [-t TARGET]     find documents by name, text, or annotation mark
+quaderno search KEYWORD [-t TARGET] [-f DIR]  find documents by name, text, or annotation mark
 quaderno cp SRC... DST                  copy documents on the device; several -> into folder DST
+quaderno replace LOCAL REMOTE           replace a document's PDF content in place
+quaderno annotations DOC PAGE [-o OUT]  download raw binary annotations for a page
 quaderno viewing                        show which document is open on the device
-quaderno config [KEY [VALUE]]           show device settings, or change one
+quaderno marks                          list preset annotation mark names
+quaderno ping                           check authenticated connection to the device
+quaderno templates {ls,add,rename,rm}   manage custom PDF note templates
+quaderno wifi {status,on,off,scan,ls,add,rm}  inspect or configure Wi-Fi
+quaderno power {sleep,wake,reboot,shutdown}   device power controls
+quaderno firmware {precheck,upload,update}    firmware update workflow
+quaderno pen-buttons {ls,set}           show or assign pen button functions
+quaderno certs {ls,add-ca,add-client,clear}   manage CA and client certificates
+quaderno pastlog [OUT]                  download encrypted diagnostic pastlog archive
+quaderno config [--all] [KEY [VALUE]]   show device settings, or change one
 quaderno time                           set the device clock from the Mac
-quaderno info [--json]                  firmware, storage, battery, MAC, owner
-quaderno screenshot [OUT.png]           PNG of the current screen
+quaderno info [--json]                  firmware, storage, battery, MAC, owner, Wi-Fi
+quaderno screenshot [OUT] [--format F]  PNG or JPEG of the current screen
 quaderno addr                           print the device address (switches USB mode if needed)
 ```
 
@@ -129,7 +140,7 @@ How the commands behave:
   - With `put -r` and a single folder, a `-d` folder that doesn't exist yet is created.
 - **A failed upload leaves nothing behind.** If an upload fails partway, the half-created document is deleted from the device.
 - **`put` skips what it can't upload and carries on.** Each file or folder you name that can't be uploaded gets a `skip` line on stderr: not a PDF, a folder without `-r`, or a file that doesn't exist. Everything else is still uploaded. So `put -r dir/* -d DEST` works even when `dir` mixes PDFs and EPUBs. Inside folders uploaded with `-r`, non-PDF files are left out silently and counted in the summary line (`… 2 non-PDF ignored`); hidden files are ignored and not counted. As with `cp`, the exit status is 1 if anything you named was skipped this way, so a script can tell that something wasn't uploaded. Files skipped because they're already on the device don't count, nor do non-PDFs inside folders.
-- **`rm` on a folder only deletes it when it's empty.** `rm -r` deletes the documents first, then the folders from the deepest up. The CLI never sends a delete for a folder that still has contents, because the device's behaviour in that case isn't documented. It refuses to delete or move the root folder.
+- **`rm` on a folder only deletes it when it's empty.** `rm -r` deletes the documents first, then the folders from the deepest up. On the device, `DELETE /folders/{id}` rejects non-empty folders with HTTP 400 (`40018`) unless `{"force_delete_flag": "true"}` is sent; deleting individually gives per-file progress events. It refuses to delete or move the root folder.
 - **`get -r` keeps the folder layout.** Partial downloads are written to `*.part` and renamed when complete.
 
 ## Sync (device → Mac)
@@ -173,56 +184,80 @@ quaderno search star -t mark               # documents carrying the "star" annot
 quaderno search a --sort read --desc       # most recently read first
 ```
 
-- **`-t` chooses where to look:** `meta` (names, titles and authors; the default), `body` (the text inside documents), or `mark` (by annotation-mark name, such as `star` or `asterisk`).
+- **`-t` chooses where to look:** `meta` (names, titles and authors; the default), `body` (the text inside documents), or `mark` (by annotation-mark name — run `quaderno marks` to list valid mark names).
+- **`-f` / `--folder`** restricts the search to one device folder subtree (`origin_folder_id`).
 - **`--notes` / `--docs`** limit the results to notebooks, or to documents (everything else).
 - **`--sort`** orders by `name`, `title`, `author`, `date`, `read` (last read), `size` or `created`; add `--desc` to reverse it.
 - **`--mark`** (only with `-t mark`) narrows to `hand` (handwriting) or `highlight`; the default is both.
 - Results are printed as full paths, like `ls -R`. When nothing matches, nothing is printed and a short note goes to stderr.
 
-## cp, viewing and config
+## cp, replace, viewing, config and device management
 
 ```
 quaderno cp Books/a.pdf Note              # copy into a folder (keeping the name)
 quaderno cp Books/a.pdf Books/a-copy.pdf   # copy to a new name
 quaderno cp 'Books/*.pdf' Archive          # patterns; several sources -> DST must be a folder
+quaderno replace updated.pdf Books/a.pdf   # replace PDF contents in place (keeps ID)
+quaderno annotations Books/a.pdf 1 -o p1.bin  # download raw annotation bytes for page 1
 quaderno viewing                           # what's open on the screen right now
-quaderno config                            # list every device setting
+quaderno marks                             # list preset annotation marks
+quaderno ping                              # verify authenticated session
+quaderno config                            # list all scalar device settings
+quaderno config --all                      # full /system/configs3 JSON
 quaderno config timeout_to_standby         # read one setting
 quaderno config owner "Santiago"           # change one setting
+quaderno screenshot screen.jpg             # JPEG screenshot (or --format jpeg|png)
+quaderno templates ls                      # list note templates
+quaderno templates add grid.pdf --name Grid
+quaderno wifi status                       # Wi-Fi state (also: on, off, scan, ls, add, rm)
+quaderno power sleep                       # sleep, wake, reboot, or shutdown
+quaderno firmware precheck                 # firmware update: precheck, upload, update --yes
+quaderno pen-buttons ls                    # show or set pen button functions
+quaderno certs ls                          # manage CA and client certificates
+quaderno pastlog quaderno-log.bin          # download encrypted diagnostic archive
 ```
 
 - **`cp` copies on the device itself**, with no download and re-upload, so it's quick even for large files. Only documents can be copied, not folders. Like `mv`, several sources need an existing folder as the destination, while a single source may instead name a new file; name clashes are checked before anything is copied.
+- **`replace` overwrites an existing document's PDF bytes in place** (`PUT /documents/{id}/file`), preserving its document ID; pass `--revision REV` for optimistic concurrency control (`40017` on mismatch).
 - **`viewing`** prints the open document's path and page, for example `Document/Books/x.pdf  page 59 of 736`, or `nothing is open on the device`. It pairs with `open`.
-- **`config`** with no arguments lists every setting; with a name it prints that one; with a name and a value it changes it. Settable: `owner`, `timezone`, `date_format`, `time_format`, `timeout_to_standby`. Values are device-specific — in particular `timezone` accepts only the zones the device itself offers (see `time` above), and the device rejects anything else.
+- **`config`** with no arguments lists all scalar settings (via `/system/configs3`, normalizing `timeout_to_sleep` to `timeout_to_standby`); `--all` prints the raw `/system/configs3` JSON. Settable keys: `owner`, `timezone`, `date_format`, `time_format`, `timeout_to_standby`, `mtp` (`0`/`1`), `regulation_voltage`, `use_mode` (`personal`/`shared`/`others`), `annotations_permission` (`yes`/`no`), `additional_client_registration` (`accept_all`/`accept_dcss_only`/`refuse`), `control_servers_editable` (`yes`/`no`), `initialized_flag`, `wifi` (`on`/`off`), `wifi_apmode` (`on`/`off`), `wifi_sleep_policy` (`disabled`/`enabled_always`/`enabled_if_plugged`).
+- **`templates`, `wifi`, `power`, `firmware`, `pen-buttons`, `certs`, `pastlog`** expose the remaining device Web API controls directly from the command line. See [`docs/API.md`](docs/API.md) for the complete endpoint-by-endpoint reference.
 
 ## Python API
 
-Everything the command does is available from Python; the CLI is a thin layer over it.
+Everything the command does — plus low-level v2 document/folder operations, document action attributes, on-screen dialogs (`indicate`), transfer wizards, notifications, and custom app installation — is available from Python with full `TypedDict` structs for every request and response (`quaderno.models`).
 
 ```python
 import quaderno
+from quaderno import DialogParameters, WifiApConfig
 
 with quaderno.connect() as dev:                  # find it on USB, log in (closes the connection after)
-    for e in dev.entries("Books"):               # Entry: name, path, relpath, size, pages, modified, ...
+    dev.ping()
+    for e in dev.entries("Books", v2=True):      # Entry: name, path, relpath, ext_id, size, pages, ...
         print(e.relpath, e.size)
     dev.get("Books/Sailing/*.pdf", "~/Downloads")      # patterns work as in the CLI
     res = dev.put(["a.pdf", "b.pdf"], "Books")         # PutResult(uploaded=, skipped=, missing=, ...)
     dev.upload("c.pdf", "Books")                       # one file; raises if the name exists
+    dev.replace_document("Books/c.pdf", "c_v2.pdf")    # in-place PDF update -> FileUploadResult
     dev.move("Fighter*", "Books")                      # -> [(old_path, new_path), ...]
     dev.copy("Books/x.pdf", "Archive")                 # server-side copy -> [(old, new), ...]
     dev.rm("Received/*", confirm=lambda entries: True) # confirm is asked only when a pattern matched
     dev.sync("~/QUADERNO", "Note")                     # -> counts per action
-    for e in dev.search("rust", target="meta"):        # -> [Entry, ...]; target meta/body/mark
+    for e in dev.search("rust", target="meta", origin_folder="Books"):
         print(e.relpath)
     dev.open("Books/x.pdf", page=5)
-    print(dev.current_viewing()["views"])              # what's on the screen now
+    print(dev.current_viewing()["views"])              # CurrentViewing struct
     dev.set_time()
-    dev.set_config("owner", "Santiago")                # dev.configs() / dev.get_config(key)
+    dev.set_config("owner", "Santiago")                # dev.configs() / dev.configs_v3() / dev.get_config(key)
+    dev.add_wifi_accesspoint(config=WifiApConfig(ssid="Home", security="psk", passwd="secret"))
+    dev.indicate(DialogParameters(title="Sync", message="Working...", button_caption="OK"))
     print(dev.info()["storage"])
 ```
 
+- **Structs:** [`quaderno/models.py`](quaderno/models.py) defines `TypedDict` structs and `Literal` enums for every request and response model (`DeviceInformation`, `CurrentViewing`, `NoteTemplate`, `FileUploadResult`, `ConfigsV2`, `ConfigsV3`, `WifiApConfig`, `WifiApInfo`, `PenButtonsInfo`, `CertificateInfo`, `DocumentProcessStatus`, `UpdateFirmwarePrecheck`, `DialogParameters`, `DocumentAttribute`, `TransferWizardNextScreen`, etc.). They are plain `dict`s at runtime and statically checked under `mypy --strict`.
+- **Session renewal:** device sessions expire after 30 minutes idle; `Client` automatically re-authenticates once on HTTP `401`.
 - **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
-- **Errors:** every failure on the device side is a `quaderno.QuadernoError`; local file problems (a directory that doesn't exist, no permission) are ordinary `OSError`s. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
+- **Errors:** every failure on the device side is a `quaderno.QuadernoError`; local file problems (a directory that doesn't exist, no permission) are ordinary `OSError`s. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`, `LockedError`, `StorageFullError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
 - **Pairing:** `quaderno.pair(read_pin)` pairs from code. `read_pin` is a function that returns the PIN shown on the device.
 - **Types:** the package is fully annotated and ships `py.typed`, so mypy and editors check code that uses it. Answers from the device are checked where they come in: a reply that isn't a JSON object, or lacks an id the API needs, raises `ProtocolError` rather than surfacing later as a `KeyError`.
 
@@ -311,10 +346,11 @@ zsh tests/hw_zsh_completion.zsh             # presses Tab in a real zsh against 
 
 ```
 quaderno/
-  __init__.py     public API: connect, pair, Device, Entry, Event, PutResult, errors
-  device.py       Device: ls/find/walk, get/put/upload, mkdir/move/rm, open, set_time, info, sync
+  __init__.py     public API: connect, pair, Device, Entry, Event, PutResult, models, errors
+  device.py       Device: files, search, viewer, templates, configs, Wi-Fi, certs, power, firmware, sync
+  models.py       TypedDict structs and literal enums for every JSON request and response
   sync.py         one-way incremental sync (device -> Mac)
-  client.py       HTTPS transport (kept-alive, certificate pinning) and login
+  client.py       HTTPS transport (kept-alive, certificate pinning, auto re-auth) and binary transfer
   pairing.py      PIN pairing protocol
   crypto.py       RSA/AES via `cryptography`, HMAC, Diffie-Hellman, PEM/DER
   credentials.py  where credentials live; loading and saving them
@@ -324,6 +360,7 @@ quaderno/
   errors.py       the exception hierarchy
   util.py         paths, patterns, time and size formatting
   cli.py          the `quaderno` command: argument parsing and printing only
+docs/API.md       complete firmware Web API v2.1 endpoint and error code reference
 completions/_quaderno   zsh Tab completion
 tests/                  offline tests (fake device) and manual device checks
 ```
@@ -365,6 +402,8 @@ QuadernoError                    base: .status (HTTP status, when there is one)
 ├── PairingError                                                             exit 4
 │   └── WrongPinError
 ├── RequestError                 the device answered with an HTTP error: .status, .code   exit 1
+│   ├── LockedError              HTTP 423: resource is locked (e.g. open in viewer)        exit 1
+│   └── StorageFullError         HTTP 507: insufficient storage on the device              exit 1
 ├── ProtocolError                the device's answer is malformed (not JSON)            exit 1
 ├── NotFoundError                path doesn't exist, or a pattern matched nothing        exit 1
 ├── ExistsError                  target already exists                                   exit 1

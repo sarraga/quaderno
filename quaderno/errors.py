@@ -13,6 +13,8 @@
     ├── PairingError
     │   └── WrongPinError
     ├── RequestError                 the device answered with an HTTP error: .status, .code
+    │   ├── LockedError              HTTP 423: resource is locked (e.g. open in viewer)
+    │   └── StorageFullError         HTTP 507: insufficient storage on the device
     ├── ProtocolError                the device's answer is malformed (not JSON; Entry.mtime: bad date)
     ├── NotFoundError                path doesn't exist, or a pattern matched nothing
     ├── ExistsError                  target already exists
@@ -79,6 +81,14 @@ class RequestError(QuadernoError):
     def __init__(self, msg: str, status: int | None = None, code: str | None = None) -> None:
         super().__init__(msg, status)
         self.code = code
+
+
+class LockedError(RequestError):
+    """HTTP 423 (42300): the resource is locked, e.g. currently open on the device."""
+
+
+class StorageFullError(RequestError):
+    """HTTP 507 (50700/50701): insufficient storage capacity on the device."""
 
 
 class ProtocolError(QuadernoError):

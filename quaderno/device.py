@@ -17,20 +17,28 @@ optional `on_event` callback that receives an Event for each step.
 Errors from the device are QuadernoError subclasses. Local file problems (a
 directory that doesn't exist, no permission, a full disk) are OSError."""
 
+import base64
 import datetime
 import errno
 import logging
 import os
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import cast
 from urllib.parse import quote, urlencode
 
-from . import credentials, usb
+from . import credentials, pairing, usb
 from .client import Client
 from .credentials import Credentials
 from .entry import Entry
 from .errors import ExistsError, NotEmptyError, NotFoundError, ProtocolError, QuadernoError
 from .events import EventHandler, emit
+from .models import (CertificateInfo, CommonValue, ConfigsV2, ConfigsV3, CurrentViewing,
+                     DeviceInformation, DialogParameters, DocumentAttribute, DocumentProcessStatus,
+                     DocumentsViewInfo, FileUploadResult, FolderViewInfo, IndicationInfo,
+                     NoteTemplate, PenButtonAssignment, PenButtonsInfo, TransferWizardInfo,
+                     TransferWizardNextScreen, UpdateFirmwarePrecheck, ViewerOpen2Request,
+                     ViewerOpenConfirmRequest, WifiApConfig, WifiApInfo)
 from .util import (ROOT, JsonObject, device_time, human, is_pattern, json_int, json_str, matcher,
                    nfc, norm, safe_local_name)
 
@@ -43,8 +51,17 @@ Patterns = str | Sequence[str]  # one path/pattern, or several
 SEARCH_TARGETS = {"meta": "document_meta", "body": "document_body", "mark": "annotation_pattern"}
 SEARCH_ENTRY_TYPES = {"all": "all", "docs": "documents", "notes": "notes"}
 ANNOTATION_TYPES = {"all": "all", "hand": "handwritings", "highlight": "highlights"}
-# config settings safe to change through set_config() (the rest are read-only here)
-SETTABLE_CONFIGS = ("owner", "timezone", "date_format", "time_format", "timeout_to_standby")
+# Scalar settings under /system/configs/<key> and the JSON key each one uses on the wire
+_CONFIG_WIRE_KEY: dict[str, str] = {
+    "use_mode": "use_mode",
+    "annotations_permission": "deletable",
+}
+SETTABLE_CONFIGS = (
+    "owner", "timezone", "date_format", "time_format", "timeout_to_standby",
+    "mtp", "regulation_voltage", "use_mode", "annotations_permission",
+    "additional_client_registration", "control_servers_editable", "initialized_flag",
+    "wifi", "wifi_apmode", "wifi_sleep_policy",
+)
 
 
 @dataclass
@@ -88,9 +105,26 @@ class Device(Client):
     credentials: Credentials | None = None
 
     # --- lookup ----------------------------------------------------------------
-    def resolve(self, path: str) -> Entry:
-        """The Entry at `path` (exact, no patterns). Raises NotFoundError."""
-        return Entry.from_api(self.request_json("GET", "/resolve/entry/" + quote(norm(path), safe="")))
+    def resolve(self, path: str, *, v2: bool = False) -> Entry:
+        """The Entry at `path` (exact, no patterns). Raises NotFoundError.
+        With v2=True, uses GET /resolve/entry/path/{path}."""
+        prefix = "/resolve/entry/path/" if v2 else "/resolve/entry/"
+        return Entry.from_api(self.request_json("GET", prefix + quote(norm(path), safe="")))
+
+    def resolve_ext_id(self, ext_id: str) -> Entry:
+        """Look up an entry by external ID (GET /resolve/entry/ext_id/{ext_id})."""
+        return Entry.from_api(self.request_json(
+            "GET", "/resolve/entry/ext_id/" + quote(ext_id, safe="")))
+
+    def get_document(self, doc_id: str, *, v2: bool = False) -> Entry:
+        """Metadata for a document by ID (GET /documents/{id} or /documents2/{id})."""
+        base = "/documents2/" if v2 else "/documents/"
+        return Entry.from_api(self.request_json("GET", base + quote(doc_id, safe="")))
+
+    def get_folder(self, folder_id: str, *, v2: bool = False) -> Entry:
+        """Metadata for a folder by ID (GET /folders/{id} or /folders2/{id})."""
+        base = "/folders2/" if v2 else "/folders/"
+        return Entry.from_api(self.request_json("GET", base + quote(folder_id, safe="")))
 
     def try_resolve(self, path: str) -> Entry | None:
         try:
@@ -106,14 +140,14 @@ class Device(Client):
             raise QuadernoError(f"{f.path} is not a folder")
         return f
 
-    def _paged(self, base: str, limit: int | None = None) -> list[Entry]:
+    def _paged(self, base: str, limit: int | None = None, page_size: int = 500) -> list[Entry]:
         """Collect entries from a {count, entry_list} endpoint, following offset
         pagination. `base` carries its own query string, if any; `limit` caps how
-        many are fetched in all."""
+        many are fetched in all. The device's own default page size is 1300."""
         out: list[Entry] = []
         while True:
             sep = "&" if "?" in base else "?"
-            page = f"{base}{sep}offset={len(out)}&limit=100"
+            page = f"{base}{sep}offset={len(out)}&limit={page_size}"
             r = self.request_json("GET", page)
             batch = r.get("entry_list", [])
             if not isinstance(batch, list) or not all(isinstance(d, dict) for d in batch):
@@ -123,28 +157,45 @@ class Device(Client):
             if not batch or len(out) >= count or (limit is not None and len(out) >= limit):
                 return out[:limit] if limit is not None else out
 
-    def _children(self, folder_id: str) -> list[Entry]:
-        return self._paged(f"/folders/{folder_id}/entries")
+    def _children(self, folder_id: str, *, v2: bool = False, order: str | None = None,
+                  fields: Sequence[str] | None = None, limit: int | None = None) -> list[Entry]:
+        suffix = "entries2" if v2 else "entries"
+        q: dict[str, str] = {}
+        if order:
+            q["order_type"] = order
+        if fields:
+            q["fields"] = ",".join(fields)
+        qs = ("?" + urlencode(q)) if q else ""
+        return self._paged(f"/folders/{quote(folder_id, safe='')}/{suffix}{qs}", limit=limit)
 
     def search(self, keyword: str, target: str = "meta", entry_type: str = "all",
                mark: str = "all", order: str | None = None,
-               limit: int | None = None) -> list[Entry]:
+               limit: int | None = None, *, origin_folder: PathOrEntry | None = None,
+               fields: Sequence[str] | None = None, v2: bool = False) -> list[Entry]:
         """Search documents on the device. `target`: 'meta' (names, titles and
         authors), 'body' (text inside documents) or 'mark' (by annotation-mark
         name, e.g. 'star'). `entry_type` may narrow to 'docs' or 'notes'; `mark`
         ('all'/'hand'/'highlight') applies to a mark search; `order` is a device
-        order_type such as 'reading_date_desc'. Returns the matching Entries."""
+        order_type such as 'reading_date_desc'; `origin_folder` restricts to a
+        subtree. Returns the matching Entries."""
         q = {"entry_type": SEARCH_ENTRY_TYPES[entry_type],
              "search_target": SEARCH_TARGETS[target], "search_keyword": keyword}
         if target == "mark":
             q["annotation_type"] = ANNOTATION_TYPES[mark]
+        if origin_folder is not None:
+            q["origin_folder_id"] = self._folder(origin_folder).id
         if order:
             q["order_type"] = order
-        return self._paged("/documents?" + urlencode(q), limit=limit)
+        if fields:
+            q["fields"] = ",".join(fields)
+        endpoint = "/documents2?" if v2 else "/documents?"
+        return self._paged(endpoint + urlencode(q), limit=limit)
 
-    def entries(self, folder: PathOrEntry = ROOT) -> list[Entry]:
+    def entries(self, folder: PathOrEntry = ROOT, *, v2: bool = False, order: str | None = None,
+                fields: Sequence[str] | None = None, limit: int | None = None) -> list[Entry]:
         """Direct children of a folder (path or Entry)."""
-        return self._children(self._folder(folder).id)
+        return self._children(self._folder(folder).id, v2=v2, order=order, fields=fields,
+                              limit=limit)
 
     def walk(self, folder: PathOrEntry = ROOT) -> Iterator[Entry]:
         """Everything below a folder, depth-first; parents come before children."""
@@ -562,19 +613,108 @@ class Device(Client):
         return plan
 
     def _delete_empty_folder(self, e: Entry, on_event: EventHandler | None) -> None:
-        # The device's behaviour on non-empty folders is undocumented (it may delete
-        # recursively), so DELETE is only ever sent for a folder verified to be empty.
+        # Firmware refuses non-empty folder deletion with 400/40018 unless
+        # force_delete_flag="true" is passed; we still verify emptiness up front
+        # so rm -r deletes items individually with progress events.
         children = self._children(e.id)
         if children:
             raise NotEmptyError(f"{e.path} is not empty ({len(children)} entries); "
                                 "use -r to delete its contents first")
-        self.request("DELETE", f"/folders/{e.id}")
+        self.delete_folder(e.id)
         emit(on_event, "deleted", f"deleted {e.path}/", e.path)
 
-    # --- the device itself -------------------------------------------------------
-    def open(self, path: PathOrEntry, page: int | None = None, regex: bool = False) -> Entry:
-        """Show a document on the device's screen (at `page`, or where it was left).
-        A pattern must match exactly one document. Returns its Entry."""
+    # --- low-level document/folder operations (v1/v2, attributes, annotations) ---
+    def replace_document(self, doc: PathOrEntry, local: str, *,
+                         target_revision: str | None = None, file_hash: str | None = None,
+                         on_event: EventHandler | None = None) -> FileUploadResult:
+        """Replace an existing document's PDF content in place (PUT /documents/{id}/file).
+
+        Returns a ``FileUploadResult`` (``completed``, ``current_bytes``, ``received_bytes``,
+        ``file_revision``). Passing ``target_revision`` guards against concurrent edits
+        on the device (HTTP 400 / error_code 40017)."""
+        entry = doc if isinstance(doc, Entry) else self.resolve(doc)
+        if not entry.is_document:
+            raise QuadernoError(f"{entry.path} is not a document")
+        res = self.replace_file(entry.id, local, target_revision=target_revision,
+                                file_hash=file_hash)
+        emit(on_event, "uploaded", f"{local} -> {entry.path}", entry.path)
+        return res
+
+    def update_document(self, doc_id: str, *, file_name: str | None = None,
+                        parent_folder_id: str | None = None,
+                        ext_id: str | None = None) -> None:
+        """Update document metadata (PUT /documents/{id}, or /documents2/{id} with ext_id)."""
+        body: JsonObject = {}
+        if file_name is not None:
+            body["file_name"] = file_name
+        if parent_folder_id is not None:
+            body["parent_folder_id"] = parent_folder_id
+        if ext_id is not None:
+            body["ext_id"] = ext_id
+        base = "/documents2/" if ext_id is not None else "/documents/"
+        self.request("PUT", base + quote(doc_id, safe=""), body)
+
+    def delete_document(self, doc_id: str, *, target_revision: str | None = None) -> None:
+        """Delete a document by ID, optionally guarded by `target_revision`."""
+        body: JsonObject | None = ({"target_revision": target_revision}
+                                   if target_revision is not None else None)
+        self.request("DELETE", f"/documents/{quote(doc_id, safe='')}", body)
+
+    def update_folder(self, folder_id: str, *, folder_name: str | None = None,
+                      parent_folder_id: str | None = None,
+                      ext_id: str | None = None) -> None:
+        """Update folder metadata (PUT /folders/{id}, or /folders2/{id} with ext_id)."""
+        body: JsonObject = {}
+        if folder_name is not None:
+            body["folder_name"] = folder_name
+        if parent_folder_id is not None:
+            body["parent_folder_id"] = parent_folder_id
+        if ext_id is not None:
+            body["ext_id"] = ext_id
+        base = "/folders2/" if ext_id is not None else "/folders/"
+        self.request("PUT", base + quote(folder_id, safe=""), body)
+
+    def delete_folder(self, folder_id: str, *, force: bool = False) -> None:
+        """Delete a folder by ID. Without force=True, the device rejects non-empty
+        folders with HTTP 400 (error_code 40018)."""
+        body: JsonObject | None = {"force_delete_flag": "true"} if force else None
+        self.request("DELETE", f"/folders/{quote(folder_id, safe='')}", body)
+
+    def download_annotation(self, doc: PathOrEntry, page: int, target: str) -> int:
+        """Save raw binary annotation data for `page` of `doc` to `target`."""
+        _need_dir(target)
+        entry = doc if isinstance(doc, Entry) else self.resolve(doc)
+        if not entry.is_document:
+            raise QuadernoError(f"{entry.path} is not a document")
+        tmp = target + ".part"
+        try:
+            with open(tmp, "wb") as fh:
+                n = self.download_annotation_to(entry.id, page, fh)
+            os.replace(tmp, target)
+            return n
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    def get_document_attribute(self, doc: PathOrEntry) -> DocumentAttribute:
+        """Get custom action attributes for a document (GET /documents/{id}/attribute)."""
+        entry = doc if isinstance(doc, Entry) else self.resolve(doc)
+        return cast(DocumentAttribute,
+                    self.request_json("GET", f"/documents/{quote(entry.id, safe='')}/attribute"))
+
+    def set_document_attribute(self, doc: PathOrEntry, attribute: DocumentAttribute) -> None:
+        """Set custom action attributes on a document (PUT /documents/{id}/attribute)."""
+        entry = doc if isinstance(doc, Entry) else self.resolve(doc)
+        self.request("PUT", f"/documents/{quote(entry.id, safe='')}/attribute", attribute)
+
+    def delete_document_attribute(self, doc: PathOrEntry) -> None:
+        """Delete custom action attributes from a document (DELETE /documents/{id}/attribute)."""
+        entry = doc if isinstance(doc, Entry) else self.resolve(doc)
+        self.request("DELETE", f"/documents/{quote(entry.id, safe='')}/attribute")
+
+    # --- viewer & note templates -----------------------------------------------
+    def _single_document(self, path: PathOrEntry, regex: bool = False) -> Entry:
         matches = [path] if isinstance(path, Entry) else self.find(path, regex)[0]
         docs = [e for e in matches if e.is_document]
         if len(docs) != 1:
@@ -583,17 +723,136 @@ class Device(Client):
             listing = "\n  ".join(e.path for e in docs[:10])
             raise QuadernoError(f"{path!r} matches {len(docs)} documents; be more "
                                 f"specific:\n  {listing}")
-        e = docs[0]
+        return docs[0]
+
+    def open(self, path: PathOrEntry, page: int | None = None, regex: bool = False) -> Entry:
+        """Show a document on the device's screen (at `page`, or where it was left).
+        A pattern must match exactly one document. Returns its Entry."""
+        e = self._single_document(path, regex)
         if page is None:
             self.request("PUT", "/viewer/controls/open", {"document_id": e.id})
         else:
+            req: ViewerOpen2Request = {"document_id": e.id, "page": str(int(page))}
             try:
-                self.request("PUT", "/viewer/controls/open2", {"document_id": e.id, "page": int(page)})
+                self.request("PUT", "/viewer/controls/open2", req)
             except QuadernoError as err:
                 if err.status in (404, 405):
                     raise QuadernoError("this firmware does not support opening at a page") from err
                 raise
         return e
+
+    def open_confirm(self, path: PathOrEntry, title: str, message: str,
+                     positive_button: str, negative_button: str, *,
+                     page: int | None = None, regex: bool = False) -> Entry:
+        """Prompt the user with a two-button dialog before opening a document
+        (PUT /viewer/controls/open2_confirm)."""
+        e = self._single_document(path, regex)
+        body: ViewerOpenConfirmRequest = {
+            "document_id": e.id,
+            "confirm_dialog_params": {
+                "title": title, "message": message,
+                "positive_button_caption": positive_button,
+                "negative_button_caption": negative_button,
+            },
+        }
+        if page is not None:
+            body["page"] = str(int(page))
+        self.request("PUT", "/viewer/controls/open2_confirm", body)
+        return e
+
+    def show_documents_view(self, view_type: str = "list",
+                            order_type: str = "reading_date_desc") -> None:
+        """Switch the device UI to the documents list view."""
+        body: DocumentsViewInfo = {"view_type": view_type, "order_type": order_type}
+        self.request("PUT", "/viewer/controls/transfer/documents_view", body)
+
+    def show_folder_view(self, folder: PathOrEntry = ROOT, view_type: str = "list",
+                         order_type: str = "entry_name_asc") -> None:
+        """Switch the device UI to a specific folder view."""
+        f = self._folder(folder)
+        body: FolderViewInfo = {"folder_id": f.id, "view_type": view_type,
+                                "order_type": order_type}
+        self.request("PUT", "/viewer/controls/transfer/folder_view", body)
+
+    def current_viewing(self) -> CurrentViewing:
+        """What the device is showing now (GET /viewer/status/current_viewing):
+        ``orientation`` (``'portlait'``/``'landscape'``), ``view_mode``, and
+        ``views`` (each with ``entry_path``, ``current_page``, ``total_page``, ``title``)."""
+        return cast(CurrentViewing, self.request_json("GET", "/viewer/status/current_viewing"))
+
+    def preset_marks(self) -> list[str]:
+        """List preset annotation mark names (GET /viewer/status/preset_marks)."""
+        r = self.request_json("GET", "/viewer/status/preset_marks")
+        items = r.get("pattern_list", [])
+        if not isinstance(items, list):
+            raise ProtocolError(f"GET /viewer/status/preset_marks: invalid pattern_list: {r!r}")
+        out: list[str] = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("pattern"), str):
+                out.append(item["pattern"])
+            elif isinstance(item, str):
+                out.append(item)
+        return out
+
+    def note_templates(self) -> list[NoteTemplate]:
+        """List all note templates (GET /viewer/configs/note_templates)."""
+        r = self.request_json("GET", "/viewer/configs/note_templates")
+        items = r.get("template_list", [])
+        if not isinstance(items, list) or not all(isinstance(x, dict) for x in items):
+            raise ProtocolError(f"GET /viewer/configs/note_templates: invalid template_list: {r!r}")
+        return cast(list[NoteTemplate], list(items))
+
+    def get_note_template(self, template_id: str) -> NoteTemplate:
+        """Get metadata for a single note template."""
+        return cast(NoteTemplate, self.request_json(
+            "GET", f"/viewer/configs/note_templates/{quote(template_id, safe='')}"))
+
+    def upload_note_template(self, local: str, name: str | None = None,
+                             on_event: EventHandler | None = None) -> str:
+        """Create and upload a PDF note template; returns its note_template_id.
+        Deletes the half-created template entry if the upload fails."""
+        tname = nfc(name or os.path.splitext(os.path.basename(local))[0])
+        tid = json_str(self.request_json("POST", "/viewer/configs/note_templates",
+                                         {"template_name": tname}), "note_template_id")
+        try:
+            self.upload_note_template_file(tid, local)
+        except BaseException:
+            try:
+                self.delete_note_template(tid)
+            except (QuadernoError, OSError):
+                log.warning("warning: could not remove incomplete note template %s", tname)
+            raise
+        emit(on_event, "uploaded", f"{local} -> template {tname} ({tid})", tid)
+        return tid
+
+    def rename_note_template(self, template_id: str, name: str) -> None:
+        """Rename a note template (PUT /viewer/configs/note_templates/{id})."""
+        self.request("PUT", f"/viewer/configs/note_templates/{quote(template_id, safe='')}",
+                     {"template_name": nfc(name)})
+
+    def delete_note_template(self, template_id: str) -> None:
+        """Delete a note template (DELETE /viewer/configs/note_templates/{id})."""
+        self.request("DELETE", f"/viewer/configs/note_templates/{quote(template_id, safe='')}")
+
+    # --- settings & status -----------------------------------------------------
+    def ping(self) -> None:
+        """Authenticated keep-alive / connectivity check (GET /ping)."""
+        self.request("GET", "/ping")
+
+    def device_information(self) -> DeviceInformation:
+        """Pre-auth device info from port 8080 (GET /register/information):
+        model_name, serial_number, sku_code, device_color."""
+        status, res = pairing.reg_request(self.addr, "GET", "/register/information")
+        if status != 200 or not isinstance(res, dict):
+            raise ProtocolError(f"GET /register/information -> HTTP {status}: {res!r}")
+        return cast(DeviceInformation, res)
+
+    def serial_number(self) -> str:
+        """Device serial number from port 8080 (GET /register/serial_number)."""
+        status, res = pairing.reg_request(self.addr, "GET", "/register/serial_number")
+        if status != 200 or not isinstance(res, dict):
+            raise ProtocolError(f"GET /register/serial_number -> HTTP {status}: {res!r}")
+        return json_str(res, "value")
 
     def set_time(self, when: datetime.datetime | None = None) -> str:
         """Set the device clock (default: now). The clock can't be read back.
@@ -606,31 +865,75 @@ class Device(Client):
         value = (self.request("GET", "/system/configs/timezone") or {}).get("value")
         return value if isinstance(value, str) else None
 
-    def current_viewing(self) -> JsonObject:
-        """What the device is showing now (GET /viewer/status/current_viewing):
-        a 'views' list, each with entry_path, current_page, total_page and title."""
-        return self.request_json("GET", "/viewer/status/current_viewing")
+    def configs_v2(self) -> ConfigsV2:
+        """Raw device settings from GET /system/configs2."""
+        return cast(ConfigsV2, self.request_json("GET", "/system/configs2"))
+
+    def configs_v3(self) -> ConfigsV3:
+        """Raw device settings from GET /system/configs3 (most complete)."""
+        return cast(ConfigsV3, self.request_json("GET", "/system/configs3"))
 
     def configs(self) -> dict[str, str]:
-        """All device settings as a flat {name: value} map (GET /system/configs)."""
-        r = self.request_json("GET", "/system/configs")
-        return {k: v["value"] for k, v in r.items()
-                if isinstance(v, dict) and isinstance(v.get("value"), str)}
+        """All scalar device settings as a flat {name: value} map. Uses
+        GET /system/configs3 (falling back to /system/configs on older firmware)
+        and normalizes 'timeout_to_sleep' to 'timeout_to_standby'."""
+        try:
+            r = self.request_json("GET", "/system/configs3")
+        except QuadernoError as err:
+            if err.status in (404, 405):
+                r = self.request_json("GET", "/system/configs")
+            else:
+                raise
+        out: dict[str, str] = {}
+        for k, v in r.items():
+            if not isinstance(v, dict):
+                continue
+            name = "timeout_to_standby" if k == "timeout_to_sleep" else k
+            wire_key = _CONFIG_WIRE_KEY.get(name, "value")
+            val = v.get(wire_key)
+            if isinstance(val, str):
+                out[name] = val
+        return out
+
+    def get_config_raw(self, key: str) -> JsonObject:
+        """Raw JSON object returned by GET /system/configs/<key>."""
+        return self.request_json("GET", "/system/configs/" + quote(key, safe=""))
 
     def get_config(self, key: str) -> str:
-        """One setting's value (GET /system/configs/<key>)."""
-        return json_str(self.request_json("GET", "/system/configs/" + quote(key)), "value")
+        """One scalar setting's value (GET /system/configs/<key>). Handles keys
+        that use 'use_mode' or 'deletable' in addition to standard 'value'."""
+        r = self.get_config_raw(key)
+        wire_key = _CONFIG_WIRE_KEY.get(key, "value")
+        return json_str(r, wire_key)
 
     def set_config(self, key: str, value: str) -> None:
-        """Change a device setting (PUT /system/configs/<key>). Only a known-safe
-        set of keys may be changed; see SETTABLE_CONFIGS."""
+        """Change a device setting (PUT /system/configs/<key>). Only known
+        scalar settings may be changed; see SETTABLE_CONFIGS."""
         if key not in SETTABLE_CONFIGS:
             raise QuadernoError(f"{key!r} can't be set; settable: {', '.join(SETTABLE_CONFIGS)}")
-        self.request("PUT", "/system/configs/" + quote(key), {"value": value})
+        wire_key = _CONFIG_WIRE_KEY.get(key, "value")
+        self.request("PUT", "/system/configs/" + quote(key, safe=""), {wire_key: value})
+
+    def pen_buttons(self, *, assigning_only: bool = False,
+                    choices_only: bool = False) -> PenButtonsInfo:
+        """Get pen button assignments and/or available choices
+        (GET /system/configs/pen_buttons_function)."""
+        q: dict[str, str] = {}
+        if assigning_only:
+            q["assigning_only"] = "true"
+        if choices_only:
+            q["choices_only"] = "true"
+        qs = ("?" + urlencode(q)) if q else ""
+        return cast(PenButtonsInfo, self.request_json("GET", f"/system/configs/pen_buttons_function{qs}"))
+
+    def set_pen_buttons(self, assigning: Sequence[PenButtonAssignment]) -> None:
+        """Set pen button assignments (PUT /system/configs/pen_buttons_function)."""
+        self.request("PUT", "/system/configs/pen_buttons_function",
+                     {"assigning": list(assigning)})
 
     def info(self) -> dict[str, JsonObject]:
-        """Firmware, storage, battery, owner, MAC: the device's raw answers
-        (a part that failed holds {'error': ...})."""
+        """Firmware, storage, battery, owner, MAC, Wi-Fi state: the device's raw
+        answers (a part that failed holds {'error': ...})."""
         def get(path: str) -> JsonObject:
             try:
                 return self.request("GET", path) or {}
@@ -641,14 +944,223 @@ class Device(Client):
                 "storage": get("/system/status/storage"),
                 "battery": get("/system/status/battery"),
                 "owner": get("/system/configs/owner"),
-                "mac_address": get("/system/status/mac_address")}
+                "mac_address": get("/system/status/mac_address"),
+                "wifi_state": get("/system/status/wifi_state")}
 
-    def screenshot(self, path: str) -> int:
-        """Save the current screen as a PNG file. Returns its size in bytes."""
+    def wifi_state(self) -> WifiApInfo:
+        """Current Wi-Fi connection status (GET /system/status/wifi_state)."""
+        return cast(WifiApInfo, self.request_json("GET", "/system/status/wifi_state"))
+
+    def wifi_scan(self) -> list[WifiApInfo]:
+        """Scan for nearby Wi-Fi access points (POST /system/controls/wifi_accesspoints/scan)."""
+        r = self.request_json("POST", "/system/controls/wifi_accesspoints/scan")
+        aps = r.get("aplist", [])
+        if not isinstance(aps, list) or not all(isinstance(x, dict) for x in aps):
+            raise ProtocolError(f"POST /system/controls/wifi_accesspoints/scan: bad aplist: {r!r}")
+        return cast(list[WifiApInfo], list(aps))
+
+    def wifi_accesspoints(self) -> list[WifiApConfig]:
+        """List saved Wi-Fi access points (GET /system/configs/wifi_accesspoints)."""
+        r = self.request_json("GET", "/system/configs/wifi_accesspoints")
+        aps = r.get("aplist", [])
+        if not isinstance(aps, list) or not all(isinstance(x, dict) for x in aps):
+            raise ProtocolError(f"GET /system/configs/wifi_accesspoints: bad aplist: {r!r}")
+        return cast(list[WifiApConfig], list(aps))
+
+    def get_wifi_accesspoint(self, ssid: str, security: str) -> WifiApConfig:
+        """Get config for one saved Wi-Fi access point (`security`: nonsec|psk|eap)."""
+        return cast(WifiApConfig, self.request_json(
+            "GET", f"/system/configs/wifi_accesspoints/{quote(ssid, safe='')}/{quote(security, safe='')}"))
+
+    def add_wifi_accesspoint(self, ssid: str = "", security: str = "psk", passwd: str = "",
+                             *, config: WifiApConfig | None = None, **extra: str) -> None:
+        """Register and connect to a Wi-Fi access point
+        (PUT /system/controls/wifi_accesspoints/register).
+
+        Either pass ``ssid``/``security``/``passwd`` (plus optional ``ApConfigureObject``
+        fields via ``**extra``) or pass a full ``WifiApConfig`` struct via ``config=``."""
+        if config is not None:
+            body: JsonObject = {"dhcp": "true", "proxy": "false", **config, **extra}
+        else:
+            body = {"ssid": ssid, "security": security, "dhcp": "true",
+                    "proxy": "false", **extra}
+            if passwd:
+                body["passwd"] = passwd
+        self.request("PUT", "/system/controls/wifi_accesspoints/register", body)
+
+    def delete_wifi_accesspoint(self, ssid: str, security: str) -> None:
+        """Delete a saved Wi-Fi access point."""
+        self.request(
+            "DELETE",
+            f"/system/configs/wifi_accesspoints/{quote(ssid, safe='')}/{quote(security, safe='')}")
+
+    def ca_certificates(self) -> list[CertificateInfo]:
+        """List installed CA certificates (GET /system/configs/certificates/ca)."""
+        r = self.request_json("GET", "/system/configs/certificates/ca")
+        certs = r.get("cert", [])
+        if not isinstance(certs, list) or not all(isinstance(x, dict) for x in certs):
+            raise ProtocolError(f"GET /system/configs/certificates/ca: bad cert list: {r!r}")
+        return cast(list[CertificateInfo], list(certs))
+
+    def install_ca_certificate(self, name: str, filename: str, data: bytes) -> None:
+        """Install a CA certificate (POST /system/configs/certificates/ca)."""
+        self.request("POST", "/system/configs/certificates/ca", {
+            "name": name, "filename": filename, "file": base64.b64encode(data).decode()})
+
+    def client_certificates(self) -> list[CertificateInfo]:
+        """List installed client certificates (GET /system/configs/certificates/client)."""
+        r = self.request_json("GET", "/system/configs/certificates/client")
+        certs = r.get("cert", [])
+        if not isinstance(certs, list) or not all(isinstance(x, dict) for x in certs):
+            raise ProtocolError(f"GET /system/configs/certificates/client: bad cert list: {r!r}")
+        return cast(list[CertificateInfo], list(certs))
+
+    def install_client_certificate(self, name: str, filename: str, data: bytes,
+                                   password: str = "") -> None:
+        """Install a client PKCS#12 certificate (POST /system/configs/certificates/client)."""
+        self.request("POST", "/system/configs/certificates/client", {
+            "name": name, "filename": filename,
+            "file": base64.b64encode(data).decode(), "password": password})
+
+    def clear_certificates(self) -> None:
+        """Remove all installed user certificates (DELETE /system/configs/certificates)."""
+        self.request("DELETE", "/system/configs/certificates")
+
+    def document_process(self) -> DocumentProcessStatus:
+        """Status of background document processing (GET /system/status/document_process)."""
+        return cast(DocumentProcessStatus,
+                    self.request_json("GET", "/system/status/document_process"))
+
+    def abort_document_process(self, content_id: str | None = None) -> None:
+        """Abort an active background document process."""
+        qs = ("?" + urlencode({"content_id": content_id})) if content_id is not None else ""
+        self.request("PUT", f"/system/controls/abort_document_process{qs}")
+
+    # --- device controls, diagnostics & firmware update ------------------------
+    def screenshot(self, path: str, *, fmt: str | None = None) -> int:
+        """Save the current screen as PNG or JPEG. Returns its size in bytes.
+        When `fmt` is omitted, '.jpg'/'.jpeg' selects JPEG via screen_shot2;
+        otherwise PNG via screen_shot."""
         _need_dir(path)
+        chosen = fmt.lower() if fmt is not None else (
+            "jpeg" if path.lower().endswith((".jpg", ".jpeg")) else "png")
+        if chosen == "jpg":
+            chosen = "jpeg"
+        if chosen not in ("png", "jpeg"):
+            raise QuadernoError(f"unsupported screenshot format {chosen!r} (use 'png' or 'jpeg')")
+        endpoint = ("/system/controls/screen_shot2?format=jpeg"
+                    if chosen == "jpeg" else "/system/controls/screen_shot")
         with open(path, "wb") as fh:
-            return self.request_stream("GET", "/system/controls/screen_shot", fh,
-                                       headers={"Accept": "*/*"})
+            return self.request_stream("GET", endpoint, fh, headers={"Accept": "*/*"})
+
+    def sleep(self) -> None:
+        """Put the device into sleep/standby (PUT /system/controls/sleep)."""
+        self.request("PUT", "/system/controls/sleep")
+
+    def wake(self) -> None:
+        """Wake/resume the device (PUT /system/controls/run)."""
+        self.request("PUT", "/system/controls/run")
+
+    def reboot(self) -> None:
+        """Reboot the device (PUT /system/controls/reboot)."""
+        self.request("PUT", "/system/controls/reboot")
+
+    def shutdown(self) -> None:
+        """Power off the device (PUT /system/controls/shutdown)."""
+        self.request("PUT", "/system/controls/shutdown")
+
+    def reset_configs(self) -> None:
+        """Reset all system settings to defaults (PUT /system/controls/reset_configs)."""
+        self.request("PUT", "/system/controls/reset_configs")
+
+    def clear_documents(self) -> None:
+        """Delete all documents on the device (PUT /system/controls/clear_documents)."""
+        self.request("PUT", "/system/controls/clear_documents")
+
+    def download_pastlog(self, target: str) -> int:
+        """Download the encrypted diagnostic pastlog archive (GET /system/controls/pastlog)."""
+        _need_dir(target)
+        tmp = target + ".part"
+        try:
+            with open(tmp, "wb") as fh:
+                n = self.download_pastlog_to(fh)
+            os.replace(tmp, target)
+            return n
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    def indicate(self, dialog_params: DialogParameters, *,
+                 show_animation: bool = False) -> CommonValue | None:
+        """Display an on-screen indication/dialog (POST /system/controls/indicate)."""
+        body: IndicationInfo = {
+            "dialog_params": dialog_params,
+            "show_animation": "true" if show_animation else "false",
+        }
+        return cast(CommonValue | None, self.request("POST", "/system/controls/indicate", body))
+
+    def update_indication(self, indication_id: str, dialog_params: DialogParameters, *,
+                          show_animation: bool = False) -> None:
+        """Update an active on-screen indication (PUT /system/controls/indicate/{id})."""
+        body: IndicationInfo = {
+            "dialog_params": dialog_params,
+            "show_animation": "true" if show_animation else "false",
+        }
+        self.request("PUT", f"/system/controls/indicate/{quote(indication_id, safe='')}", body)
+
+    def dismiss_indication(self, indication_id: str) -> None:
+        """Dismiss an active on-screen indication (DELETE /system/controls/indicate/{id})."""
+        self.request("DELETE", f"/system/controls/indicate/{quote(indication_id, safe='')}")
+
+    def transfer_wizard(self, wizard_id_list: Sequence[str],
+                        next_screen: TransferWizardNextScreen | None = None) -> None:
+        """Trigger the on-device transfer wizard (PUT /system/controls/transfer/wizard)."""
+        body: TransferWizardInfo = {"wizard_id_list": list(wizard_id_list)}
+        if next_screen is not None:
+            body["next_screen"] = next_screen
+        self.request("PUT", "/system/controls/transfer/wizard", body)
+
+    def customize_ux(self, payload: JsonObject) -> None:
+        """Apply UX customization JSON (PUT /system/controls/customize_ux)."""
+        self.request("PUT", "/system/controls/customize_ux", payload)
+
+    def customize_setting_ux(self, payload: JsonObject) -> None:
+        """Apply Settings UX customization JSON (PUT /system/controls/customize_setting_ux)."""
+        self.request("PUT", "/system/controls/customize_setting_ux", payload)
+
+    def firmware_precheck(self) -> UpdateFirmwarePrecheck:
+        """Check battery & firmware image readiness (GET /system/controls/update_firmware/precheck)."""
+        return cast(UpdateFirmwarePrecheck,
+                    self.request_json("GET", "/system/controls/update_firmware/precheck"))
+
+    def upload_firmware(self, local: str, on_event: EventHandler | None = None) -> FileUploadResult:
+        """Upload a FwUpdater.pkg image to the device (PUT /system/controls/update_firmware/file)."""
+        res = self.upload_firmware_file(local)
+        emit(on_event, "uploaded", f"uploaded firmware {local}", local)
+        return res
+
+    def start_firmware_update(self) -> None:
+        """Trigger reboot into recovery to flash the uploaded firmware
+        (PUT /system/controls/update_firmware)."""
+        self.request("PUT", "/system/controls/update_firmware")
+
+    def notify_login_result(self, success: bool) -> None:
+        """Notify device of external login result (PUT /notify/login_result)."""
+        self.request("PUT", "/notify/login_result", {"value": "success" if success else "failure"})
+
+    def notify_logout_result(self, success: bool) -> None:
+        """Notify device of external logout result (PUT /notify/logout_result)."""
+        self.request("PUT", "/notify/logout_result", {"value": "success" if success else "failure"})
+
+    def notify_force_assigned(self, value: str) -> None:
+        """Notify device of forced assignment (PUT /notify/force_assigned)."""
+        self.request("PUT", "/notify/force_assigned", {"value": value})
+
+    def install_custom_app(self, local: str, application_id: str, signature: str,
+                           encrypted_key_crypto: str, iv: str) -> None:
+        """Install a signed & encrypted custom app package (POST /custom_apps/install)."""
+        self.upload_custom_app(local, application_id, signature, encrypted_key_crypto, iv)
 
     def sync(self, local: str, remote: str = ROOT, delete: bool = False, dry_run: bool = False,
              force: bool = False, on_event: EventHandler | None = None) -> dict[str, int]:
