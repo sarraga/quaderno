@@ -1,4 +1,4 @@
-# QUADERNO Web API Reference (Firmware `2.2.09.11030FP`, API `2.1`)
+# QUADERNO Web API Reference (API `2.1`)
 
 Reference for the Web API of the Fujitsu QUADERNO Gen 2 / Gen 3C (firmware `2.2.09.11030FP`), mapped to the Python API (`quaderno.Device`, `quaderno.models`) and CLI (`quaderno`).
 
@@ -7,16 +7,16 @@ Reference for the Web API of the Fujitsu QUADERNO Gen 2 / Gen 3C (firmware `2.2.
 - **mDNS / Bonjour**: `_dp_fujitsu._tcp.`, instance prefix `Digital Paper `, port `8080`, hostname `digitalpaper.local`.
 - **JSON style**: All wire keys are `snake_case`, and null fields are left out. Every struct in [`quaderno/models.py`](../quaderno/models.py) describes one request or response body.
 - **Timestamps**: UTC ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
-- **Session cookie (`Credentials`)**: Issued by `PUT /auth`. Expires after **30 minutes idle** (`1,800,000 ms`) or **24 hours total** (`86,400,000 ms`). `quaderno.Client` automatically re-authenticates once on HTTP `401`.
+- **Session cookie (`Credentials`)**: Issued by `PUT /auth`. Expires after **30 minutes idle** or **24 hours total**. `quaderno.Client` automatically re-authenticates once on HTTP `401`.
 - **Binary transfers**: Downloads support HTTP `Range` (`206 Partial Content`); uploads use chunked `multipart/form-data` PUT requests with `offset_bytes` and `total_bytes` until `{"completed": "yes"}`.
 
 | Port | Protocol | Purpose | Access |
 |---:|---|---|---|
-| `8080` | HTTP | Pre-auth & registration | Production builds restrict to `/api_version` and `/register/*`. |
+| `8080` | HTTP | Pre-auth & registration | Restricted to `/api_version` and `/register/*`. |
 | `8443` | HTTPS | Main client API | Self-signed device cert (`digitalpaper.local`); requires `Credentials` cookie except `/auth/*`. |
-| `8444` | HTTPS | Factory testmode (`/testmode/*`) | Requires `testmode` role (`K_pub_DT.der`, `KeyStore_T.pfx`). |
-| `8445` | HTTPS | Enterprise kitting (`/kitting/*`) | Requires `kitting` role (`K_pub_DK.der`, `KeyStore_K.pfx`). |
-| `9090` | HTTPS | SetupTool special mode | Only active in special mode (`KeyStore_S.pfx`), restricted to whitelist paths. |
+| `8444` | HTTPS | Factory testmode (`/testmode/*`) | Requires factory testmode credentials. |
+| `8445` | HTTPS | Enterprise kitting (`/kitting/*`) | Requires enterprise kitting credentials. |
+| `9090` | HTTPS | SetupTool special mode | Only active in setup special mode. |
 
 ---
 
@@ -143,7 +143,7 @@ Reference for the Web API of the Fujitsu QUADERNO Gen 2 / Gen 3C (firmware `2.2.
 | `PUT` | `/notify/{login_result,logout_result,force_assigned}` | `CommonValue -> 204` | `dev.notify_login_result(...)` / `logout_result(...)` / `force_assigned(...)` | — |
 | `POST` | `/custom_apps/install` | `?application_id&signature&encrypted_key_crypto&iv` + multipart `-> 204` | `dev.install_custom_app(...)` | — |
 
-### Abolished Endpoints (`410 Gone` in Firmware `2.2.09.11030FP`)
+### Abolished Endpoints (`410 Gone`)
 
 These routes exist but always return HTTP `410` (`error_code: "41000"`):
 - `GET/PUT /system/configs/current_pen_set`, `GET /system/configs/pen_sets`, `GET/PUT /system/configs/pen_grip_style`
@@ -152,7 +152,7 @@ These routes exist but always return HTTP `410` (`error_code: "41000"`):
 
 ---
 
-## 3. Firmware Error Codes (`ResponseConstants`)
+## 3. Device Error Codes
 
 Errors return `ErrorResult` (`{"error_code": "40007", "message": "..."}`). `quaderno.Client` raises `NotFoundError` (`404`), `LockedError` (`423`), `StorageFullError` (`507`), or `RequestError` (all other 4xx/5xx) with `.status` and `.code`.
 
