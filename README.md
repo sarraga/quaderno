@@ -1,23 +1,26 @@
 # quaderno
 
 A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected to a Mac over USB.
-It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io); its compiled module loads fine under Santa.
+It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io).
 It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
-Tested against: QUADERNO serial 850000312345678, firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2, Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed.
+**New here? Start with the [manual](docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
+
+Tested against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2 and Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed.
 
 ## Install
 
-It's set up the same way as `ytchan`: a pyproject package installed in editable mode into its own `.venv`, so changes to the code take effect immediately.
+You need a Mac (USB discovery uses macOS's I/O Registry), Python 3.11 or newer, and a USB cable that carries data. Install it into its own virtual environment; editable mode means changes to the code take effect immediately:
 
 ```
+git clone https://github.com/sarraga/quaderno.git ~/quaderno
 cd ~/quaderno
-/opt/homebrew/opt/python@3.14/bin/python3.14 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/quaderno --help
 ```
 
-`pip install` also installs `cryptography`. Without the `quaderno` command on your PATH, `.venv/bin/python -m quaderno` works the same. To run plain `quaderno` from anywhere, link it into a folder on your PATH. On this Mac that folder is `~/bin`:
+`pip install` also installs `cryptography`. Without the `quaderno` command on your PATH, `.venv/bin/python -m quaderno` works the same. To run plain `quaderno` from anywhere, link it into a folder that is on your PATH, for example `~/bin`:
 
 ```
 ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
@@ -170,7 +173,7 @@ The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors ex
 - **`open DOC`** shows the document on the device at the page you last read. `open DOC -p N` opens it at page N. The device reports the new page a few seconds later.
 - **`time`** sets the device clock to the Mac's current time. Run it now and then to keep the clock right. The device clock can be set but not read.
 
-  The device's timezone is separate from the clock. Yours is `UTC`, which matches Dublin in winter and is 1 hour behind in summer. `time` prints a note whenever the two differ. It doesn't change the timezone, because the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu) and none of them follows Irish summer time. (`config timezone` can set one of those zones; see below.)
+  The device's timezone is separate from the clock. `time` prints a note whenever the device's timezone and the Mac's give different local times. It doesn't change the timezone itself: the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu), so pick the closest one with `config timezone` (see below).
 
 ## search
 
@@ -294,7 +297,7 @@ If pairing received a certificate it couldn't read, none is stored and connectio
 ## How the connection works
 
 1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*`. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new `enN` interface. The script writes only to a tty whose USB VID/PID match.
-2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For this unit it is `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface macOS created for the device: the I/O Registry lists that interface (e.g. `en8`) and its link status under the USB device. The link status is used only to word an error (missing interface, link down, or no answer), never to skip trying: right after one plug-in it read "not valid" while the device answered. With several QUADERNOs attached, the serial saved at pairing picks the right one.
+2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For example, serial `850000312345678` gives `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface macOS created for the device: the I/O Registry lists that interface (e.g. `en8`) and its link status under the USB device. The link status is used only to word an error (missing interface, link down, or no answer), never to skip trying: right after one plug-in it read "not valid" while the device answered. With several QUADERNOs attached, the serial saved at pairing picks the right one.
 3. **Pairing.** Plain HTTP on port 8080, in five calls:
    - `POST /register/pin`: the device sends nonce `n1`, its MAC and its Diffie-Hellman public value.
    - `POST /register/hash`: both sides compute a shared secret (DH, RFC 3526 2048-bit group). PBKDF2-SHA256 with 10,000 iterations turns it into a 32-byte HMAC key and a 16-byte AES-128-CBC key. The PIN enters as `HMAC(key, pin)`, so each side proves it knows the PIN without sending it.
@@ -360,6 +363,7 @@ quaderno/
   errors.py       the exception hierarchy
   util.py         paths, patterns, time and size formatting
   cli.py          the `quaderno` command: argument parsing and printing only
+docs/MANUAL.md    user manual: what you can do, task by task
 docs/API.md       complete firmware Web API v2.1 endpoint and error code reference
 completions/_quaderno   zsh Tab completion
 tests/                  offline tests (fake device) and manual device checks
@@ -438,3 +442,11 @@ slept. Wake it with its power button, or unplug and re-plug it, then try again.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
 - **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.
+
+## License
+
+Copyright (C) 2026 Santiago Arraga González
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; see [LICENSE](LICENSE) for the full text.
+
+QUADERNO is a trademark of its owner. This project is not affiliated with or endorsed by Fujitsu or Sony.

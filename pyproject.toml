@@ -3,6 +3,8 @@ name = "quaderno"
 dynamic = ["version"]
 description = "Python API and command-line client for the Fujitsu QUADERNO e-paper tablet over USB"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]
 
@@ -12,8 +14,12 @@ test = ["pytest>=8", "mypy>=1.10"]
 [project.scripts]
 quaderno = "quaderno.cli:main"
 
+[project.urls]
+Repository = "https://github.com/sarraga/quaderno"
+Manual = "https://github.com/sarraga/quaderno/blob/main/docs/MANUAL.md"
+
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # 77: SPDX `license` string and `license-files`
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
