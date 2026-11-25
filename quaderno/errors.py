@@ -42,8 +42,8 @@ class DeviceNotFoundError(ConnectError):
 
 class SerialModeError(ConnectError):
     """The device is on USB but stayed in serial mode: it ignored the command that
-    switches it to USB networking. Seen when it is in standby, e.g. after the Mac
-    slept. Waking it (power button) or re-plugging it fixes this."""
+    switches it to USB networking. Seen when it is in standby, e.g. after the
+    computer slept. Waking it (power button) or re-plugging it fixes this."""
 
 
 class DeviceUnreachableError(ConnectError):

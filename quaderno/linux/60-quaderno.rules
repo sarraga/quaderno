@@ -1,0 +1,19 @@
+# udev rules for the QUADERNO: USB vendor 04c5, product 1656 in serial mode and
+# 1657 in USB network mode. `quaderno linux-setup` prints the commands that
+# install this file; unplug and re-plug the device afterwards.
+
+ACTION=="remove", GOTO="quaderno_end"
+
+# Serial mode. Let the user logged in at this computer open the port: the
+# "uaccess" tag works only in a file numbered below 73. Keep ModemManager from
+# probing the port with modem commands, which the device doesn't expect.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="04c5", ATTR{idProduct}=="1656", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04c5", ATTRS{idProduct}=="1656", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
+
+# Network mode. Name the interface quaderno0 (quaderno1, ... for more devices) so
+# that the NetworkManager profile next to this file matches it, and bring it up:
+# without NetworkManager, that is all the kernel needs to give it the IPv6
+# link-local address quaderno connects from.
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="04c5", ATTRS{idProduct}=="1657", NAME="quaderno%n", RUN+="/bin/sh -c 'ip link set dev $name up'"
+
+LABEL="quaderno_end"

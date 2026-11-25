@@ -1,4 +1,4 @@
-"""One-way sync, device -> Mac."""
+"""One-way sync, device -> this computer."""
 
 import json
 import os
@@ -109,7 +109,8 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
         if not e.path.startswith(prefix):
             continue
         rel = "/".join(safe_local_name(p) for p in e.path[len(prefix):].split("/"))
-        key = nfc(rel).casefold()  # macOS volumes are usually case-insensitive
+        key = nfc(rel).casefold()  # macOS volumes are usually case-insensitive; skipping
+                                   # these everywhere keeps a synced tree the same on all systems
         if key in planned:
             stats["conflict"] += 1
             act("clash", "CLASH", f"{rel} (same local name as {planned[key]}; skipped)", e.path)

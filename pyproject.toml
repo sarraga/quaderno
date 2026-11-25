@@ -7,6 +7,10 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]
+classifiers = [  # informational only: pip installs the same wheel everywhere
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "mypy>=1.10"]
@@ -26,7 +30,8 @@ build-backend = "setuptools.build_meta"
 packages = ["quaderno"]
 
 [tool.setuptools.package-data]
-quaderno = ["py.typed"]  # PEP 561: the package ships its own types
+quaderno = ["py.typed",   # PEP 561: the package ships its own types
+            "linux/*"]   # udev rule and NetworkManager profile, for `quaderno linux-setup`
 
 [tool.setuptools.dynamic]
 version = {attr = "quaderno.__version__"}  # the one place the version is set

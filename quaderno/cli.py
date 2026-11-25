@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import os
+import shlex
 import sys
 import time
 from collections.abc import Callable
@@ -367,7 +368,7 @@ def cmd_open(dev: Device, args: Args) -> None:
     print(f"opened {e.path}{where} on the device")
 
 
-def mac_timezone_name() -> str:
+def local_timezone_name() -> str:
     try:
         return os.readlink("/etc/localtime").split("zoneinfo/", 1)[1]
     except (OSError, IndexError):
@@ -378,24 +379,46 @@ def cmd_time(dev: Device, args: Args) -> None:
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     print(f"device clock set to {dev.set_time(now)}")
     tz = dev.timezone()
-    print(f"device timezone {tz}, Mac timezone {mac_timezone_name()}")
+    print(f"device timezone {tz}, local timezone {local_timezone_name()}")
     if tz is None:
         return
     try:
         dev_off = now.astimezone(ZoneInfo(tz)).utcoffset()
     except (ZoneInfoNotFoundError, ValueError):
         return
-    mac_off = now.astimezone().utcoffset()
-    if dev_off is not None and mac_off is not None and dev_off != mac_off:
-        hours = (mac_off - dev_off).total_seconds() / 3600
+    local_off = now.astimezone().utcoffset()
+    if dev_off is not None and local_off is not None and dev_off != local_off:
+        hours = (local_off - dev_off).total_seconds() / 3600
         print(f"note: the device shows {abs(hours):g} h {'behind' if hours > 0 else 'ahead of'} "
-              f"the Mac's local time because its timezone differs; change it with "
+              f"this computer's local time because its timezone differs; change it with "
               f"`quaderno config timezone <zone>` or in the QUADERNO's settings")
 
 
 def cmd_sync(dev: Device, args: Args) -> None:
     dev.sync(args.directory, args.folder, delete=args.delete, dry_run=args.dry_run,
              force=args.force, on_event=show)
+
+
+LINUX_FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "linux")
+
+
+def linux_setup_script() -> str:
+    """A shell script that installs the udev rule and NetworkManager profile
+    shipped in quaderno/linux/ (see the comments in those files)."""
+    rules = shlex.quote(os.path.join(LINUX_FILES, "60-quaderno.rules"))
+    profile = shlex.quote(os.path.join(LINUX_FILES, "quaderno.nmconnection"))
+    return f"""\
+# Sets up Linux for the QUADERNO. Run it with: quaderno linux-setup | sh
+# sudo asks for your password. Unplug and re-plug the QUADERNO afterwards.
+set -e
+sudo install -m 644 {rules} /etc/udev/rules.d/60-quaderno.rules
+sudo udevadm control --reload
+if command -v nmcli >/dev/null; then
+    sudo install -m 600 {profile} /etc/NetworkManager/system-connections/quaderno.nmconnection
+    sudo nmcli connection reload
+fi
+echo "done: unplug the QUADERNO and plug it back in"
+"""
 
 
 def cmd_pair(args: Args) -> None:
@@ -652,8 +675,10 @@ def build_parser() -> argparse.ArgumentParser:
     cp = csub.add_parser("clear", help="remove all installed certificates")
     cp.add_argument("-y", "--yes", action="store_true", help="confirm certificate wipe")
 
-    add("time", cmd_time, "set the device clock from the Mac")
+    add("time", cmd_time, "set the device clock to this computer's time")
     add("addr", None, "print the device address (switches USB mode if needed)")
+    add("linux-setup", None, "print a script that sets up Linux for the device (udev rule, "
+                             "NetworkManager profile); run it with `quaderno linux-setup | sh`")
 
     p = add("pair", None, "pair with the device using the PIN on its screen")
     p.add_argument("--force", action="store_true",
@@ -690,6 +715,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "pair":
             cmd_pair(args)
+            return 0
+        if args.cmd == "linux-setup":
+            print(linux_setup_script(), end="")
             return 0
         if args.cmd == "addr":
             try:

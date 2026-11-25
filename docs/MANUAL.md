@@ -17,7 +17,7 @@ For every option and the technical details, see the [README](../README.md). For 
 
 ## What this is
 
-The Fujitsu QUADERNO is an e-paper tablet for reading PDFs and writing notes by hand with a pen. Fujitsu's own way to move files on and off it is a desktop app. `quaderno` is an independent alternative: a command you type in the Mac's Terminal, with a Python library underneath, that talks to the tablet directly over the USB cable.
+The Fujitsu QUADERNO is an e-paper tablet for reading PDFs and writing notes by hand with a pen. Fujitsu's own way to move files on and off it is a desktop app. `quaderno` is an independent alternative: a command you type in a terminal on your Mac or Linux computer, with a Python library underneath, that talks to the tablet directly over the USB cable.
 
 Why use it instead of the app?
 
@@ -29,7 +29,7 @@ Why use it instead of the app?
 What you need:
 
 - **A QUADERNO.** It was built and tested on the A4 model (FMV-DP41). Other models are untested.
-- **A Mac.** Finding the tablet on USB relies on macOS.
+- **A Mac or a Linux computer.** Linux needs one extra setup step, described under [Install it](#install-it).
 - **Python 3.11 or newer.**
 - **A USB cable that carries data.** Some cables only charge; with those the tablet never shows up.
 
@@ -37,7 +37,7 @@ You don't need Fujitsu's app. If you already use it, both can be used side by si
 
 ## Install it
 
-In Terminal:
+In a terminal (on a Mac, the Terminal app):
 
 ```
 git clone https://github.com/sarraga/quaderno.git ~/quaderno
@@ -52,6 +52,15 @@ To type plain `quaderno` from any folder, link it into a folder that's on your P
 ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
 ```
 
+**On Linux, one more step.** Linux doesn't let ordinary users open the tablet's USB connection, and its network manager can drop the link the tablet uses. `quaderno linux-setup` prints a short script that fixes both. Read it, then run it; it asks for your password:
+
+```
+quaderno linux-setup         # show what it will do
+quaderno linux-setup | sh    # do it
+```
+
+Then unplug the tablet and plug it back in. You do this once per computer.
+
 The README also explains how to turn on Tab completion, which completes the names of files on the tablet as you type.
 
 ## First steps
@@ -60,9 +69,9 @@ You do this once, and it takes about five minutes.
 
 ### 1. Plug in and wake the tablet
 
-Connect the tablet to the Mac, press its power button to wake it, and unlock it if it's locked. Commands only work while the tablet is awake.
+Connect the tablet to your computer, press its power button to wake it, and unlock it if it's locked. Commands only work while the tablet is awake.
 
-The first command after plugging in takes a few seconds longer than usual: `quaderno` switches the tablet's USB connection from a serial port into a small network link between the Mac and the tablet. That happens automatically.
+The first command after plugging in takes a few seconds longer than usual: `quaderno` switches the tablet's USB connection from a serial port into a small network link between your computer and the tablet. That happens automatically.
 
 ### 2. Pair
 
@@ -72,7 +81,7 @@ quaderno pair
 
 The tablet shows a PIN on its screen. Type it at the prompt within about two minutes.
 
-Pairing is like pairing Bluetooth headphones: it creates a key on your Mac and registers it with the tablet, so from now on the tablet recognizes your Mac. The key is stored in `~/.config/quaderno/`. If Fujitsu's app was paired before, it keeps working.
+Pairing is like pairing Bluetooth headphones: it creates a key on your computer and registers it with the tablet, so from now on the tablet recognizes your computer. The key is stored in `~/.config/quaderno/`. If Fujitsu's app was paired before, it keeps working.
 
 ### 3. Check that it works
 
@@ -103,8 +112,8 @@ You're ready.
   - **Documents** are PDFs you put on the tablet: papers, books, manuals.
   - **Notebooks** are created on the tablet from a *template* (lined, squared, blank…) and filled in by hand. They're PDFs too.
 - **Your handwriting is saved with the file.** Notes and highlights you write on a page are part of that document, so when you download it, the handwriting comes along.
-- **Names with spaces need quotes** in Terminal: `"Books/My Paper.pdf"`.
-- **Patterns save typing.** `'Books/*rust*'` matches every name in `Books` containing "rust", ignoring letter case. Always put patterns in single quotes so the Mac's shell doesn't try to expand them itself.
+- **Names with spaces need quotes** in the terminal: `"Books/My Paper.pdf"`.
+- **Patterns save typing.** `'Books/*rust*'` matches every name in `Books` containing "rust", ignoring letter case. Always put patterns in single quotes so your shell doesn't try to expand them itself.
 
 ## Everyday tasks
 
@@ -140,7 +149,7 @@ quaderno marks                      # the marks the tablet knows, e.g. star and 
 quaderno search star -t mark        # every document where you drew a star
 ```
 
-### Back up your notes to the Mac
+### Back up your notes to your computer
 
 A one-off copy of a whole folder:
 
@@ -149,7 +158,7 @@ quaderno get -r Note -o ~/Backup          # creates ~/Backup/Note/...
 quaderno get "Note/Meeting Notes_20260105.pdf" -o ~/Downloads
 ```
 
-**For regular backups, use `sync`.** It keeps a folder on your Mac as a mirror of a folder on the tablet:
+**For regular backups, use `sync`.** It keeps a folder on your computer as a mirror of a folder on the tablet:
 
 ```
 quaderno sync ~/QUADERNO              # the whole tablet
@@ -161,10 +170,10 @@ What makes `sync` safe to run as often as you like:
 
 - **It only downloads what changed.** New and edited documents (including new handwriting) are downloaded; everything else is left alone.
 - **It follows moves and renames** on the tablet without downloading the file again.
-- **It never overwrites your own changes.** A file you edited on the Mac is kept and reported as `KEEP`.
-- **It doesn't delete by itself.** Something deleted on the tablet stays on the Mac and is reported as `gone`. Add `--delete` if you want those removed too.
+- **It never overwrites your own changes.** A file you edited on your computer is kept and reported as `KEEP`.
+- **It doesn't delete by itself.** Something deleted on the tablet stays on your computer and is reported as `gone`. Add `--delete` if you want those removed too.
 
-Copying only works in one direction, from the tablet to the Mac.
+Copying only works in one direction, from the tablet to your computer.
 
 ### Send papers and books to the tablet
 
@@ -194,10 +203,10 @@ quaderno rm -r Books/Old                         # delete a folder with everythi
 
 - **`mv` and `cp` check everything first.** If any destination name is already taken, nothing moves or is copied at all.
 - **Moving or copying into a folder needs the folder to exist.** With a single source and a destination that doesn't exist, `mv` and `cp` treat the destination as a new name instead.
-- **`cp` doesn't go through the Mac,** so copying even a large book is quick. Only documents can be copied, not folders.
+- **`cp` doesn't go through your computer,** so copying even a large book is quick. Only documents can be copied, not folders.
 - **Be careful with `rm`.** With a pattern it shows the matches and asks before deleting. With an exact name, it deletes straight away. A folder is only deleted if it's empty, unless you add `-r`.
 
-### Open something on the tablet from your Mac
+### Open something on the tablet from your computer
 
 ```
 quaderno open 'Books/*algorithm*'          # opens it where you last stopped reading
@@ -209,7 +218,7 @@ quaderno screenshot screen.jpg             # or as a JPEG
 
 `open` needs a name or pattern that matches exactly one document; if several match, it lists them so you can be more specific.
 
-### Update a PDF you changed on the Mac
+### Update a PDF you changed on your computer
 
 If you've edited a PDF that's already on the tablet, `replace` swaps in the new file while keeping the same entry on the tablet:
 
@@ -228,11 +237,11 @@ quaderno config                          # list all settings
 quaderno config owner "Your Name"        # set the owner name
 quaderno config timeout_to_standby       # read one setting
 quaderno config time_format 24hour
-quaderno time                            # set the tablet's clock from the Mac
+quaderno time                            # set the tablet's clock to your computer's time
 ```
 
 - **Use the values the tablet's own settings menu offers;** it rejects anything else.
-- **The timezone is separate from the clock.** The tablet only offers 11 zones (UTC, Amsterdam, Helsinki, six US zones, Tokyo, Honolulu); set the closest with `config timezone`. `time` tells you when the tablet's local time won't match the Mac's.
+- **The timezone is separate from the clock.** The tablet only offers 11 zones (UTC, Amsterdam, Helsinki, six US zones, Tokyo, Honolulu); set the closest with `config timezone`. `time` tells you when the tablet's local time won't match your computer's.
 
 **Note templates** are the page designs you choose from when you create a notebook. You can add your own, made as a PDF:
 
@@ -321,12 +330,14 @@ The README's Python API section covers the rest.
 | Message | What to do |
 |---|---|
 | `no QUADERNO on USB` | Check the cable carries data, not only power, and that the tablet is on. |
-| `stayed in USB serial mode` | The tablet was asleep, often after the Mac slept. Wake it with its power button, or unplug and re-plug it. |
+| `stayed in USB serial mode` | The tablet was asleep, often after the computer slept. Wake it with its power button, or unplug and re-plug it. |
 | `link is up, but it doesn't answer` | Wake or unlock the tablet. |
 | `not paired` | Pair first: `quaderno pair`. |
-| `the device rejected this client` | The tablet forgot your Mac. Pair again with `quaderno pair --force`. |
+| `the device rejected this client` | The tablet forgot your computer. Pair again with `quaderno pair --force`. |
 | `device TLS certificate differs` | Normal after a firmware update: run `quaderno pair --force`. |
 | `pairing failed: wrong PIN` | Run `pair` again; the tablet shows a new PIN each time. |
+| `no permission to open /dev/ttyACM0` | Linux only: do the Linux step under [Install it](#install-it), then unplug and re-plug the tablet. |
+| `that interface is down`, or `no IPv6 link-local address` | Linux only: the same Linux step. |
 | `isn't the one these credentials were paired with` | A different QUADERNO is plugged in. Plug in yours, or pair this one too (see the README's `--config` option). |
 
 The README's Troubleshooting section has the full list.
@@ -335,14 +346,14 @@ The README's Troubleshooting section has the full list.
 
 | Command | What it does | Changes the tablet? |
 |---|---|---|
-| `pair` | Pair this Mac with the tablet (once) | Registers your Mac |
+| `pair` | Pair this computer with the tablet (once) | Registers your computer |
 | `ping` | Check the connection | No |
 | `info` | Firmware, storage, battery, owner | No |
 | `ls` | List folders and documents | No |
 | `search` | Find documents by name, text or hand-drawn mark | No |
 | `marks` | List the marks the tablet recognizes | No |
 | `get` | Download documents or folders | No |
-| `sync` | Keep a Mac folder mirroring a tablet folder | No |
+| `sync` | Keep a local folder mirroring a tablet folder | No |
 | `put` | Upload PDFs or folders | Adds files |
 | `mkdir` | Create folders | Yes |
 | `mv` | Move or rename | Yes |
@@ -353,7 +364,7 @@ The README's Troubleshooting section has the full list.
 | `viewing` | What's on the screen now | No |
 | `screenshot` | Save the screen as an image | No |
 | `config` | Show or change settings | When you give a value |
-| `time` | Set the tablet's clock from the Mac | Yes |
+| `time` | Set the tablet's clock to your computer's time | Yes |
 | `templates` | List, add, rename or delete note templates | Except `ls` |
 | `pen-buttons` | Show or set what the pen buttons do | Only `set` |
 | `wifi` | Wi-Fi status, networks and settings | Except `status`, `scan`, `ls` |
@@ -363,6 +374,7 @@ The README's Troubleshooting section has the full list.
 | `annotations` | Download one page's raw handwriting data | No |
 | `pastlog` | Download the encrypted diagnostic log | No |
 | `addr` | Print the tablet's network address | No |
+| `linux-setup` | Print the one-time Linux setup script | No |
 
 Run `quaderno COMMAND --help` for every option of a command.
 
@@ -373,5 +385,5 @@ Run `quaderno COMMAND --help` for every option of a command.
 - **Template:** a page design (lines, squares, planner…) a notebook is created from.
 - **Annotation:** handwriting or highlighting on a page.
 - **Mark:** a symbol the tablet recognizes when you draw it, such as a star, so you can find those pages later with `search -t mark`.
-- **Pairing:** the one-time step that lets the tablet recognize your Mac.
+- **Pairing:** the one-time step that lets the tablet recognize your computer.
 - **Revision:** a tag the tablet changes every time a document's file changes, including when you write on it. `sync` uses it to know what to download.

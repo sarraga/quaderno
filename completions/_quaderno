@@ -48,7 +48,7 @@ _quaderno() {
     'mkdir:create folders'
     'mv:move or rename documents/folders'
     'rm:delete documents or folders'
-    'sync:mirror a device folder to the Mac'
+    'sync:mirror a device folder to this computer'
     'open:open a document on the device screen'
     'search:find documents by name, text, or mark'
     'cp:copy documents on the device'
@@ -65,11 +65,12 @@ _quaderno() {
     'certs:manage CA and client certificates'
     'pastlog:download diagnostic pastlog archive'
     'config:show or change device settings'
-    'time:set the device clock from the Mac'
+    "time:set the device clock to this computer's time"
     'info:firmware, storage, battery'
     'screenshot:save the device screen as PNG or JPEG'
     'addr:print the device address'
     'pair:pair with the device (PIN on its screen)'
+    'linux-setup:print a script that sets up Linux for the device'
   )
   regex=('(-E --regex)'{-E,--regex}'[remote paths are regular expressions]')
 
@@ -177,7 +178,7 @@ _quaderno() {
         pair)
           _arguments '--force[replace an existing pairing]' \
             '--pin-file[read the PIN from this file]:file:_files' && ret=0 ;;
-        time|addr) ret=0 ;;
+        time|addr|linux-setup) ret=0 ;;
       esac ;;
   esac
   return ret

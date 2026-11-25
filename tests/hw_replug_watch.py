@@ -37,7 +37,7 @@ for _ in range(20):  # give the tty node a moment to appear
         break
     time.sleep(0.25)
 log("enumerated as", [(hex(d.pid), d.serial, d.tty or d.iface) for d in devs])
-log("/dev/cu.*:", glob.glob("/dev/cu.*"))
+log("serial ports:", glob.glob("/dev/cu.*") + glob.glob("/dev/ttyACM*"))  # macOS, Linux
 cmd = ["__complete", "Bo"] if "--tab" in sys.argv else ["-v", "ls"]
 log("running: quaderno", *cmd)
 t1 = time.time()

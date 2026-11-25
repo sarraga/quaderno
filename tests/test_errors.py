@@ -2,9 +2,11 @@
 USB bus and clock), HTTP errors, dropped connections, login rejection, malformed
 answers (not JSON: error; unreadable date or size: warning), local file errors,
 CLI exit codes."""
+import grp
 import http.client
 import json
 import plistlib
+import shlex
 import subprocess
 import time
 import types
@@ -18,7 +20,7 @@ from fakedevice import FakeDevice, expect
 import quaderno
 from quaderno import cli, client, credentials, crypto, pairing, sync, usb
 from quaderno.entry import Entry
-from quaderno.usb import PID_ETHERNET, PID_SERIAL, RegistryNode, UsbDevice
+from quaderno.usb import PID_ETHERNET, PID_SERIAL, VID, RegistryNode, UsbDevice
 from quaderno.util import parse_device_time
 
 KEY = crypto.load_private_key(crypto.generate_keypair()[0])
@@ -136,6 +138,27 @@ def test_discover_does_not_trust_the_registry_link_status(on_bus: OnBus) -> None
     assert on_bus(FakeBus("ethernet", link=False)) == "fe80::c8d3:84ff:fec2:323b%en8"
 
 
+class LockedPortBus(FakeBus):
+    """A device in serial mode whose port this user may not open."""
+    def switch_to_ethernet(self, tty: str) -> None:
+        raise PermissionError(13, "Permission denied", tty)
+
+
+def test_discover_says_when_the_serial_port_may_not_be_opened(on_bus: OnBus) -> None:
+    with pytest.raises(quaderno.ConnectError) as e:
+        on_bus(LockedPortBus("serial"))
+    assert not isinstance(e.value, quaderno.SerialModeError)    # not taken for standby
+    assert "no permission to open /dev/cu.usbmodemFAKE" in str(e.value)
+    assert "quaderno linux-setup" in str(e.value) and "the group that owns it" in str(e.value)
+
+
+def test_no_permission_names_the_ports_group(tmp_path: Path) -> None:
+    port = tmp_path / "ttyACM0"
+    port.touch()
+    group = grp.getgrgid(port.stat().st_gid).gr_name
+    assert f"add yourself to the {group} group" in usb._no_permission(str(port))
+
+
 def test_discover_unplugged_while_waiting(on_bus: OnBus) -> None:
     with pytest.raises(quaderno.DeviceNotFoundError, match="disconnected"):
         on_bus(FakeBus("ethernet", answers=False, unplug_after=1))
@@ -199,18 +222,17 @@ def ioreg(monkeypatch: pytest.MonkeyPatch) -> UseIoreg:
 
 
 @pytest.mark.parametrize("status,link", [(3, True), (1, False), (0, None)])
-def test_usb_devices_reads_interface_and_link(ioreg: UseIoreg, status: int,
-                                              link: bool | None) -> None:
+def test_ioreg_reads_interface_and_link(ioreg: UseIoreg, status: int, link: bool | None) -> None:
     ioreg([{"idVendor": 0x05AC, "idProduct": 1},             # someone else's device
            ioreg_device(PID_ETHERNET, "111", iface="en8", link=status),
            ioreg_device(PID_SERIAL, "222", tty="/dev/cu.usbmodem101")])
-    assert usb.usb_devices() == [UsbDevice(PID_ETHERNET, "111", None, "en8", link),
-                                 UsbDevice(PID_SERIAL, "222", "/dev/cu.usbmodem101")]
+    assert usb._ioreg_devices() == [UsbDevice(PID_ETHERNET, "111", None, "en8", link),
+                                    UsbDevice(PID_SERIAL, "222", "/dev/cu.usbmodem101")]
 
 
-def test_usb_devices_with_nothing_attached(ioreg: UseIoreg) -> None:
+def test_ioreg_with_nothing_attached(ioreg: UseIoreg) -> None:
     ioreg([])
-    assert usb.usb_devices() == []
+    assert usb._ioreg_devices() == []
 
 
 def test_ioreg_failure_is_not_taken_for_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,7 +240,98 @@ def test_ioreg_failure_is_not_taken_for_no_device(monkeypatch: pytest.MonkeyPatc
         raise subprocess.TimeoutExpired("ioreg", 15)
     monkeypatch.setattr(subprocess, "run", fail)
     with pytest.raises(quaderno.ConnectError, match="couldn't read the list of USB devices"):
+        usb._ioreg_devices()
+
+
+# --- reading Linux's sysfs -------------------------------------------------------------
+
+@pytest.fixture
+def sysfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Linux, with an empty fake sysfs (returned) and procfs (next to it, as 'proc')."""
+    monkeypatch.setattr(usb, "PLATFORM", "linux")
+    monkeypatch.setattr(usb, "SYSFS", str(tmp_path / "sys"))
+    monkeypatch.setattr(usb, "PROC", str(tmp_path / "proc"))
+    (tmp_path / "sys" / "bus" / "usb" / "devices").mkdir(parents=True)
+    return tmp_path / "sys"
+
+
+def sysfs_device(sys_dir: Path, name: str, vid: int, pid: int, serial: str | None = None, *,
+                 tty: str = "", iface: str = "", carrier: str | None = None) -> None:
+    """A USB device with one interface under a fake sysfs, laid out as Linux 6 does it:
+    bus/usb/devices/<dev>/<dev>:1.0/{tty,net}/<name>, and class/net/<name>/carrier."""
+    devices = sys_dir / "bus" / "usb" / "devices"
+    dev = devices / name
+    intf = dev / f"{name}:1.0"
+    intf.mkdir(parents=True)
+    (devices / intf.name).symlink_to(intf)                    # interfaces are listed too
+    (dev / "idVendor").write_text(f"{vid:04x}\n")
+    (dev / "idProduct").write_text(f"{pid:04x}\n")
+    if serial is not None:
+        (dev / "serial").write_text(serial + "\n")
+    if tty:
+        (intf / "tty" / tty).mkdir(parents=True)
+    if iface:
+        (intf / "net" / iface).mkdir(parents=True)
+        (sys_dir / "class" / "net" / iface).mkdir(parents=True)
+        if carrier is not None:                               # unreadable while it's down
+            (sys_dir / "class" / "net" / iface / "carrier").write_text(carrier + "\n")
+
+
+@pytest.mark.parametrize("carrier,link", [("1", True), ("0", False), (None, None)])
+def test_sysfs_reads_tty_interface_and_link(sysfs: Path, carrier: str | None,
+                                            link: bool | None) -> None:
+    sysfs_device(sysfs, "usb1", 0x1D6B, 0x0003)                         # a root hub
+    sysfs_device(sysfs, "1-1", 0x05AC, 0x0001, "x", tty="ttyACM0")      # someone else's device
+    sysfs_device(sysfs, "1-2", VID, PID_ETHERNET, "111", iface="quaderno0", carrier=carrier)
+    sysfs_device(sysfs, "3-1.4", VID, PID_SERIAL, "222", tty="ttyACM1")
+    sysfs_device(sysfs, "3-2", VID, PID_SERIAL)                         # no serial, no tty yet
+    assert usb.usb_devices() == [UsbDevice(PID_ETHERNET, "111", None, "quaderno0", link),
+                                 UsbDevice(PID_SERIAL, "222", "/dev/ttyACM1"),
+                                 UsbDevice(PID_SERIAL, None)]
+
+
+def test_sysfs_with_nothing_attached(sysfs: Path) -> None:
+    assert usb.usb_devices() == []
+
+
+def test_sysfs_missing_is_not_taken_for_no_device(sysfs: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(usb, "SYSFS", str(sysfs / "nowhere"))
+    with pytest.raises(quaderno.ConnectError, match="couldn't read the list of USB devices"):
         usb.usb_devices()
+
+
+def test_usb_devices_on_another_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(usb, "PLATFORM", "win32")
+    with pytest.raises(quaderno.ConnectError, match="isn't supported on win32: give its address"):
+        usb.usb_devices()
+
+
+LL = "fe80000000000000a8c3fffffe123456"  # /proc/net/if_inet6 writes addresses without colons
+
+
+@pytest.mark.parametrize("flags,ipv6_off,inet6,message", [
+    ("0x1002", False, f"{LL} 05 40 20 80 quaderno0", "but that interface is down"),
+    ("0x1003", True, "", "but IPv6 is turned off on that interface"),
+    ("0x1003", False, f"{LL} 02 40 20 80 eth0", "but that interface has no IPv6 link-local"),
+    ("0x1003", False, f"{LL} 05 40 20 80 quaderno0", "its link is up, but it doesn't answer"),
+])
+def test_discover_on_linux_says_what_is_wrong_with_the_interface(
+        on_bus: OnBus, sysfs: Path, flags: str, ipv6_off: bool, inet6: str, message: str) -> None:
+    net = sysfs / "class" / "net" / "quaderno0"
+    net.mkdir(parents=True)
+    (net / "flags").write_text(flags + "\n")
+    proc = sysfs.parent / "proc"
+    (proc / "sys" / "net" / "ipv6" / "conf" / "quaderno0").mkdir(parents=True)
+    (proc / "sys" / "net" / "ipv6" / "conf" / "quaderno0" / "disable_ipv6").write_text(
+        "1\n" if ipv6_off else "0\n")
+    (proc / "net").mkdir()
+    (proc / "net" / "if_inet6").write_text(f"00000000000000000000000000000001 01 80 10 80 lo\n"
+                                           f"{inet6}\n")
+    with pytest.raises(quaderno.DeviceUnreachableError) as e:
+        on_bus(FakeBus("ethernet", iface="quaderno0", answers=False))
+    assert message in str(e.value), str(e.value)
+    assert ("linux-setup" in str(e.value)) == ("doesn't answer" not in message)
 
 
 # --- HTTP client ------------------------------------------------------------------
@@ -499,6 +612,18 @@ def test_completion_uses_the_command_lines_config_and_addr(
     assert seen["config_dir"] == want
     assert ("usb" in seen) == (addr is None)                   # --addr skips USB discovery
     assert capsys.readouterr() == ("", "")                     # silent on errors
+
+
+# --- Linux setup --------------------------------------------------------------------
+
+def test_linux_setup_prints_a_script_that_installs_the_packaged_files(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["linux-setup"]) == 0
+    script = capsys.readouterr().out
+    installs = [shlex.split(line.strip()) for line in script.splitlines() if " install -m " in line]
+    assert [Path(w[4]).name for w in installs] == ["60-quaderno.rules", "quaderno.nmconnection"]
+    assert all(Path(w[4]).is_file() for w in installs)
+    assert subprocess.run(["sh", "-n"], input=script, text=True).returncode == 0
 
 
 # --- TLS without a pinned certificate ------------------------------------------------

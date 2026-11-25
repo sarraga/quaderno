@@ -1,0 +1,24 @@
+# NetworkManager profile for the QUADERNO's USB network interface, which the
+# udev rule next to this file names quaderno0. The profile NetworkManager makes
+# by default for a new wired interface waits for DHCP and router advertisements,
+# which the device doesn't send, and can drop the connection when they time out.
+# This one gives the interface only an IPv6 link-local address, which is all
+# quaderno needs. `quaderno linux-setup` prints the commands that install it.
+
+[connection]
+id=QUADERNO
+uuid=ed8eaa73-2871-4799-a858-f09884781a5e
+type=ethernet
+autoconnect=true
+autoconnect-priority=10
+
+[match]
+interface-name=quaderno*
+
+[ethernet]
+
+[ipv4]
+method=disabled
+
+[ipv6]
+method=link-local

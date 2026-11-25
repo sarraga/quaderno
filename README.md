@@ -1,16 +1,16 @@
 # quaderno
 
-A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected to a Mac over USB.
+A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected over USB to a Mac or a Linux computer.
 It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io).
 It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
 **New here? Start with the [manual](docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
 
-Tested against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2 and Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed.
+Tested against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2 and Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed. Linux support is newer and hasn't been tried with the device yet. The code differs between the two systems only in how it finds the device on USB, and the offline tests check the Linux side against a simulated sysfs.
 
 ## Install
 
-You need a Mac (USB discovery uses macOS's I/O Registry), Python 3.11 or newer, and a USB cable that carries data. Install it into its own virtual environment; editable mode means changes to the code take effect immediately:
+You need macOS or Linux, Python 3.11 or newer, and a USB cable that carries data. Linux also needs the one-time [Linux setup](#linux-setup) below. Install it into its own virtual environment; editable mode means changes to the code take effect immediately:
 
 ```
 git clone https://github.com/sarraga/quaderno.git ~/quaderno
@@ -24,6 +24,27 @@ python3 -m venv .venv
 
 ```
 ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
+```
+
+### Linux setup
+
+Linux needs a one-time setup that `pip` can't do, because it needs root:
+
+- **The serial port.** The device first appears as `/dev/ttyACM0`, which only root and the `dialout` group (`uucp` on Arch) may open. A udev rule lets the user logged in at the computer open it, and keeps ModemManager from probing it, which could get in the way of the switch to USB networking.
+- **The network interface.** The same rule names the device's interface `quaderno0` and brings it up, which is all the kernel needs to give it the IPv6 link-local address `quaderno` uses.
+- **NetworkManager**, if you use it. Its default profile for a new wired interface waits for DHCP and router advertisements, which the device doesn't send, and can drop the connection when they time out. A profile that matches `quaderno*` gives the interface only a link-local address.
+
+Both files ship with the package, in [`quaderno/linux/`](quaderno/linux). `quaderno linux-setup` prints a script that installs them. Read it, then run it; `sudo` asks for your password:
+
+```
+quaderno linux-setup
+quaderno linux-setup | sh
+```
+
+Then unplug the QUADERNO and plug it back in. The rule's access grant (`uaccess`) applies only to whoever is logged in at the computer itself. Over SSH, add yourself to the group that owns the port instead, then log in again:
+
+```
+sudo usermod -aG dialout $USER
 ```
 
 ### Tab completion (zsh)
@@ -52,7 +73,7 @@ fpath=(~/quaderno/completions $fpath)
 autoload -Uz compinit && compinit
 ```
 
-`compinit` turns on zsh's completion system for every command, not just this one. If your `~/.zshrc` already runs it, add only the `fpath` line, above it.
+`compinit` turns on zsh's completion system for every command, not just this one. If your `~/.zshrc` already runs it, add only the `fpath` line, above it. This works the same with zsh on Linux; there is no bash completion.
 
 ## Usage
 
@@ -64,7 +85,7 @@ quaderno put LOCAL... [-d DEST] [-r]    upload PDFs; -r for local directories
 quaderno mkdir REMOTE... [-p]           create folders; -p creates parents, ok if exists
 quaderno mv SRC... DST                  move/rename; several sources -> into folder DST
 quaderno rm REMOTE... [-r] [-y]         delete documents / empty folders; -r with contents
-quaderno sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder to the Mac (incremental)
+quaderno sync LOCAL [REMOTE] [--delete] [-n]  mirror a device folder here (incremental)
 quaderno open DOC [-p PAGE]             open a document on the device's screen
 quaderno search KEYWORD [-t TARGET] [-f DIR]  find documents by name, text, or annotation mark
 quaderno cp SRC... DST                  copy documents on the device; several -> into folder DST
@@ -81,10 +102,11 @@ quaderno pen-buttons {ls,set}           show or assign pen button functions
 quaderno certs {ls,add-ca,add-client,clear}   manage CA and client certificates
 quaderno pastlog [OUT]                  download encrypted diagnostic pastlog archive
 quaderno config [--all] [KEY [VALUE]]   show device settings, or change one
-quaderno time                           set the device clock from the Mac
+quaderno time                           set the device clock to this computer's time
 quaderno info [--json]                  firmware, storage, battery, MAC, owner, Wi-Fi
 quaderno screenshot [OUT] [--format F]  PNG or JPEG of the current screen
 quaderno addr                           print the device address (switches USB mode if needed)
+quaderno linux-setup                    print the one-time Linux setup script (see Linux setup)
 ```
 
 Global options:
@@ -112,7 +134,7 @@ quaderno rm -r Books/Old
 
 ### Patterns
 
-`ls`, `get`, `mv`, `cp`, `rm` and `open` accept patterns in remote paths, so you don't have to type long names. **Quote patterns** so your shell doesn't try to expand them against files on the Mac (zsh fails with `no matches found`).
+`ls`, `get`, `mv`, `cp`, `rm` and `open` accept patterns in remote paths, so you don't have to type long names. **Quote patterns** so your shell doesn't try to expand them against local files (zsh fails with `no matches found`).
 
 ```
 quaderno ls 'fighter*'                    # glob: * ? [abc]; letter case is ignored
@@ -146,7 +168,7 @@ How the commands behave:
 - **`rm` on a folder only deletes it when it's empty.** `rm -r` deletes the documents first, then the folders from the deepest up. On the device, `DELETE /folders/{id}` rejects non-empty folders with HTTP 400 (`40018`) unless `{"force_delete_flag": "true"}` is sent; deleting individually gives per-file progress events. It refuses to delete or move the root folder.
 - **`get -r` keeps the folder layout.** Partial downloads are written to `*.part` and renamed when complete.
 
-## Sync (device → Mac)
+## Sync (device → computer)
 
 ```
 quaderno sync ~/QUADERNO                # whole device
@@ -155,14 +177,14 @@ quaderno sync -n ~/QUADERNO             # dry run: show what would happen
 quaderno sync --delete ~/QUADERNO       # also remove local copies of documents deleted on the device
 ```
 
-`sync` copies one way, from the device to the Mac. Each run downloads only documents that are new or changed. It decides by the device's `file_revision`, which changes whenever a document is edited, including handwriting added on the device. Opening or reading a document doesn't change it.
+`sync` copies one way, from the device to this computer. Each run downloads only documents that are new or changed. It decides by the device's `file_revision`, which changes whenever a document is edited, including handwriting added on the device. Opening or reading a document doesn't change it.
 
 What each run does:
 - **New or edited on the device:** downloaded. The local file's date is set to the device's modification date.
 - **Moved or renamed on the device:** the local file is moved too, without downloading it again.
 - **Deleted on the device:** the local copy is kept and reported as `gone`. It is removed only with `--delete`, and empty folders left behind are removed too.
 - **Missing locally:** downloaded again.
-- **Name clash:** two device names that differ only in letter case would land on the same file on a case-insensitive Mac volume. The second one is skipped and reported as `CLASH`.
+- **Name clash:** two device names that differ only in letter case would land on the same file on a case-insensitive volume, as macOS volumes usually are. The second one is skipped and reported as `CLASH`. Linux does the same, so a synced folder has the same contents on either system.
 
 **Local files are never overwritten.** `sync` only replaces, moves or deletes a file that is exactly as the last sync left it, checked by size and date. A file you edited, or one that wasn't created by sync, is kept and reported as `KEEP`.
 
@@ -171,9 +193,9 @@ The state is stored in `LOCAL/.quaderno-sync.json`. Each local folder mirrors ex
 ## open and time
 
 - **`open DOC`** shows the document on the device at the page you last read. `open DOC -p N` opens it at page N. The device reports the new page a few seconds later.
-- **`time`** sets the device clock to the Mac's current time. Run it now and then to keep the clock right. The device clock can be set but not read.
+- **`time`** sets the device clock to this computer's current time. Run it now and then to keep the clock right. The device clock can be set but not read.
 
-  The device's timezone is separate from the clock. `time` prints a note whenever the device's timezone and the Mac's give different local times. It doesn't change the timezone itself: the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu), so pick the closest one with `config timezone` (see below).
+  The device's timezone is separate from the clock. `time` prints a note whenever the device's timezone and this computer's give different local times. It doesn't change the timezone itself: the device offers only 11 zones (UTC, Amsterdam, Helsinki, 6 US zones, Tokyo, Honolulu), so pick the closest one with `config timezone` (see below).
 
 ## search
 
@@ -296,8 +318,8 @@ If pairing received a certificate it couldn't read, none is stored and connectio
 
 ## How the connection works
 
-1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*`. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new `enN` interface. The script writes only to a tty whose USB VID/PID match.
-2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For example, serial `850000312345678` gives `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface macOS created for the device: the I/O Registry lists that interface (e.g. `en8`) and its link status under the USB device. The link status is used only to word an error (missing interface, link down, or no answer), never to skip trying: right after one plug-in it read "not valid" while the device answered. With several QUADERNOs attached, the serial saved at pairing picks the right one.
+1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*` on macOS and `/dev/ttyACM*` on Linux. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new network interface: `enN` on macOS; `usbN` or `ethN` on Linux, which the udev rule from `quaderno linux-setup` renames `quaderno0`. The script writes only to a tty whose USB VID/PID match.
+2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For example, serial `850000312345678` gives `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface the system created for the device. On macOS, the I/O Registry (`ioreg`) lists that interface (e.g. `en8`) and its link status under the USB device. On Linux, sysfs does: `/sys/bus/usb/devices/<device>/<interface>/net/`, with the link status in `/sys/class/net/<interface>/carrier`. On Linux, an error also says when the interface is down or has no IPv6 link-local address. The link status is used only to word an error (missing interface, link down, or no answer), never to skip trying: right after one plug-in it read "not valid" while the device answered. With several QUADERNOs attached, the serial saved at pairing picks the right one.
 3. **Pairing.** Plain HTTP on port 8080, in five calls:
    - `POST /register/pin`: the device sends nonce `n1`, its MAC and its Diffie-Hellman public value.
    - `POST /register/hash`: both sides compute a shared secret (DH, RFC 3526 2048-bit group). PBKDF2-SHA256 with 10,000 iterations turns it into a 32-byte HMAC key and a 16-byte AES-128-CBC key. The PIN enters as `HMAC(key, pin)`, so each side proves it knows the PIN without sending it.
@@ -335,7 +357,7 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_sync.py` | sync: edits, moves, deletes, local changes, name clashes, dry run |
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
 | `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
-| `tests/test_errors.py` | discovery states (stuck serial mode...), HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
+| `tests/test_errors.py` | discovery states (stuck serial mode...), reading `ioreg` and a simulated Linux sysfs, `linux-setup`, HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
 | `tests/test_types.py` | `mypy --strict` over the package and the tests (skipped if mypy isn't installed) |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
@@ -352,17 +374,18 @@ quaderno/
   __init__.py     public API: connect, pair, Device, Entry, Event, PutResult, models, errors
   device.py       Device: files, search, viewer, templates, configs, Wi-Fi, certs, power, firmware, sync
   models.py       TypedDict structs and literal enums for every JSON request and response
-  sync.py         one-way incremental sync (device -> Mac)
+  sync.py         one-way incremental sync (device -> computer)
   client.py       HTTPS transport (kept-alive, certificate pinning, auto re-auth) and binary transfer
   pairing.py      PIN pairing protocol
   crypto.py       RSA/AES via `cryptography`, HMAC, Diffie-Hellman, PEM/DER
   credentials.py  where credentials live; loading and saving them
-  usb.py          finding the device on USB (`ioreg -a`), USB mode switch, address
+  usb.py          finding the device on USB (`ioreg -a` on macOS, sysfs on Linux), USB mode switch, address
   entry.py        Entry: a document or folder
   events.py       Event: progress reports from API operations
   errors.py       the exception hierarchy
   util.py         paths, patterns, time and size formatting
   cli.py          the `quaderno` command: argument parsing and printing only
+  linux/          udev rule and NetworkManager profile, installed by `quaderno linux-setup`
 docs/MANUAL.md    user manual: what you can do, task by task
 docs/API.md       complete firmware Web API v2.1 endpoint and error code reference
 completions/_quaderno   zsh Tab completion
@@ -420,25 +443,28 @@ A malformed value that only affects what is shown or a file's date doesn't stop 
 
 ### The device stuck in serial mode
 
-When the USB link restarts, the QUADERNO starts in serial mode; this happens when you plug it in or when the Mac wakes from sleep. `quaderno` then sends the command that switches it to USB networking. While the device is in standby, it can ignore that command.
+When the USB link restarts, the QUADERNO starts in serial mode; this happens when you plug it in or when the computer wakes from sleep. `quaderno` then sends the command that switches it to USB networking. While the device is in standby, it can ignore that command.
 
 `quaderno` re-sends the command every 3 seconds. If the device is still in serial mode after 15 seconds, it stops with:
 
 ```
 quaderno: the QUADERNO is connected but stayed in USB serial mode: it ignored the command that
-switches it to USB networking for 15 s. This happens when it is in standby, e.g. after the Mac
-slept. Wake it with its power button, or unplug and re-plug it, then try again.
+switches it to USB networking for 15 s. This happens when it is in standby, e.g. after the
+computer slept. Wake it with its power button, or unplug and re-plug it, then try again.
 ```
 
 ## Troubleshooting
 
-- **`no QUADERNO on USB`**: run `ioreg -p IOUSB` and look for `FMVDP41`. If it's missing, check the cable: it must carry data, not only power.
+- **`no QUADERNO on USB`**: look for the device in the system's USB list: `ioreg -p IOUSB` on macOS (look for `FMVDP41`), `lsusb -d 04c5:` on Linux. If it's missing, check the cable: it must carry data, not only power.
 - **`stayed in USB serial mode`**: wake the device or re-plug it, as described above.
-- **`macOS lists no network interface for it`**: macOS didn't set up networking for the device after the switch. Unplug and re-plug it.
+- **`lists no network interface for it`**: the system didn't set up networking for the device after the switch. Unplug and re-plug it. On Linux, also check that the `cdc_ether` driver loads: `sudo modprobe cdc_ether`.
 - **`USB network link (enN) is down`**: the interface exists but has no link. Wake or unlock the device; if that doesn't help, re-plug it.
 - **`its link is up, but it doesn't answer`**: the network is fine but the device's server isn't responding. Wake or unlock the device.
+- **`no permission to open /dev/ttyACM0`** (Linux): run `quaderno linux-setup | sh`, then re-plug the device. Over SSH, add yourself to the group the message names instead, as described in [Linux setup](#linux-setup).
+- **`that interface is down`, `has no IPv6 link-local address` or `IPv6 is turned off on that interface`** (Linux): run `quaderno linux-setup | sh`, then re-plug the device. `ip addr show quaderno0` should then list an `inet6 fe80::` address. With NetworkManager, `nmcli device status` should show `quaderno0` connected with the `QUADERNO` profile.
 - **`isn't the one these credentials were paired with`**: a different QUADERNO is plugged in. Plug in the paired one, or pair this one into its own folder with `quaderno --config DIR pair` and use `--config DIR` with it.
-- **`couldn't read the list of USB devices with ioreg`**: macOS's `ioreg` failed or timed out; the message includes why. This is not the same as the device being absent.
+- **`couldn't read the list of USB devices`**: macOS's `ioreg` failed or timed out, or Linux's `/sys/bus/usb/devices` couldn't be read; the message includes why. This is not the same as the device being absent.
+- **`finding the QUADERNO on USB isn't supported on ...`**: only macOS and Linux can find the device on USB. On other systems, give its address with `--addr`.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
 - **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.

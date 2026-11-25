@@ -2,15 +2,18 @@
 
 The device first appears as a CDC-ACM serial port (VID 0x04C5, PID 0x1656).
 Writing SWITCH_TO_CDC_ECM to it makes it re-enumerate as CDC-ECM Ethernet
-(PID 0x1657). macOS then gives it a network interface (e.g. en8); the I/O
-Registry lists that interface and its link status under the USB device. The
+(PID 0x1657), and the system gives it a network interface. macOS's I/O Registry
+lists that interface (e.g. en8) and its link status under the USB device; on
+Linux, sysfs does (usb0, or quaderno0 with `quaderno linux-setup`). The
 device's IPv6 link-local address is derived from its serial number."""
 
+import glob
 import os
 import plistlib
 import re
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -23,6 +26,11 @@ PID_SERIAL = 0x1656
 PID_ETHERNET = 0x1657
 SWITCH_TO_CDC_ECM = bytes([0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04])
 LINK_VALID, LINK_ACTIVE = 1, 2  # IOLinkStatus bits (IONetworkMedium.h)
+IFF_UP = 0x1                    # Linux interface flag (linux/if.h)
+
+PLATFORM = sys.platform  # read through this name so that tests can change it, and so that
+                         # mypy checks the code for every platform, not just the one it runs on
+SYSFS, PROC = "/sys", "/proc"   # where Linux mounts them; tests point these at a fake tree
 
 RegistryNode = dict[str, Any]  # one entry of `ioreg -a` output, as plistlib decodes it
 SwitchHandler = Callable[[str, "str | None"], None]  # on_switch(tty, serial)
@@ -31,9 +39,9 @@ SwitchHandler = Callable[[str, "str | None"], None]  # on_switch(tty, serial)
 class UsbDevice(NamedTuple):
     pid: int
     serial: str | None
-    tty: str | None = None     # /dev/cu.usbmodem* while in serial mode
+    tty: str | None = None     # /dev/cu.usbmodem* (macOS), /dev/ttyACM* (Linux) in serial mode
     iface: str | None = None   # its network interface, e.g. 'en8', while in network mode
-    link: bool | None = None   # link up, per the registry (None: not reported). Only used to
+    link: bool | None = None   # link up, per the system (None: not reported). Only used to
                                # explain a failure: right after a plug-in it read 0 (not
                                # valid) while the device answered on that interface.
 
@@ -80,9 +88,24 @@ def _network(node: RegistryNode) -> tuple[str | None, bool | None]:
 
 
 def usb_devices() -> list[UsbDevice]:
-    """QUADERNO devices attached over USB, read from the I/O Registry (`ioreg -a`).
-    Raises ConnectError if the registry can't be read, so that the failure isn't
-    taken for "no device"."""
+    """QUADERNO devices attached over USB: from the I/O Registry on macOS, from
+    sysfs on Linux. Raises ConnectError if the list can't be read, so that the
+    failure isn't taken for "no device", and on other systems."""
+    if PLATFORM == "darwin":
+        return _ioreg_devices()
+    if PLATFORM.startswith("linux"):
+        return _sysfs_devices()
+    raise ConnectError(f"finding the QUADERNO on USB isn't supported on {PLATFORM}: "
+                       "give its address with --addr (Python: connect(addr=...))")
+
+
+def os_name() -> str:
+    """This system's name, for messages."""
+    return {"darwin": "macOS", "linux": "Linux"}.get(PLATFORM, PLATFORM)
+
+
+def _ioreg_devices() -> list[UsbDevice]:
+    """QUADERNO devices attached over USB, read from macOS's I/O Registry (`ioreg -a`)."""
     try:
         out = subprocess.run(["ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l"],
                              capture_output=True, timeout=15, check=True).stdout
@@ -101,6 +124,83 @@ def usb_devices() -> list[UsbDevice]:
         devs.append(UsbDevice(pid, serial if isinstance(serial, str) else None,
                               _str(n, "IOCalloutDevice"), iface, link))
     return devs
+
+
+# --- Linux's sysfs ------------------------------------------------------------------
+
+def _read(path: str) -> str | None:
+    """A sysfs or procfs file's contents, stripped, or None if it can't be read
+    (e.g. `carrier` while the interface is down)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _hex(path: str) -> int | None:
+    try:
+        return int(_read(path) or "", 16)
+    except ValueError:
+        return None
+
+
+def _child(dev_dir: str, name: str, kind: str) -> str | None:
+    """The first `kind` ('tty' or 'net') entry the kernel lists under any of this
+    USB device's interfaces (<dev>/<dev>:<config>.<interface>/<kind>/<name>)."""
+    pattern = os.path.join(glob.escape(dev_dir), glob.escape(name) + ":*", kind, "*")
+    found = sorted(glob.glob(pattern))
+    return os.path.basename(found[0]) if found else None
+
+
+def _sysfs_devices() -> list[UsbDevice]:
+    """QUADERNO devices attached over USB, read from Linux's sysfs: one directory
+    per device under /sys/bus/usb/devices, holding idVendor, idProduct, serial and
+    a subdirectory per interface, which names the tty or network interface the
+    kernel made for it."""
+    base = os.path.join(SYSFS, "bus", "usb", "devices")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError as err:
+        raise ConnectError(f"couldn't read the list of USB devices from {base}: {err}") from err
+    devs = []
+    for name in names:
+        if ":" in name:  # one of a device's interfaces, not a device
+            continue
+        path = os.path.join(base, name)
+        if _hex(os.path.join(path, "idVendor")) != VID:
+            continue
+        pid = _hex(os.path.join(path, "idProduct"))
+        if pid is None:
+            continue
+        tty = _child(path, name, "tty")
+        iface = _child(path, name, "net") if pid == PID_ETHERNET else None
+        carrier = _read(os.path.join(SYSFS, "class", "net", iface, "carrier")) if iface else None
+        devs.append(UsbDevice(pid, _read(os.path.join(path, "serial")) or None,
+                              f"/dev/{tty}" if tty else None, iface,
+                              {"1": True, "0": False}.get(carrier or "")))
+    return devs
+
+
+def _iface_problem(iface: str) -> str | None:
+    """Why Linux can't reach the device on `iface`, when sysfs and procfs show it:
+    the interface is down, IPv6 is off on it, or it has no IPv6 link-local
+    address. None when nothing looks wrong, or on other systems."""
+    if not PLATFORM.startswith("linux"):
+        return None
+    flags = _hex(os.path.join(SYSFS, "class", "net", iface, "flags"))
+    if flags is None:
+        return None
+    if not flags & IFF_UP:
+        return "that interface is down"
+    if _read(os.path.join(PROC, "sys", "net", "ipv6", "conf", iface, "disable_ipv6")) == "1":
+        return "IPv6 is turned off on that interface"
+    table = _read(os.path.join(PROC, "net", "if_inet6"))  # address ifindex prefix scope flags name
+    if table is not None and not any(
+            len(f) == 6 and f[5] == iface and f[0].startswith("fe80")
+            for f in (line.split() for line in table.splitlines())):
+        return "that interface has no IPv6 link-local address"
+    return None
 
 
 # --- switching and probing ----------------------------------------------------------
@@ -166,7 +266,7 @@ def _leave_serial_mode(dev: UsbDevice, on_switch: SwitchHandler | None, timeout:
             raise SerialModeError(
                 "the QUADERNO is connected but stayed in USB serial mode: it ignored the "
                 f"command that switches it to USB networking for {timeout:g} s. This happens "
-                "when it is in standby, e.g. after the Mac slept. Wake it with its power "
+                "when it is in standby, e.g. after the computer slept. Wake it with its power "
                 "button, or unplug and re-plug it, then try again.")
         if now >= next_send:
             for d in stuck:
@@ -175,20 +275,39 @@ def _leave_serial_mode(dev: UsbDevice, on_switch: SwitchHandler | None, timeout:
                         on_switch(d.tty, d.serial)
                     try:
                         switch_to_ethernet(d.tty)
+                    except PermissionError as err:
+                        raise ConnectError(_no_permission(d.tty)) from err
                     except OSError:
                         pass  # the port vanished mid-switch: it is re-enumerating
             next_send = now + resend_every
         time.sleep(0.5)
 
 
+def _no_permission(tty: str) -> str:
+    """The message for a serial port this user may not open."""
+    try:
+        import grp
+        group = f"the {grp.getgrgid(os.stat(tty).st_gid).gr_name} group"
+    except (ImportError, OSError, KeyError):
+        group = "the group that owns it"
+    return (f"no permission to open {tty}, the QUADERNO's USB serial port: run "
+            f"`quaderno linux-setup | sh` to allow it, or add yourself to {group} and log in "
+            "again")
+
+
 def _no_answer(dev: UsbDevice, ip: str) -> ConnectError:
-    """The error for a device that didn't answer in time, by what the Mac sees."""
+    """The error for a device that didn't answer in time, by what the system sees."""
     if dev.pid == PID_SERIAL:
         return SerialModeError("the QUADERNO went back to USB serial mode: unplug and re-plug it")
     if not dev.iface:
         return DeviceUnreachableError(
-            "the QUADERNO is in USB network mode, but macOS lists no network interface for it: "
-            "unplug and re-plug it")
+            f"the QUADERNO is in USB network mode, but {os_name()} lists no network interface "
+            "for it: unplug and re-plug it")
+    problem = _iface_problem(dev.iface)
+    if problem:
+        return DeviceUnreachableError(
+            f"the QUADERNO is on {dev.iface}, but {problem}: `quaderno linux-setup | sh` "
+            "sets Linux up for it")
     if dev.link is False:
         return DeviceUnreachableError(
             f"the QUADERNO's USB network link ({dev.iface}) is down: wake or unlock it, "
@@ -200,15 +319,16 @@ def _no_answer(dev: UsbDevice, ip: str) -> ConnectError:
 
 def discover(serial_hint: str | None = None, on_switch: SwitchHandler | None = None,
              switch_timeout: float = 15, answer_timeout: float | None = None) -> str:
-    """Return the device's scoped IPv6 address ('fe80::...%en8'), switching it to
-    USB networking first if it is in serial mode. `serial_hint` (the serial saved
-    at pairing) selects the device; `on_switch(tty, serial)` is called before each
-    switch command.
+    """Return the device's scoped IPv6 address ('fe80::...%en8' on macOS,
+    'fe80::...%quaderno0' on Linux), switching it to USB networking first if it
+    is in serial mode. `serial_hint` (the serial saved at pairing) selects the
+    device; `on_switch(tty, serial)` is called before each switch command.
 
     Raises DeviceNotFoundError (not on USB, not the paired device, or no usable
     serial), SerialModeError (won't leave serial mode within `switch_timeout` s),
-    DeviceUnreachableError (no network interface, link down, or not answering),
-    or ConnectError (the USB device list can't be read)."""
+    DeviceUnreachableError (no network interface, link or interface down, or not
+    answering), or ConnectError (the USB device list can't be read, the serial
+    port may not be opened, or the system isn't macOS or Linux)."""
     devs = usb_devices()
     if not devs:
         raise DeviceNotFoundError("no QUADERNO on USB: plug it in with a data cable "
