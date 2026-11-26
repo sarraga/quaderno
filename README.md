@@ -142,16 +142,20 @@ quaderno ping && quaderno info
 .venv/bin/mypy
 ```
 
-### Tab completion (zsh)
+### Tab completion (zsh and bash)
 
-`completions/_quaderno` completes subcommands, options, local files, and **paths on the device**. Paths are fetched live from the device, about 0.4 s per Tab:
+`completions/_quaderno` (zsh) and `completions/quaderno.bash` (bash) complete subcommands, options, local files, and **paths on the device**. Paths are fetched live from the device, about 0.4 s per Tab:
 
 ```
+quaderno sc⇥                         ->  quaderno screenshot
+quaderno power s⇥                    ->  shutdown  sleep
+quaderno search -t m⇥                ->  mark  meta
 quaderno ls Bo⇥                      ->  quaderno ls Books/
 quaderno --wifi ls Bo⇥               ->  quaderno --wifi ls Books/
-quaderno get Books/milit⇥            ->  quaderno get Books/Military\ History/
-quaderno put x.pdf -d Books/Mil⇥     ->  only folders are offered after -d
-quaderno mv 'Books/Fight⇥            ->  quoting is handled, inside quotes or with \
+quaderno get Books/comp⇥             ->  quaderno get Books/Computer\ engineering/
+quaderno get Books/Computer\ engineering/ru⇥  ->  quaderno get Books/Computer\ engineering/Rust/
+quaderno put x.pdf -d no⇥            ->  quaderno put x.pdf -d Note/   (folders only after -d)
+quaderno mv 'Books/comp⇥             ->  quaderno mv 'Books/Computer engineering/   (quoted or escaped)
 ```
 
 How it behaves:
@@ -161,16 +165,30 @@ How it behaves:
 - **With the device unplugged**, nothing is offered, without any delay.
 - **`--config DIR`, `--addr ADDR`, `--wifi`, and `--usb`** typed before the subcommand apply to completion too. Over `--wifi`, completion only probes the cached IP in `wifi_addr.dat` (short timeout) and never blocks on an mDNS scan; run one `quaderno --wifi ping` first if the cache doesn't exist yet.
 - **Right after plugging in**, the first Tab switches the device to USB networking, which takes about 4 s. Later Tabs take about 0.4 s.
-- **After updating the checkout**, reload the completion function in already-open zsh shells with `unfunction _quaderno && autoload -Uz _quaderno`.
 
-`pip install` doesn't install this file: zsh reads it straight from the checkout. To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
+`pip install` doesn't install completion files: your shell reads them straight from the checkout.
 
-```
-fpath=(~/quaderno/completions $fpath)
-autoload -Uz compinit && compinit
-```
+- **bash (Linux / macOS):** link into the standard user `bash-completion` directory (loaded automatically on demand, no `~/.bashrc` edit needed):
 
-`compinit` turns on zsh's completion system for every command, not just this one. If your `~/.zshrc` already runs it, add only the `fpath` line, above it. This works the same with zsh on Linux; there is no bash completion.
+  ```sh
+  mkdir -p ~/.local/share/bash-completion/completions
+  ln -sf ~/quaderno/completions/quaderno.bash ~/.local/share/bash-completion/completions/quaderno
+  ```
+
+  Or source it directly from `~/.bashrc`:
+
+  ```sh
+  source ~/quaderno/completions/quaderno.bash
+  ```
+
+- **zsh (macOS / Linux):** add to `~/.zshrc` (`fpath` must come before `compinit`; if `~/.zshrc` already calls `compinit`, add only the `fpath` line above it):
+
+  ```sh
+  fpath=(~/quaderno/completions $fpath)
+  autoload -Uz compinit && compinit
+  ```
+
+  After updating the checkout, reload in already-open zsh shells with `unfunction _quaderno && autoload -Uz _quaderno` (or `source ~/quaderno/completions/quaderno.bash` in bash).
 
 ## Usage
 
@@ -462,8 +480,9 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
 | `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
 | `tests/test_errors.py` | discovery states (stuck serial mode...), reading `ioreg` and a simulated Linux sysfs, `linux-setup`, HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
-| `tests/test_mdns.py` | pure-stdlib DNS-SD/mDNS packet encoding/decoding, macOS Bonjour fast-path, VPN interface filtering, dual-stack dedup, cached Wi-Fi IP probe, USB → Wi-Fi fallback, CLI `--usb`/`--wifi` |
+| `tests/test_mdns.py` | pure-stdlib DNS-SD/mDNS packet encoding/decoding, macOS Bonjour & Linux Avahi fast-paths + UDP fallback, VPN interface filtering, dual-stack dedup, cached Wi-Fi IP probe, USB → Wi-Fi fallback, CLI `--usb`/`--wifi` |
 | `tests/test_hardening.py` | adversarial tests: mDNS SSRF/DoS/flood/pin-mismatch defenses, sync path traversal and symlink guards, protocol loop/size bounds, X.509 cert validation, terminal escape sanitization |
+| `tests/test_bash_completion.py` | bash Tab completion (`completions/quaderno.bash`): subcommands, options, remote path escaping, global flag forwarding |
 | `tests/test_types.py` | `mypy --strict` over the package and the tests (skipped if mypy isn't installed) |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
@@ -496,7 +515,8 @@ quaderno/
   linux/          udev rule and NetworkManager profile, installed by `quaderno linux-setup`
 docs/MANUAL.md    user manual: what you can do, task by task
 docs/API.md       complete firmware Web API v2.1 endpoint and error code reference
-completions/_quaderno   zsh Tab completion
+completions/_quaderno       zsh Tab completion
+completions/quaderno.bash   bash Tab completion
 tests/                  offline tests (fake device) and manual device checks
 ```
 
@@ -545,8 +565,10 @@ quaderno config wifi_sleep_policy disabled             # keep Wi-Fi awake while 
 How Wi-Fi discovery works (zero external dependencies):
 - **Fast path (`wifi_addr.dat`, ~0.3 s):** `--wifi` first probes the last verified IP cached in `~/.config/quaderno/wifi_addr.dat` with a TLS 1.2 certificate-pin check (`devicecert.bin`). If the IP is stale or changed by DHCP, it automatically falls back to mDNS and updates the cache after login succeeds.
 - **macOS Bonjour fast-path (~15 ms lookup):** on macOS, `quaderno/mdns.py` first queries the system `mDNSResponder` cache via `libSystem.B.dylib` (`DNSServiceBrowse` / `DNSServiceResolve` / `DNSServiceGetAddrInfo`). This finds an idle tablet immediately even when Wi-Fi power-save drops raw multicast probes.
+- **Linux Avahi fast-path (when installed):** on Linux, `quaderno/mdns.py` first queries `avahi-daemon`'s cache via `avahi-browse -c -r -t -p` (with the same port, probe-cap, serial, and TLS-pin checks). If `avahi-browse` isn't installed, the daemon isn't running, or the cache misses, it falls back silently to raw UDP multicast.
 - **Cross-platform stdlib UDP mDNS fallback:** browses `_dp_fujitsu._tcp.local` over `224.0.0.251:5353`, pinning `IP_MULTICAST_IF` / `IP_ADD_MEMBERSHIP` to active non-loopback, non-point-to-point LAN interfaces (skipping VPN tunnels like `utun*`) and resending queries every `0.5 s` up to `5 s`.
 - **Hardening on untrusted LANs:** discovery refuses non-`8080` SRV ports and loopback/multicast/link-local/unspecified IPs, caps probe counts and response sizes, and verifies `devicecert.bin` over TLS 1.2 *before* accepting or caching an IP. If a cached IP fails TLS pinning, `wifi_addr.dat` is automatically cleared.
+- **SSID display:** the tablet's Wi-Fi endpoints return `ssid` Base64-encoded on the wire; `quaderno info` and `quaderno wifi status|ls|scan` decode canonical Base64 UTF-8 SSIDs automatically.
 - **Tab completion:** `quaderno --wifi ls Bo⇥` probes only the cached `wifi_addr.dat` IP (short timeout) and never blocks on an mDNS scan.
 - **Standby note:** check `quaderno --wifi config wifi_sleep_policy`. With sleep enabled, the tablet drops off Wi-Fi after sitting idle; wake it with its power button or set `wifi_sleep_policy` to `disabled`.
 

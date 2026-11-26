@@ -136,7 +136,41 @@ ip -br addr show quaderno0   # quaderno0  UP  fe80::.../64
 nmcli device status          # quaderno0  ethernet  connected  QUADERNO
 ```
 
-The README also explains how to turn on Tab completion (zsh), which completes the names of files on the tablet as you type.
+### Tab completion (bash and zsh)
+
+`quaderno` ships Tab completion for both **bash** and **zsh**. Pressing `Tab` completes subcommands, flags, option values, local files, and **folders and PDFs live from the tablet**:
+
+```sh
+quaderno sc⇥                             ->  quaderno screenshot
+quaderno power s⇥                        ->  shutdown  sleep
+quaderno ls bo⇥                          ->  quaderno ls Books/
+quaderno --wifi ls Books/comp⇥           ->  quaderno --wifi ls Books/Computer\ engineering/
+quaderno get 'Books/comp⇥                ->  quaderno get 'Books/Computer engineering/
+quaderno put paper.pdf -d no⇥            ->  quaderno put paper.pdf -d Note/
+quaderno search -t m⇥                    ->  mark  meta
+```
+
+- Folders end in `/` with no trailing space so pressing `Tab` again steps straight into the subfolder.
+- Letter case is ignored when matching names on the tablet, and patterns containing `*`, `?`, or `[` are left untouched.
+- With `--wifi`, Tab completion probes only the cached Wi-Fi IP (`wifi_addr.dat`) so it stays fast and never blocks on a slow network scan (run one `quaderno --wifi ping` first if you haven't connected over Wi-Fi yet).
+
+**Enable it in bash (Linux / macOS):**
+
+```sh
+mkdir -p ~/.local/share/bash-completion/completions
+ln -sf ~/quaderno/completions/quaderno.bash ~/.local/share/bash-completion/completions/quaderno
+```
+
+Open a new terminal (or run `source ~/quaderno/completions/quaderno.bash` in an already-open shell). If your system doesn't use `bash-completion`, add `source ~/quaderno/completions/quaderno.bash` to `~/.bashrc` instead.
+
+**Enable it in zsh (macOS / Linux):**
+
+Add these two lines to `~/.zshrc` (`fpath` must come before `compinit`; if `~/.zshrc` already calls `compinit`, add only the `fpath` line above it):
+
+```sh
+fpath=(~/quaderno/completions $fpath)
+autoload -Uz compinit && compinit
+```
 
 ## First steps
 

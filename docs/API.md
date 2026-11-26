@@ -107,7 +107,7 @@ Reference for the Web API of the Fujitsu QUADERNO Gen 2 / Gen 3C (firmware `2.2.
 | `GET` | `/system/status/storage` | `-> StorageStatus` | `dev.info()["storage"]` | `quaderno info` |
 | `GET` | `/system/status/firmware_version` | `-> FirmwareVersion` | `dev.info()["firmware_version"]` | `quaderno info` |
 | `GET` | `/system/status/mac_address` | `-> CommonValue` | `dev.info()["mac_address"]` | `quaderno info` |
-| `GET` | `/system/status/wifi_state` | `-> WifiApInfo` | `dev.wifi_state()` | `quaderno wifi status` |
+| `GET` | `/system/status/wifi_state` | `-> WifiApInfo` (`ssid` is Base64-encoded on the wire; CLI decodes via `util.decode_ssid()`) | `dev.wifi_state()` | `quaderno wifi status` |
 | `GET` | `/system/status/document_process` | `-> DocumentProcessStatus` | `dev.document_process()` | — |
 | `GET` | `/system/configs` | `-> ConfigsV1` | `dev.configs()` (fallback) | `quaderno config` |
 | `GET` | `/system/configs2` | `-> ConfigsV2` | `dev.configs_v2()` | — |
