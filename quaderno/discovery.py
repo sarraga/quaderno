@@ -26,9 +26,9 @@ def parse_transport(value: str | None) -> Transport:
 
 def _try_cached_wifi(cached_addr: str, serial_hint: str | None) -> bool:
     """Fast check whether a cached Wi-Fi IP still points to the same QUADERNO."""
-    if not usb.probe(cached_addr, timeout=0.4):
+    if not usb.probe(cached_addr, timeout=1.0):
         return False
-    ok, serial = mdns.fetch_serial(cached_addr, timeout=1.0)
+    ok, serial = mdns.fetch_serial(cached_addr, timeout=1.5)
     if not ok:
         return False
     return serial_hint is None or serial == serial_hint
@@ -46,7 +46,7 @@ def _discover_wifi(serial_hint: str | None, *, cached_addr: str | None,
 
 def discover(serial_hint: str | None = None, *, transport: Transport = "usb",
              on_switch: usb.SwitchHandler | None = None,
-             cached_addr: str | None = None, mdns_timeout: float = 3.0,
+             cached_addr: str | None = None, mdns_timeout: float = 5.0,
              on_wifi_addr: Callable[[str], None] | None = None) -> str:
     """Find the QUADERNO and return its address.
 

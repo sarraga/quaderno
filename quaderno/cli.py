@@ -501,7 +501,7 @@ def complete(argv: list[str]) -> int:
         elif transport != "usb":
             creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
             cached = credentials.load_wifi_addr(creds.source)
-            if not cached or not usb.probe(cached, timeout=0.25):
+            if not cached or not usb.probe(cached, timeout=0.8):
                 return 0
             target = cached
         else:

@@ -141,6 +141,7 @@ def test_browse_resolves_ptr_srv_a_and_stops_early_on_serial_match(
         clock.t += wait
         return [], [], []
 
+    monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -150,6 +151,160 @@ def test_browse_resolves_ptr_srv_a_and_stops_early_on_serial_match(
     assert devs == [WifiDevice("192.168.1.50", 8080, "850000312345678", inst, "Android.local")]
     assert sock.closed
     assert clock.t == 1000.0  # exited immediately on serial match without waiting timeout
+
+
+def test_browse_deduplicates_dual_stack_device_and_prefers_ipv4(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    inst = "Digital Paper FMVDP41._dp_fujitsu._tcp.local"
+    host_wire = mdns.encode_name("Android-2.local")
+    inst_wire = mdns.encode_name(inst)
+    # Dual-stack response with 1 IPv4 and 2 global IPv6 addresses (like a real QUADERNO)
+    pkt = _response_packet(
+        [_rr(mdns.encode_name(SERVICE), TYPE_PTR, inst_wire)],
+        [
+            _rr(inst_wire, TYPE_SRV, struct.pack("!HHH", 0, 0, 8080) + host_wire),
+            _rr(host_wire, TYPE_A, socket.inet_pton(socket.AF_INET, "192.168.0.99")),
+            _rr(host_wire, TYPE_AAAA, socket.inet_pton(socket.AF_INET6, "2a02:8084::1")),
+            _rr(host_wire, TYPE_AAAA, socket.inet_pton(socket.AF_INET6, "2a02:8084::2")),
+        ],
+    )
+    sock = FakeUdpSocket([pkt])
+    clock = FakeClock()
+    probed: list[str] = []
+
+    def fake_select(rlist: list[FakeUdpSocket], _w: object, _x: object,
+                    wait: float) -> tuple[list[FakeUdpSocket], list[object], list[object]]:
+        if sock.inbox:
+            return [sock], [], []
+        clock.t += wait
+        return [], [], []
+
+    def fake_fetch(ip: str, port: int = 8080) -> tuple[bool, str | None]:
+        probed.append(ip)
+        return True, "850000302014492"
+
+    monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
+    monkeypatch.setattr(select, "select", fake_select)
+    monkeypatch.setattr(mdns, "time", clock)
+    monkeypatch.setattr(mdns, "fetch_serial", fake_fetch)
+
+    # Without want_serial (e.g. `pair` or unpaired `addr`), must return 1 device, not 3
+    devs = mdns.browse(timeout=5.0, want_serial=None)
+    assert devs == [WifiDevice("192.168.0.99", 8080, "850000302014492", inst, "Android-2.local")]
+    assert probed == ["192.168.0.99"]  # did not waste HTTP probes on IPv6 after IPv4 succeeded
+
+
+def test_browse_upgrades_ipv6_entry_when_ipv4_arrives_later(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    inst = "Digital Paper FMVDP41._dp_fujitsu._tcp.local"
+    host_wire = mdns.encode_name("Android-2.local")
+    inst_wire = mdns.encode_name(inst)
+    v6_pkt = _response_packet(
+        [_rr(mdns.encode_name(SERVICE), TYPE_PTR, inst_wire)],
+        [
+            _rr(inst_wire, TYPE_SRV, struct.pack("!HHH", 0, 0, 8080) + host_wire),
+            _rr(host_wire, TYPE_AAAA, socket.inet_pton(socket.AF_INET6, "2a02:8084::1")),
+        ],
+    )
+    v4_pkt = _response_packet(
+        [_rr(host_wire, TYPE_A, socket.inet_pton(socket.AF_INET, "192.168.0.99"))],
+    )
+    sock = FakeUdpSocket([v6_pkt])
+    clock = FakeClock()
+    fed_v4 = False
+
+    def fake_select(rlist: list[FakeUdpSocket], _w: object, _x: object,
+                    wait: float) -> tuple[list[FakeUdpSocket], list[object], list[object]]:
+        nonlocal fed_v4
+        if sock.inbox:
+            return [sock], [], []
+        if not fed_v4:
+            fed_v4 = True
+            sock.inbox.append(v4_pkt)
+            clock.t += 0.1
+            return [sock], [], []
+        clock.t += wait
+        return [], [], []
+
+    monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
+    monkeypatch.setattr(select, "select", fake_select)
+    monkeypatch.setattr(mdns, "time", clock)
+    monkeypatch.setattr(mdns, "fetch_serial", lambda ip, port=8080: (True, "850000302014492"))
+
+    devs = mdns.browse(timeout=5.0, want_serial=None)
+    assert devs == [WifiDevice("192.168.0.99", 8080, "850000302014492", inst, "Android-2.local")]
+
+
+def test_browse_resends_periodically_through_wifi_packet_loss(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    inst = "Digital Paper FMVDP41._dp_fujitsu._tcp.local"
+    reply = _service_response(inst, "Android-2.local", "192.168.0.99")
+    sock = FakeUdpSocket([])
+    clock = FakeClock()
+    fed = False
+
+    def fake_select(rlist: list[FakeUdpSocket], _w: object, _x: object,
+                    wait: float) -> tuple[list[FakeUdpSocket], list[object], list[object]]:
+        nonlocal fed
+        # Drop the first 3 queries; answer only once the 4th query is sent (~1.5s)
+        if len(sock.sent) >= 4 and not fed:
+            fed = True
+            sock.inbox.append(reply)
+            return [sock], [], []
+        clock.t += wait
+        return [], [], []
+
+    monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
+    monkeypatch.setattr(select, "select", fake_select)
+    monkeypatch.setattr(mdns, "time", clock)
+    monkeypatch.setattr(mdns, "fetch_serial", lambda ip, port=8080: (True, "850000302014492"))
+
+    devs = mdns.browse(timeout=5.0, want_serial="850000302014492")
+    assert len(devs) == 1 and devs[0].addr == "192.168.0.99"
+    assert len(sock.sent) == 4
+
+
+def test_bonjour_helpers_and_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert mdns._split_service_domain("_dp_fujitsu._tcp.local") == ("_dp_fujitsu._tcp.", "local.")
+    assert mdns._split_service_domain("_dp_fujitsu._tcp.local.") == ("_dp_fujitsu._tcp.", "local.")
+    sa4 = struct.pack("!BBH4s", 16, socket.AF_INET, 0, socket.inet_pton(socket.AF_INET, "192.168.0.99"))
+    assert mdns._sockaddr_to_ip(sa4) == "192.168.0.99"
+    sa6 = struct.pack("!BBHI16s", 28, socket.AF_INET6, 0, 0, socket.inet_pton(socket.AF_INET6, "2a02::1"))
+    assert mdns._sockaddr_to_ip(sa6) == "2a02::1"
+    assert mdns._sockaddr_to_ip(b"") is None
+
+    dev = WifiDevice("192.168.0.99", 8080, "111", "DP._dp_fujitsu._tcp.local", "Android-2.local")
+    monkeypatch.setattr(mdns, "PLATFORM", "darwin")
+    monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [dev])
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: pytest.fail("UDP fallback not needed"))
+    assert mdns.browse(timeout=5.0, want_serial="111") == [dev]
+
+
+def test_multicast_interface_parsing_skips_loopback_and_vpn() -> None:
+    mac_ifconfig = """\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.0.202 netmask 0xffffff00 broadcast 192.168.0.255
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.93.244.70 --> 100.93.244.70 netmask 0xffffffff
+en8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 169.254.10.2 netmask 0xffff0000 broadcast 169.254.255.255
+"""
+    assert mdns._parse_ifconfig_ipv4(mac_ifconfig) == ["192.168.0.202", "169.254.10.2"]
+
+    linux_ip = """\
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
+    inet 127.0.0.1/8 scope host lo
+2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.1.25/24 brd 192.168.1.255 scope global dynamic wlan0
+3: tailscale0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1280
+    inet 100.93.244.70/32 scope global tailscale0
+"""
+    assert mdns._parse_ip_addr_ipv4(linux_ip) == ["192.168.1.25"]
 
 
 def test_mdns_discover_selection_and_errors(monkeypatch: pytest.MonkeyPatch) -> None:
