@@ -18,7 +18,7 @@ from .device import SETTABLE_CONFIGS, Device, connect
 from .entry import Entry
 from .errors import AuthError, ConnectError, PairingError, QuadernoError
 from .events import Event
-from .util import ROOT, JsonObject, human, sanitize_terminal
+from .util import ROOT, JsonObject, decode_ssid, human, sanitize_terminal
 
 
 class Args(argparse.Namespace):
@@ -250,8 +250,9 @@ def cmd_info(dev: Device, args: Args) -> None:
         print(f"battery        {val(b)}")
     w = info.get("wifi_state")
     if isinstance(w, dict) and "state" in w:
-        ssid = w.get("ssid")
-        print(f"wifi           {w['state']}" + (f" ({ssid})" if ssid else ""))
+        raw_ssid = w.get("ssid")
+        ssid = decode_ssid(raw_ssid) if isinstance(raw_ssid, str) else ""
+        print(_tty_safe(f"wifi           {w['state']}" + (f" ({ssid})" if ssid else "")))
 
 
 def cmd_screenshot(dev: Device, args: Args) -> None:
@@ -314,19 +315,22 @@ def cmd_templates(dev: Device, args: Args) -> None:
 
 def cmd_wifi(dev: Device, args: Args) -> None:
     if args.action == "status":
-        print(json.dumps(dev.wifi_state(), indent=2))
+        state: JsonObject = dict(dev.wifi_state())
+        if isinstance(state.get("ssid"), str):
+            state["ssid"] = decode_ssid(state["ssid"])
+        print(json.dumps(state, indent=2))
     elif args.action in ("on", "off"):
         dev.set_config("wifi", args.action)
         print(f"wifi = {args.action}")
     elif args.action == "scan":
         for ap in dev.wifi_scan():
-            line = (f"{ap.get('ssid', '')}\t{ap.get('security', '')}\t"
+            line = (f"{decode_ssid(ap.get('ssid', ''))}\t{ap.get('security', '')}\t"
                     f"{ap.get('frequency_band', '')}\t{ap.get('rssi_level', '')}\t"
                     f"{ap.get('state', '')}")
             print(_tty_safe(line))
     elif args.action == "ls":
         for cfg in dev.wifi_accesspoints():
-            print(_tty_safe(f"{cfg.get('ssid', '')}\t{cfg.get('security', '')}"))
+            print(_tty_safe(f"{decode_ssid(cfg.get('ssid', ''))}\t{cfg.get('security', '')}"))
     elif args.action == "add":
         passwd = _read_secret(args, f"Wi-Fi password for {args.ssid}: ",
                               required=args.security in ("psk", "eap"))

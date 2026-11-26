@@ -1,5 +1,7 @@
 """Path, name and formatting helpers shared by the API and the CLI."""
 
+import base64
+import binascii
 import datetime
 import fnmatch
 import re
@@ -78,6 +80,23 @@ def sanitize_terminal(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def decode_ssid(value: str) -> str:
+    """Decode a Base64-encoded Wi-Fi SSID from the device API to UTF-8 text.
+    Returns `value` unchanged if it isn't canonical printable Base64 (e.g. plain text)."""
+    if not value or len(value) % 4 != 0:
+        return value
+    try:
+        raw = base64.b64decode(value.encode("ascii"), validate=True)
+        if not raw or base64.b64encode(raw).decode("ascii") != value:
+            return value
+        text = raw.decode("utf-8")
+    except (UnicodeError, binascii.Error, ValueError):
+        return value
+    if not all(ord(ch) >= 0x20 and ord(ch) != 0x7F and not (0x80 <= ord(ch) <= 0x9F) for ch in text):
+        return value
+    return text
 
 
 def is_pattern(component: str, regex: bool = False) -> bool:

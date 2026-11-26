@@ -628,6 +628,112 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
     return found
 
 
+# --- Linux Avahi cache fast-path ----------------------------------------------------
+
+def _unescape_avahi(text: str) -> str:
+    """Unescape Avahi's \\DDD decimal byte escapes (e.g. '\\032' -> ' ')."""
+    raw = bytearray()
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 3 < n and text[i + 1:i + 4].isdigit():
+            val = int(text[i + 1:i + 4])
+            if 0 <= val <= 255:
+                raw.append(val)
+                i += 4
+                continue
+        raw.extend(text[i].encode("utf-8"))
+        i += 1
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_avahi_browse(text: str) -> list[tuple[str, str, str, int]]:
+    """Parse resolved (`=`) rows from `avahi-browse -c -r -t -p`.
+    Returns `(instance_fqdn, hostname, address, port)` tuples."""
+    entries: list[tuple[str, str, str, int]] = []
+    for line in text.splitlines():
+        parts = line.split(";")
+        if len(parts) < 9 or parts[0] != "=":
+            continue
+        name = _unescape_avahi(parts[3])
+        regtype = _unescape_avahi(parts[4]).rstrip(".")
+        domain = _unescape_avahi(parts[5]).rstrip(".")
+        host = _unescape_avahi(parts[6]).rstrip(".")
+        addr = parts[7].strip()
+        try:
+            port = int(parts[8])
+        except ValueError:
+            continue
+        if not name or not host or not addr:
+            continue
+        inst = f"{name}.{regtype}.{domain}" if regtype and domain else name
+        entries.append((inst, host, addr, port))
+    return entries
+
+
+def _browse_avahi(services: Sequence[str], *, timeout: float,
+                  want_serial: str | None,
+                  pinned_cert: bytes | None = None) -> list[WifiDevice]:
+    """Query Linux's Avahi daemon cache via `avahi-browse -c -r -t -p` if available.
+
+    When `avahi-daemon` is running, it caches the QUADERNO's unsolicited mDNS
+    announcements even while Wi-Fi power-save drops raw multicast probes.
+    Returns `[]` silently when `avahi-browse` isn't installed or the daemon isn't
+    running, letting `browse()` fall back to raw UDP multicast."""
+    if not PLATFORM.startswith("linux") or timeout <= 0:
+        return []
+    deadline = time.time() + timeout
+    by_inst: dict[str, tuple[str, str, int, list[str]]] = {}
+    for svc in services:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        regtype, domain = _split_service_domain(svc)
+        cmd = ["avahi-browse", "-c", "-r", "-t", "-p",
+               "-d", domain.rstrip("."), regtype.rstrip(".")]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=min(remaining, 2.0), check=False)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if res.returncode != 0:
+            continue
+        for inst, host, addr, port in _parse_avahi_browse(res.stdout):
+            if port != REG_PORT:
+                continue
+            inst_key = _norm_dns(inst)
+            if inst_key not in by_inst:
+                if len(by_inst) >= MAX_PROBES:
+                    continue
+                by_inst[inst_key] = (inst, host, port, [])
+            ips = by_inst[inst_key][3]
+            if addr not in ips and len(ips) < MAX_PROBES:
+                ips.append(addr)
+
+    found: list[WifiDevice] = []
+    found_by_key: dict[str, int] = {}
+    checked: set[tuple[str, int]] = set()
+    for inst_key, (inst_name, host, port, raw_ips) in by_inst.items():
+        for ip in _rank_addrs(raw_ips):
+            if time.time() >= deadline or len(checked) >= MAX_PROBES:
+                break
+            ep = (ip, port)
+            if ep in checked:
+                continue
+            checked.add(ep)
+            ok, serial = fetch_serial(ip, port)
+            if not ok:
+                continue
+            if pinned_cert is not None and not probe_tls_pin(ip, pinned_cert, timeout=1.5):
+                continue
+            _record_device(found, found_by_key, inst_key,
+                           WifiDevice(ip, port, serial, inst_name, host))
+            if want_serial is not None and serial == want_serial:
+                return found
+            break
+    return found
+
+
 def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
            want_serial: str | None = None,
            pinned_cert: bytes | None = None) -> list[WifiDevice]:
@@ -648,6 +754,18 @@ def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
             return bonjour_devs
         if time.time() >= deadline:
             return bonjour_devs
+    elif PLATFORM.startswith("linux"):
+        if pinned_cert is not None:
+            avahi_devs = _browse_avahi(services, timeout=min(timeout, 2.0),
+                                       want_serial=want_serial, pinned_cert=pinned_cert)
+        else:
+            avahi_devs = _browse_avahi(services, timeout=min(timeout, 2.0),
+                                       want_serial=want_serial)
+        if avahi_devs and (want_serial is None
+                           or any(d.serial == want_serial for d in avahi_devs)):
+            return avahi_devs
+        if time.time() >= deadline:
+            return avahi_devs
 
     socks = _open_sockets()
     if not socks:

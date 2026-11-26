@@ -142,6 +142,7 @@ def test_browse_resolves_ptr_srv_a_and_stops_early_on_serial_match(
         return [], [], []
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -184,6 +185,7 @@ def test_browse_deduplicates_dual_stack_device_and_prefers_ipv4(
         return True, "850000302014492"
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -228,6 +230,7 @@ def test_browse_upgrades_ipv6_entry_when_ipv4_arrives_later(
         return [], [], []
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -257,6 +260,7 @@ def test_browse_resends_periodically_through_wifi_packet_loss(
         return [], [], []
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -281,6 +285,72 @@ def test_bonjour_helpers_and_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [dev])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: pytest.fail("UDP fallback not needed"))
     assert mdns.browse(timeout=5.0, want_serial="111") == [dev]
+
+
+def test_avahi_parsing_fast_path_and_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert mdns._unescape_avahi(r"Digital\032Paper\032Caf\195\169") == "Digital Paper Café"
+
+    sample = (
+        "+;wlp2s0;IPv6;Digital\\032Paper\\032FMVDP41;_dp_fujitsu._tcp;local\n"
+        "=;wlp2s0;IPv6;Digital\\032Paper\\032FMVDP41;_dp_fujitsu._tcp;local;Android-2.local;2a02:8084::1;8080;\n"
+        "=;wlp2s0;IPv4;Digital\\032Paper\\032FMVDP41;_dp_fujitsu._tcp;local;Android-2.local;192.168.0.99;8080;\n"
+        "=;wlp2s0;IPv4;WrongPort;_dp_fujitsu._tcp;local;other.local;192.168.0.5;22;\n"
+        "=;wlp2s0;IPv4;BadPort;_dp_fujitsu._tcp;local;bad.local;192.168.0.6;notanint;\n"
+    )
+    parsed = mdns._parse_avahi_browse(sample)
+    assert parsed == [
+        ("Digital Paper FMVDP41._dp_fujitsu._tcp.local", "Android-2.local", "2a02:8084::1", 8080),
+        ("Digital Paper FMVDP41._dp_fujitsu._tcp.local", "Android-2.local", "192.168.0.99", 8080),
+        ("WrongPort._dp_fujitsu._tcp.local", "other.local", "192.168.0.5", 22),
+    ]
+
+    # Fast-path on Linux: verifies serial + TLS pin, prefers IPv4 over IPv6, skips non-8080 ports
+    import subprocess as sp
+
+    probed: list[str] = []
+
+    class _FakeCompleted:
+        def __init__(self, returncode: int, stdout: str) -> None:
+            self.returncode, self.stdout = returncode, stdout
+
+    def fake_fetch_avahi(ip: str, port: int = 8080) -> tuple[bool, str | None]:
+        probed.append(ip)
+        return True, "850000312345678"
+
+    monkeypatch.setattr(mdns, "PLATFORM", "linux")
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _FakeCompleted(0, sample))
+    monkeypatch.setattr(mdns, "fetch_serial", fake_fetch_avahi)
+    monkeypatch.setattr(mdns, "probe_tls_pin", lambda ip, pin, timeout=1.5: ip == "192.168.0.99" and pin == b"CERT")
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: pytest.fail("UDP fallback not needed when Avahi hits"))
+
+    devs = mdns.browse(timeout=5.0, want_serial="850000312345678", pinned_cert=b"CERT")
+    assert devs == [WifiDevice("192.168.0.99", 8080, "850000312345678",
+                               "Digital Paper FMVDP41._dp_fujitsu._tcp.local", "Android-2.local")]
+    assert probed == ["192.168.0.99"]
+
+    # Fallback: when avahi-browse is missing (FileNotFoundError), browse() falls back to raw UDP
+    def _missing(*_a: object, **_kw: object) -> object:
+        raise FileNotFoundError("avahi-browse")
+
+    inst = "Digital Paper FMVDP41._dp_fujitsu._tcp.local"
+    sock = FakeUdpSocket([_service_response(inst, "Android-2.local", "192.168.0.99")])
+    clock = FakeClock()
+
+    def fake_select(rlist: list[FakeUdpSocket], _w: object, _x: object,
+                    wait: float) -> tuple[list[FakeUdpSocket], list[object], list[object]]:
+        if sock.inbox:
+            return [sock], [], []
+        clock.t += wait
+        return [], [], []
+
+    monkeypatch.setattr(sp, "run", _missing)
+    monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
+    monkeypatch.setattr(select, "select", fake_select)
+    monkeypatch.setattr(mdns, "time", clock)
+    monkeypatch.setattr(mdns, "fetch_serial", lambda ip, port=8080: (True, "850000312345678"))
+
+    devs = mdns.browse(timeout=5.0, want_serial="850000312345678")
+    assert len(devs) == 1 and devs[0].addr == "192.168.0.99"
 
 
 def test_multicast_interface_parsing_skips_loopback_and_vpn() -> None:

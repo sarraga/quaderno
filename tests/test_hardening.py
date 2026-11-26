@@ -132,6 +132,7 @@ def test_browse_rejects_non_reg_port_and_caps_probes(monkeypatch: pytest.MonkeyP
         return False, None
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -153,6 +154,7 @@ def test_browse_survives_udp_flood_without_hanging(monkeypatch: pytest.MonkeyPat
         return [sock], [], []
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)
@@ -187,6 +189,7 @@ def test_browse_skips_rogue_responder_failing_tls_pin(monkeypatch: pytest.Monkey
         return [], [], []
 
     monkeypatch.setattr(mdns, "_browse_bonjour", lambda *a, **kw: [])
+    monkeypatch.setattr(mdns, "_browse_avahi", lambda *a, **kw: [])
     monkeypatch.setattr(mdns, "_open_sockets", lambda: [(sock, True)])
     monkeypatch.setattr(select, "select", fake_select)
     monkeypatch.setattr(mdns, "time", clock)

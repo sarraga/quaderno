@@ -260,3 +260,35 @@ def test_new_cli_commands(fake: FakeDevice, mkpdf: MakePdf, tmp_path: Path,
         ["config", "--all"],
     ]:
         assert parser.parse_args(argv, namespace=Q.Args()).cmd == argv[0]
+
+
+def test_decode_ssid_and_wifi_cli_display(fake: FakeDevice,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+    import base64
+    from quaderno.util import decode_ssid
+
+    b64_office = base64.b64encode(b"Office Wi-Fi 5G").decode()
+    b64_utf8 = base64.b64encode("CaféNet".encode("utf-8")).decode()
+    b64_esc = base64.b64encode(b"\x1b[31mEvil").decode()
+
+    assert decode_ssid(b64_office) == "Office Wi-Fi 5G"
+    assert decode_ssid(b64_utf8) == "CaféNet"
+    assert decode_ssid("HomeWiFi") == "HomeWiFi"     # plain text preserved
+    assert decode_ssid("Lab") == "Lab"               # non-multiple-of-4 preserved
+    assert decode_ssid("") == ""
+    assert decode_ssid(b64_esc) == b64_esc           # control chars rejected
+
+    fake.wifi_aps[(b64_office, "psk")] = {"ssid": b64_office, "security": "psk"}
+    orig_info = fake.info
+
+    def info_with_b64_wifi() -> dict[str, dict[str, Any]]:
+        data = dict(orig_info())
+        data["wifi_state"] = {"ssid": b64_office, "security": "psk", "state": "connected"}
+        return data
+
+    fake.info = info_with_b64_wifi  # type: ignore[method-assign]
+    Q.cmd_info(fake, ns(json=False))
+    assert "wifi           connected (Office Wi-Fi 5G)" in capsys.readouterr().out
+
+    Q.cmd_wifi(fake, ns(action="ls"))
+    assert "Office Wi-Fi 5G\tpsk" in capsys.readouterr().out
