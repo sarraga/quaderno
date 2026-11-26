@@ -344,12 +344,15 @@ def discover(serial_hint: str | None = None, on_switch: SwitchHandler | None = N
     if answer_timeout is None:
         answer_timeout = 15 if switched else 3  # a fresh network link needs a few seconds
     deadline = time.time() + answer_timeout
+    seen = not switched  # after switching, the device vanishes briefly while it re-enumerates
     while True:
         cur = next((d for d in usb_devices() if d.serial == dev.serial), None)
-        if cur is None:
+        if cur is not None:
+            seen = True
+            if cur.iface and probe(f"{ip}%{cur.iface}"):
+                return f"{ip}%{cur.iface}"
+            if time.time() > deadline:
+                raise _no_answer(cur, ip)
+        elif seen or time.time() > deadline:
             raise DeviceNotFoundError("the QUADERNO was disconnected")
-        if cur.iface and probe(f"{ip}%{cur.iface}"):
-            return f"{ip}%{cur.iface}"
-        if time.time() > deadline:
-            raise _no_answer(cur, ip)
         time.sleep(1)

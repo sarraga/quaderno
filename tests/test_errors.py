@@ -50,9 +50,12 @@ class FakeBus:
 
     def __init__(self, mode: str | None, switch_after: int | None = None, answers: bool = True,
                  unplug_after: int | None = None, iface: str | None = "en8",
-                 link: bool | None = True, serial: str | None = "850000312345678") -> None:
+                 link: bool | None = True, serial: str | None = "850000312345678",
+                 gap: int = 0) -> None:
         self.mode, self.switch_after, self.answers = mode, switch_after, answers
         self.unplug_after, self.iface, self.link, self.serial = unplug_after, iface, link, serial
+        self.gap = gap          # empty polls between leaving serial mode and appearing as ethernet
+        self.gap_left = 0
         self.polls = 0
         self.sent: list[str] = []
         self.probed: list[str] = []
@@ -60,6 +63,9 @@ class FakeBus:
     def usb_devices(self) -> list[UsbDevice]:
         self.polls += 1
         if self.mode is None or (self.unplug_after is not None and self.polls > self.unplug_after):
+            return []
+        if self.gap_left > 0:
+            self.gap_left -= 1
             return []
         if self.mode == "serial":
             return [UsbDevice(PID_SERIAL, self.serial, "/dev/cu.usbmodemFAKE")]
@@ -69,6 +75,7 @@ class FakeBus:
         self.sent.append(tty)
         if self.switch_after is not None and len(self.sent) >= self.switch_after:
             self.mode = "ethernet"
+            self.gap_left = self.gap
 
     def probe(self, addr: str, timeout: float = 1.5) -> bool:
         self.probed.append(addr)
@@ -162,6 +169,18 @@ def test_no_permission_names_the_ports_group(tmp_path: Path) -> None:
 def test_discover_unplugged_while_waiting(on_bus: OnBus) -> None:
     with pytest.raises(quaderno.DeviceNotFoundError, match="disconnected"):
         on_bus(FakeBus("ethernet", answers=False, unplug_after=1))
+
+
+def test_discover_waits_through_reenumeration_gap(on_bus: OnBus) -> None:
+    """After leaving serial mode, Linux drops the device briefly before ethernet enumerates."""
+    bus = FakeBus("serial", switch_after=1, gap=3)
+    assert on_bus(bus) == "fe80::c8d3:84ff:fec2:323b%en8"
+    assert bus.gap_left == 0
+
+
+def test_discover_unplugged_during_reenumeration(on_bus: OnBus) -> None:
+    with pytest.raises(quaderno.DeviceNotFoundError, match="disconnected"):
+        on_bus(FakeBus("serial", switch_after=1, gap=99))
 
 
 @pytest.mark.parametrize("serial,hint", [("85000A", None), (None, "not-a-serial")])
