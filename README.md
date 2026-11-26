@@ -1,12 +1,12 @@
 # quaderno
 
-A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected over USB to a Mac or a Linux computer.
+A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP1/RP1) connected over **USB** or **Wi-Fi** to a Mac or a Linux computer.
 It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io).
 It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
 **New here? Start with the [manual](docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
 
-Tested end-to-end against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP and Web API 2.1 on both **macOS** and **Linux** (systemd-udevd + NetworkManager). The full cycle (cold plug-in, USB mode switch, pairing, login, info, config, search, screenshot, download, and file operations) was exercised with the official app closed. The code differs between the two systems only in how it finds the device on USB (`ioreg` on macOS, `sysfs` on Linux), and the offline test suite covers both.
+Tested end-to-end against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP and Web API 2.1 over USB on both **macOS** and **Linux** (systemd-udevd + NetworkManager), and over **Wi-Fi** (zero-dependency mDNS/Bonjour discovery with TLS 1.2 certificate pinning) on macOS. The full cycle (cold plug-in, USB mode switch, Wi-Fi discovery, pairing, login, info, config, search, screenshot, download, and file operations) was exercised with the official app closed. The code differs between macOS and Linux only in OS discovery hooks (`ioreg`/Bonjour on macOS, `sysfs` on Linux), and the offline test suite covers both.
 
 ## Install
 
@@ -148,6 +148,7 @@ quaderno ping && quaderno info
 
 ```
 quaderno ls Bo⇥                      ->  quaderno ls Books/
+quaderno --wifi ls Bo⇥               ->  quaderno --wifi ls Books/
 quaderno get Books/milit⇥            ->  quaderno get Books/Military\ History/
 quaderno put x.pdf -d Books/Mil⇥     ->  only folders are offered after -d
 quaderno mv 'Books/Fight⇥            ->  quoting is handled, inside quotes or with \
@@ -158,8 +159,9 @@ How it behaves:
 - **Letter case** is ignored in the part you're completing.
 - **Patterns** containing `*`, `?` or `[` are left untouched.
 - **With the device unplugged**, nothing is offered, without any delay.
-- **`--config DIR` and `--addr ADDR`** typed before the command apply to completion too.
+- **`--config DIR`, `--addr ADDR`, `--wifi`, and `--usb`** typed before the subcommand apply to completion too. Over `--wifi`, completion only probes the cached IP in `wifi_addr.dat` (short timeout) and never blocks on an mDNS scan; run one `quaderno --wifi ping` first if the cache doesn't exist yet.
 - **Right after plugging in**, the first Tab switches the device to USB networking, which takes about 4 s. Later Tabs take about 0.4 s.
+- **After updating the checkout**, reload the completion function in already-open zsh shells with `unfunction _quaderno && autoload -Uz _quaderno`.
 
 `pip install` doesn't install this file: zsh reads it straight from the checkout. To enable it, add to `~/.zshrc`. `fpath` must come before `compinit`:
 
@@ -352,7 +354,7 @@ Everything the command does — plus low-level v2 document/folder operations, do
 import quaderno
 from quaderno import DialogParameters, WifiApConfig
 
-with quaderno.connect() as dev:                  # find it on USB, log in (closes the connection after)
+with quaderno.connect() as dev:                  # USB by default; pass transport="wifi" or "auto" for Wi-Fi
     dev.ping()
     for e in dev.entries("Books", v2=True):      # Entry: name, path, relpath, ext_id, size, pages, ...
         print(e.relpath, e.size)
@@ -400,9 +402,12 @@ The credentials are stored in `~/.config/quaderno/` (set `$QUADERNO_CONFIG` to c
 | `privatekey.dat` | RSA private key, PKCS#1 PEM | **600** |
 | `publickey.dat` | public key sent to the device | 644 |
 | `devicecert.bin` | the device's TLS certificate, received during pairing | 644 |
-| `serial.dat` | device serial number, used to compute its address | 644 |
+| `serial.dat` | device serial number, used to compute its USB address and match over mDNS | 644 |
+| `wifi_addr.dat` | last TLS-verified Wi-Fi IP address, cached for fast `--wifi` reconnects | 644 |
 
 `pair` refuses to replace an existing pairing unless you pass `--force`.
+
+**USB vs. Wi-Fi pairing:** pair over USB whenever possible. Once paired, the same credentials and pinned certificate (`devicecert.bin`) work over both USB and Wi-Fi. Pairing over Wi-Fi (`quaderno --wifi pair`) works, but because the tablet's registration endpoint uses unencrypted HTTP (port `8080`), an active attacker on a shared network could MITM the PIN exchange; `quaderno` prints a warning when pairing over a Wi-Fi IP.
 
 **Where credentials come from**, in order: `--config DIR`, then `$QUADERNO_CONFIG`, then `~/.config/quaderno`.
 
@@ -457,7 +462,8 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
 | `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
 | `tests/test_errors.py` | discovery states (stuck serial mode...), reading `ioreg` and a simulated Linux sysfs, `linux-setup`, HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
-| `tests/test_mdns.py` | pure-stdlib DNS-SD/mDNS packet encoding/decoding, serial matching, cached Wi-Fi IP probe, USB → Wi-Fi fallback, CLI `--usb`/`--wifi` |
+| `tests/test_mdns.py` | pure-stdlib DNS-SD/mDNS packet encoding/decoding, macOS Bonjour fast-path, VPN interface filtering, dual-stack dedup, cached Wi-Fi IP probe, USB → Wi-Fi fallback, CLI `--usb`/`--wifi` |
+| `tests/test_hardening.py` | adversarial tests: mDNS SSRF/DoS/flood/pin-mismatch defenses, sync path traversal and symlink guards, protocol loop/size bounds, X.509 cert validation, terminal escape sanitization |
 | `tests/test_types.py` | `mypy --strict` over the package and the tests (skipped if mypy isn't installed) |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
@@ -496,19 +502,53 @@ tests/                  offline tests (fake device) and manual device checks
 
 ## Wi-Fi
 
-By default `quaderno` connects over USB only. Pass `--wifi` to discover the device over Wi-Fi automatically via mDNS (`_dp_fujitsu._tcp.local`, pure Python stdlib — no extra dependencies):
+By default `quaderno` connects over USB only (no network traffic or mDNS delay when unplugged). Pass `--wifi` before the subcommand to connect over Wi-Fi using the **same USB-paired credentials and pinned TLS certificate**:
 
-```
-quaderno --wifi info
-quaderno --wifi ls
-quaderno --wifi addr
+```sh
+# Basic Wi-Fi commands (unplug USB, wake the tablet on the same Wi-Fi network)
+quaderno --wifi addr                     # discover & print Wi-Fi IP (e.g. 192.168.0.99)
+quaderno --wifi -v ping                  # verify TLS-pinned login over Wi-Fi
+quaderno --wifi info                     # firmware, storage, battery, Wi-Fi SSID
+quaderno --wifi ls -l Books
+quaderno --wifi put paper.pdf -d Books
+quaderno --wifi get -r Note -o ~/Backup
+quaderno --wifi sync ~/QUADERNO-notes Note
+
+# Transport selection via environment variable
+export QUADERNO_TRANSPORT=auto           # try USB first, fall back to Wi-Fi if unplugged
+quaderno ping                            # uses USB if plugged in, else Wi-Fi
+QUADERNO_TRANSPORT=wifi quaderno ls      # default to Wi-Fi
+QUADERNO_TRANSPORT=wifi quaderno --usb addr  # --usb overrides $QUADERNO_TRANSPORT
+
+# Skip discovery completely with an explicit IP
+quaderno --addr 192.168.0.99 ping
 ```
 
-- **Fast reconnects:** `--wifi` tries the last known Wi-Fi IP cached in `wifi_addr.dat` (verified via `/register/information`) before falling back to an mDNS browse matching `serial.dat`.
-- **Environment override:** set `$QUADERNO_TRANSPORT=wifi` to use Wi-Fi by default (override with `--usb`), or `$QUADERNO_TRANSPORT=auto` to try USB first and fall back to Wi-Fi. Passing `--addr 192.168.x.y` (or `$QUADERNO_ADDR`) skips discovery altogether.
-- **Security:** the same TLS certificate pinning (`devicecert.bin`) applies over Wi-Fi, so a stale DHCP address or rogue host on the LAN is rejected before credentials are sent.
-- **Tab completion:** `quaderno --wifi ...` completion only probes the cached Wi-Fi IP (short timeout) — it never blocks on a multi-second mDNS browse.
-- **Standby note:** depending on `wifi_sleep_policy` (`quaderno config wifi_sleep_policy`), the tablet may stop advertising mDNS after sitting idle; waking it or caching its IP helps.
+From Python:
+
+```python
+import quaderno
+
+with quaderno.connect(transport="wifi") as dev:   # or transport="auto"
+    print(dev.addr, dev.info()["battery"])
+```
+
+Adding a Wi-Fi network to the tablet from the CLI (prompts interactively on a TTY or reads from stdin so the password doesn't land in shell history):
+
+```sh
+quaderno wifi scan
+quaderno wifi add "MyWiFi" --security psk              # prompts securely for password
+printf '%s\n' "$WIFI_PASS" | quaderno wifi add "MyWiFi" --password-stdin
+quaderno config wifi_sleep_policy disabled             # keep Wi-Fi awake while idle
+```
+
+How Wi-Fi discovery works (zero external dependencies):
+- **Fast path (`wifi_addr.dat`, ~0.3 s):** `--wifi` first probes the last verified IP cached in `~/.config/quaderno/wifi_addr.dat` with a TLS 1.2 certificate-pin check (`devicecert.bin`). If the IP is stale or changed by DHCP, it automatically falls back to mDNS and updates the cache after login succeeds.
+- **macOS Bonjour fast-path (~15 ms lookup):** on macOS, `quaderno/mdns.py` first queries the system `mDNSResponder` cache via `libSystem.B.dylib` (`DNSServiceBrowse` / `DNSServiceResolve` / `DNSServiceGetAddrInfo`). This finds an idle tablet immediately even when Wi-Fi power-save drops raw multicast probes.
+- **Cross-platform stdlib UDP mDNS fallback:** browses `_dp_fujitsu._tcp.local` over `224.0.0.251:5353`, pinning `IP_MULTICAST_IF` / `IP_ADD_MEMBERSHIP` to active non-loopback, non-point-to-point LAN interfaces (skipping VPN tunnels like `utun*`) and resending queries every `0.5 s` up to `5 s`.
+- **Hardening on untrusted LANs:** discovery refuses non-`8080` SRV ports and loopback/multicast/link-local/unspecified IPs, caps probe counts and response sizes, and verifies `devicecert.bin` over TLS 1.2 *before* accepting or caching an IP. If a cached IP fails TLS pinning, `wifi_addr.dat` is automatically cleared.
+- **Tab completion:** `quaderno --wifi ls Bo⇥` probes only the cached `wifi_addr.dat` IP (short timeout) and never blocks on an mDNS scan.
+- **Standby note:** check `quaderno --wifi config wifi_sleep_policy`. With sleep enabled, the tablet drops off Wi-Fi after sitting idle; wake it with its power button or set `wifi_sleep_policy` to `disabled`.
 
 ## If you also use the official QUADERNO app
 
@@ -579,6 +619,9 @@ computer slept. Wake it with its power button, or unplug and re-plug it, then tr
 - **`isn't the one these credentials were paired with`**: a different QUADERNO is plugged in. Plug in the paired one, or pair this one into its own folder with `quaderno --config DIR pair` and use `--config DIR` with it.
 - **`couldn't read the list of USB devices`**: macOS's `ioreg` failed or timed out, or Linux's `/sys/bus/usb/devices` couldn't be read; the message includes why. This is not the same as the device being absent.
 - **`finding the QUADERNO on USB isn't supported on ...`**: only macOS and Linux can find the device on USB. On other systems, give its address with `--addr`.
+- **`no QUADERNO found on Wi-Fi via mDNS`**: make sure the tablet is awake, Wi-Fi is turned on (`quaderno wifi status` over USB, or on the tablet's settings), and both devices are on the same subnet (some guest networks or AP isolation settings block multicast/peer traffic). If you know the tablet's IP from your router, pass `--addr 192.168.x.y` to test direct reachability.
+- **`found QUADERNO (...) on Wi-Fi at ..., but it doesn't answer on port 8443`**: the tablet answered mDNS/port 8080 but HTTPS port 8443 refused or didn't match your pinned `devicecert.bin`. Wake or unlock the tablet; if you recently updated firmware, re-pair with `quaderno pair --force`.
+- **`2 QUADERNOs on Wi-Fi`**: unpaired discovery found multiple tablets; pass `--addr IP` to pick one, or pair first so `serial.dat` selects yours automatically.
 - **`pairing failed: wrong PIN`**: run `pair` again. The device shows a new PIN for each attempt.
 - **`device TLS certificate differs ...`**: this is expected after a firmware update; run `pair --force`. Otherwise, something other than your QUADERNO answered.
 - **`the device rejected this client`**: the device no longer knows this client. Run `pair --force`.

@@ -9,6 +9,7 @@ For every option and the technical details, see the [README](../README.md). For 
 - [First steps](#first-steps)
 - [How the tablet organizes things](#how-the-tablet-organizes-things)
 - [Everyday tasks](#everyday-tasks)
+- [Using it over Wi-Fi](#using-it-over-wi-fi)
 - [Advanced: handle with care](#advanced-handle-with-care)
 - [Using it in scripts](#using-it-in-scripts)
 - [When something goes wrong](#when-something-goes-wrong)
@@ -17,7 +18,7 @@ For every option and the technical details, see the [README](../README.md). For 
 
 ## What this is
 
-The Fujitsu QUADERNO is an e-paper tablet for reading PDFs and writing notes by hand with a pen. Fujitsu's own way to move files on and off it is a desktop app. `quaderno` is an independent alternative: a command you type in a terminal on your Mac or Linux computer, with a Python library underneath, that talks to the tablet directly over the USB cable.
+The Fujitsu QUADERNO is an e-paper tablet for reading PDFs and writing notes by hand with a pen. Fujitsu's own way to move files on and off it is a desktop app. `quaderno` is an independent alternative: a command you type in a terminal on your Mac or Linux computer, with a Python library underneath, that talks to the tablet directly over USB or Wi-Fi.
 
 Why use it instead of the app?
 
@@ -31,7 +32,7 @@ What you need:
 - **A QUADERNO.** It was built and tested on the A4 model (FMV-DP41). Other models are untested.
 - **A Mac or a Linux computer.** Linux needs one extra setup step, described under [Install it](#install-it).
 - **Python 3.11 or newer.**
-- **A USB cable that carries data.** Some cables only charge; with those the tablet never shows up.
+- **A USB cable that carries data.** Some cables only charge; with those the tablet never shows up. You need it for initial pairing (after that, you can also work wirelessly over Wi-Fi).
 
 You don't need Fujitsu's app. If you already use it, both can be used side by side.
 
@@ -349,6 +350,65 @@ quaderno -v ping               # also shows which address and keys are in use
 
 If Fujitsu support asks for a diagnostic log, `quaderno pastlog` downloads it as `quaderno-pastlog.bin`. It's encrypted and can be large (over 100 MB); only Fujitsu can read it.
 
+## Using it over Wi-Fi
+
+Once you've paired the tablet over USB and connected it to the same Wi-Fi network as your computer, you can run any `quaderno` command wirelessly by adding `--wifi` before the subcommand:
+
+```sh
+quaderno --wifi ping
+quaderno --wifi info
+quaderno --wifi ls Books
+quaderno --wifi put paper.pdf -d Books
+quaderno --wifi sync ~/QUADERNO-notes Note
+```
+
+You don't need to pair again: Wi-Fi reuses the same keys and pinned TLS certificate in `~/.config/quaderno/`.
+
+### Putting the tablet on Wi-Fi
+
+You can join Wi-Fi in the tablet's own settings menu, or while plugged in over USB:
+
+```sh
+quaderno wifi on
+quaderno wifi scan
+quaderno wifi add "MyWiFi" --security psk   # prompts for the password without saving it in history
+quaderno wifi status
+```
+
+### Fast reconnects and choosing a default transport
+
+By default, `quaderno` only checks USB so it fails immediately when nothing is plugged in. You can change that with an environment variable in your shell profile (`~/.zshrc` or `~/.bashrc`):
+
+```sh
+# Try USB first; if unplugged, automatically fall back to Wi-Fi
+export QUADERNO_TRANSPORT=auto
+
+# Or always use Wi-Fi by default (override any single command with --usb)
+export QUADERNO_TRANSPORT=wifi
+quaderno --usb addr
+```
+
+After the first successful `--wifi` login, `quaderno` caches the tablet's IP in `~/.config/quaderno/wifi_addr.dat` so later commands reconnect in about 0.3 seconds. If your router gives the tablet a new IP later, `quaderno` notices automatically, finds the new IP, and updates the cache.
+
+If you already know the tablet's IP, you can also skip discovery with `--addr`:
+
+```sh
+quaderno --addr 192.168.0.99 ls
+```
+
+### Keeping Wi-Fi responsive & Tab completion
+
+- **Wi-Fi sleep:** check `quaderno --wifi config wifi_sleep_policy`. If the tablet turns Wi-Fi off while idle, wake it with its power button—or keep Wi-Fi on with `quaderno --wifi config wifi_sleep_policy disabled`.
+- **Tab completion:** `quaderno --wifi ls Bo⇥` completes remote folders and files just like USB, using the cached IP in `wifi_addr.dat` so pressing Tab never stalls on a network scan.
+- **From Python:** pass `transport="wifi"` or `transport="auto"` to `quaderno.connect()`:
+
+  ```python
+  import quaderno
+
+  with quaderno.connect(transport="auto") as dev:
+      dev.sync("~/QUADERNO-notes", "Note")
+  ```
+
 ## Advanced: handle with care
 
 These commands change the tablet at a system level. They're there for completeness; most people never need them.
@@ -357,8 +417,8 @@ These commands change the tablet at a system level. They're there for completene
 |---|---|---|
 | `power sleep\|wake\|reboot\|shutdown` | Controls the tablet's power | Acts immediately, without asking. After `shutdown`, the USB link drops and you need the power button to start it again. |
 | `firmware upload FILE` then `firmware update --yes` | Installs a firmware update from Fujitsu's update file | The tablet reboots into update mode. Use only Fujitsu's own file, keep the tablet charged and plugged in, and don't unplug it until it's done. |
-| `wifi on\|off\|scan\|ls\|add\|rm` | Turns Wi-Fi on or off, lists networks and saves new ones | A password typed on the command line is kept in your shell history. Using `quaderno` itself over Wi-Fi is untested. |
-| `certs ls\|add-ca\|add-client\|clear` | Installs certificates for workplace Wi-Fi (EAP) | `clear` removes all of them and needs `--yes`. |
+| `wifi on\|off\|scan\|ls\|add\|rm` | Turns Wi-Fi on or off, lists networks and saves new ones | Omit `--password` to be prompted securely (or use `--password-stdin`) so your Wi-Fi password isn't saved in shell history. |
+| `certs ls\|add-ca\|add-client\|clear` | Installs certificates for workplace Wi-Fi (EAP) | `clear` removes all of them and needs `--yes`. Omit `--password` or use `--password-stdin` for `add-client`. |
 | `config` with `use_mode`, `mtp`, `regulation_voltage`, `additional_client_registration`, `control_servers_editable`, `initialized_flag`, `annotations_permission` | System-level settings | They change how the tablet behaves for every app. Leave them alone unless you know exactly what they do. |
 | `annotations DOC PAGE` | Downloads the raw handwriting data of one page | It's a data file for developers, not a picture. |
 
@@ -403,7 +463,9 @@ The README's Python API section covers the rest.
 
 | Message | What to do |
 |---|---|
-| `no QUADERNO on USB` | Check the cable carries data, not only power, and that the tablet is on. |
+| `no QUADERNO on USB` | Check the cable carries data, not only power, and that the tablet is on. To connect wirelessly instead, pass `--wifi`. |
+| `no QUADERNO found on Wi-Fi via mDNS` | Wake the tablet, check its Wi-Fi is enabled and on the same network as your computer (not a guest/isolated Wi-Fi), or pass `--addr 192.168.x.y`. |
+| `found QUADERNO (...) on Wi-Fi ... doesn't answer on port 8443` | Wake or unlock the tablet; after a firmware update, re-pair with `quaderno pair --force`. |
 | `stayed in USB serial mode` | The tablet was asleep, often after the computer slept. Wake it with its power button, or unplug and re-plug it. |
 | `link is up, but it doesn't answer` | Wake or unlock the tablet. |
 | `not paired` | Pair first: `quaderno pair`. |
