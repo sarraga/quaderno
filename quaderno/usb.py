@@ -144,6 +144,7 @@ def _read(path: str) -> str | None:
 
 
 def _hex(path: str) -> int | None:
+    """Read a sysfs hexadecimal integer from ``path``, or ``None`` if absent/invalid."""
     try:
         return int(_read(path) or "", 16)
     except ValueError:
@@ -211,6 +212,15 @@ def _iface_problem(iface: str) -> str | None:
 # --- switching and probing ----------------------------------------------------------
 
 def switch_to_ethernet(tty: str) -> None:
+    """Configure serial port ``tty`` (9600 8N1 raw) and send ``SWITCH_TO_CDC_ECM``.
+
+    Args:
+        tty: Serial device node (``/dev/cu.usbmodem*`` or ``/dev/ttyACM*``).
+
+    Raises:
+        PermissionError: If the user lacks read/write access to ``tty``.
+        OSError: If the port cannot be opened, configured, or written.
+    """
     import termios
     fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:

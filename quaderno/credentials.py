@@ -24,10 +24,16 @@ class Credentials:
 
 
 def is_paired(cred_dir: str | None = None) -> bool:
+    """Return ``True`` if ``deviceid.dat`` exists in ``cred_dir`` (or ``CONFIG_DIR``)."""
     return os.path.exists(os.path.join(cred_dir or CONFIG_DIR, "deviceid.dat"))
 
 
 def find_credentials_dir(explicit: str | None = None) -> str:
+    """Locate the credentials directory: ``explicit`` if given, else ``CONFIG_DIR``.
+
+    Raises:
+        NotPairedError: If ``explicit`` is not given and ``CONFIG_DIR`` is unpaired.
+    """
     if explicit:
         return explicit
     if is_paired(CONFIG_DIR):
@@ -36,6 +42,14 @@ def find_credentials_dir(explicit: str | None = None) -> str:
 
 
 def load_pinned_cert(cred_dir: str) -> bytes | None:
+    """Load and validate ``devicecert.bin`` from ``cred_dir`` as X.509 DER bytes.
+
+    Returns:
+        DER bytes, or ``None`` if ``devicecert.bin`` does not exist.
+
+    Raises:
+        CertificateError: If ``devicecert.bin`` exists but is not a valid X.509 cert.
+    """
     path = os.path.join(cred_dir, "devicecert.bin")
     if not os.path.exists(path):
         return None
@@ -47,9 +61,23 @@ def load_pinned_cert(cred_dir: str) -> bytes | None:
 
 
 def load_credentials(cred_dir: str | None = None) -> Credentials:
+    """Load client ID, RSA private key, optional serial, and pinned cert from ``cred_dir``.
+
+    Args:
+        cred_dir: Credentials directory path, or ``None`` to use ``find_credentials_dir()``.
+
+    Returns:
+        Populated ``Credentials`` dataclass.
+
+    Raises:
+        NotPairedError: If required pairing files are missing.
+        AuthError: If ``privatekey.dat`` is unreadable or not an RSA key.
+        CertificateError: If ``devicecert.bin`` is corrupt.
+    """
     cred_dir = cred_dir or find_credentials_dir()
 
     def read(name: str) -> str:
+        """Read and strip a required text file inside ``cred_dir``."""
         p = os.path.join(cred_dir, name)
         if not os.path.exists(p):
             raise NotPairedError(f"incomplete pairing: {p} is missing; run `quaderno pair --force`")

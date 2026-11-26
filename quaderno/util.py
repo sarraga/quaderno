@@ -54,11 +54,23 @@ def norm(path: str | None) -> str:
 
 
 def nfc(name: str) -> str:
+    """Normalize ``name`` to Unicode NFC so macOS NFD and device NFC names compare equal."""
     return unicodedata.normalize("NFC", name)
 
 
 def safe_local_name(name: str) -> str:
-    """Device names become local path components; reject anything that could escape."""
+    """Validate a single path component from the device before using it locally.
+
+    Args:
+        name: Single filename or folder name (not a multi-segment path).
+
+    Returns:
+        The validated ``name`` unchanged.
+
+    Raises:
+        QuadernoError: If ``name`` is empty, ``.``, ``..``, contains ``/``, ``\\``,
+            or NUL, or violates Windows reserved/drive-letter rules on ``win32``.
+    """
     if name in ("", ".", "..") or "/" in name or "\\" in name or "\0" in name:
         raise QuadernoError(f"refusing unsafe name from device: {name!r}")
     if sys.platform == "win32":
@@ -69,7 +81,15 @@ def safe_local_name(name: str) -> str:
 
 
 def sanitize_terminal(text: str) -> str:
-    """Escape C0/C1 control characters (including ANSI ESC) for safe TTY output."""
+    """Escape C0/C1 control characters (including ANSI ESC) for safe TTY output.
+
+    Args:
+        text: Untrusted string from the device or network.
+
+    Returns:
+        Copy of ``text`` with control bytes (except ``\\n`` and ``\\t``) replaced by
+        ``\\xNN`` escapes.
+    """
     out: list[str] = []
     for ch in text:
         code = ord(ch)
@@ -100,6 +120,7 @@ def decode_ssid(value: str) -> str:
 
 
 def is_pattern(component: str, regex: bool = False) -> bool:
+    """Return ``True`` if path ``component`` is a pattern (glob metacharacter or regex mode)."""
     return regex or any(c in component for c in GLOB_CHARS)
 
 

@@ -169,6 +169,7 @@ class Device(Client):
         return Entry.from_api(self.request_json("GET", base + quote(folder_id, safe="")))
 
     def try_resolve(self, path: str) -> Entry | None:
+        """Resolve ``path`` to an ``Entry``, returning ``None`` on HTTP 404."""
         try:
             return self.resolve(path)
         except QuadernoError as err:
@@ -177,6 +178,7 @@ class Device(Client):
             raise
 
     def _folder(self, folder: PathOrEntry) -> Entry:
+        """Resolve ``folder`` and verify it is a folder, raising ``QuadernoError`` otherwise."""
         f = folder if isinstance(folder, Entry) else self.resolve(folder)
         if not f.is_folder:
             raise QuadernoError(f"{f.path} is not a folder")
@@ -208,6 +210,7 @@ class Device(Client):
 
     def _children(self, folder_id: str, *, v2: bool = False, order: str | None = None,
                   fields: Sequence[str] | None = None, limit: int | None = None) -> list[Entry]:
+        """List direct child entries of ``folder_id`` via paginated ``entries``/``entries2``."""
         suffix = "entries2" if v2 else "entries"
         q: dict[str, str] = {}
         if order:
@@ -391,22 +394,11 @@ class Device(Client):
         emit(on_event, "uploaded", f"{local} -> {f.path}/{name}", f"{f.path}/{name}")
         return self.resolve(f"{f.path}/{name}")
 
-    def put(self, paths: Patterns, dest: str | None = None, recursive: bool = False,
-            on_event: EventHandler | None = None) -> PutResult:
-        """Upload PDFs and (with recursive=True) local folders, CLI-style:
-        - dest an existing folder: everything goes into it;
-        - dest missing and ending in .pdf: the single file is uploaded under that name;
-        - dest missing, single folder with recursive: the folder is created as dest.
-        Never overwrites (same-named documents are skipped). Paths that can't be
-        uploaded are skipped with a warning event instead of aborting."""
-        named = [paths] if isinstance(paths, str) else list(paths)
-        target = norm(dest) if dest else ROOT
-        d = self.try_resolve(target)
-        if d is not None and not d.is_folder:
-            raise ExistsError(f"{target} already exists")
-        if d is None and len(named) > 1:
-            raise self._no_such_folder(target)
-        res, items = PutResult(), []
+    @staticmethod
+    def _classify_put_inputs(named: Sequence[str], recursive: bool, res: PutResult,
+                             on_event: EventHandler | None) -> list[str]:
+        """Filter local ``put`` arguments, recording missing/rejected items in ``res``."""
+        items: list[str] = []
         for local in named:
             if os.path.isdir(local):
                 if recursive:
@@ -422,6 +414,25 @@ class Device(Client):
                 emit(on_event, "skipped", f"skip {local}: not a PDF", local, True)
             else:
                 items.append(local)
+        return items
+
+    def put(self, paths: Patterns, dest: str | None = None, recursive: bool = False,
+            on_event: EventHandler | None = None) -> PutResult:
+        """Upload PDFs and (with recursive=True) local folders, CLI-style:
+        - dest an existing folder: everything goes into it;
+        - dest missing and ending in .pdf: the single file is uploaded under that name;
+        - dest missing, single folder with recursive: the folder is created as dest.
+        Never overwrites (same-named documents are skipped). Paths that can't be
+        uploaded are skipped with a warning event instead of aborting."""
+        named = [paths] if isinstance(paths, str) else list(paths)
+        target = norm(dest) if dest else ROOT
+        d = self.try_resolve(target)
+        if d is not None and not d.is_folder:
+            raise ExistsError(f"{target} already exists")
+        if d is None and len(named) > 1:
+            raise self._no_such_folder(target)
+        res = PutResult()
+        items = self._classify_put_inputs(named, recursive, res, on_event)
         if not items:
             emit(on_event, "nothing", "nothing to upload", None, True)
             return res
@@ -446,6 +457,7 @@ class Device(Client):
 
     def _put_file(self, local: str, folder_id: str, folder_path: str, name: str,
                   existing: set[str], res: PutResult, on_event: EventHandler | None) -> bool:
+        """Upload one local PDF into ``folder_id`` unless ``name`` already exists there."""
         name = nfc(name)
         if name in existing:
             res.skipped += 1
@@ -490,6 +502,7 @@ class Device(Client):
              remote_path)
 
     def _no_such_folder(self, target: str) -> NotFoundError:
+        """Build a helpful ``NotFoundError`` suggesting similarly named device folders."""
         name = nfc(target.rsplit("/", 1)[-1]).casefold()
         hits = [e.path for e in self.walk(ROOT) if e.is_folder and nfc(e.name).casefold() == name]
         msg = (f"there is no folder {target} on the device; create it with `quaderno mkdir`, "
@@ -527,6 +540,44 @@ class Device(Client):
         emit(on_event, "created", f"created {path}/", path)
         return folder_id
 
+    def _plan_transfer(self, sources: list[Entry], dst: str, *, verb: str,
+                       allow_same: bool = False) -> list[tuple[Entry, str, str, str]]:
+        """Validate destination and compute ``(entry, parent_id, parent_path, name)`` plan.
+
+        Checks all name collisions before any mutation occurs.
+
+        Raises:
+            ExistsError: If any destination name is taken or two sources collide.
+            QuadernoError: If multiple sources target a non-existent folder or a
+                folder would be moved into itself.
+        """
+        d = self.try_resolve(dst)
+        if d is not None and not d.is_folder:
+            raise ExistsError(f"{dst} already exists")
+        if len(sources) > 1 and d is None:
+            raise QuadernoError(f"{len(sources)} items to {verb}: {dst} must be an existing folder")
+        taken = {nfc(c.name) for c in self._children(d.id)} if d is not None else set()
+        plan: list[tuple[Entry, str, str, str]] = []
+        claimed: dict[str, str] = {}
+        for e in sources:
+            if d is not None:
+                parent_id, parent_path, name = d.id, d.path, e.name
+            else:
+                parent_path, name = dst.rsplit("/", 1)
+                parent_id = self.resolve(parent_path).id
+            target = f"{parent_path}/{name}"
+            if not (allow_same and nfc(e.path) == nfc(target)):
+                if e.is_folder and (parent_path == e.path or parent_path.startswith(e.path + "/")):
+                    raise QuadernoError(f"cannot {verb} {e.path} into itself")
+                if nfc(name) in taken:
+                    raise ExistsError(f"cannot {verb} {e.path}: {target} already exists")
+                if nfc(target) in claimed:
+                    raise ExistsError(f"cannot {verb} both {claimed[nfc(target)]} and {e.path} "
+                                      f"to {target}")
+                claimed[nfc(target)] = e.path
+            plan.append((e, parent_id, parent_path, name))
+        return plan
+
     def move(self, patterns: Patterns, dst: str, regex: bool = False,
              on_event: EventHandler | None = None) -> list[tuple[str, str]]:
         """Move or rename documents/folders (patterns allowed). Several sources need
@@ -534,35 +585,10 @@ class Device(Client):
         a name already taken at the destination, or two sources that would land on
         the same name, raise ExistsError. Returns [(old_path, new_path), ...]."""
         sources, _ = self.find_all(patterns, regex)
-        dst = norm(dst)
-        d = self.try_resolve(dst)
-        if d is not None and not d.is_folder:
-            raise ExistsError(f"{dst} already exists")
-        if len(sources) > 1 and d is None:
-            raise QuadernoError(f"{len(sources)} items to move: {dst} must be an existing folder")
         if any(e.path == ROOT for e in sources):
             raise QuadernoError("refusing to move the root folder")
-        taken = {nfc(c.name) for c in self._children(d.id)} if d is not None else set()
-        plan: list[tuple[Entry, str, str, str]] = []
-        claimed: dict[str, str] = {}
-        for e in sources:
-            if d is not None:
-                parent_id, parent_path, name = d.id, d.path, e.name
-            else:  # rename to `dst`, which doesn't exist
-                parent_path, name = dst.rsplit("/", 1)
-                parent_id = self.resolve(parent_path).id
-            target = f"{parent_path}/{name}"
-            if nfc(e.path) != nfc(target):
-                if e.is_folder and (parent_path == e.path or parent_path.startswith(e.path + "/")):
-                    raise QuadernoError(f"cannot move {e.path} into itself")
-                if nfc(name) in taken:
-                    raise ExistsError(f"cannot move {e.path}: {target} already exists")
-                if nfc(target) in claimed:
-                    raise ExistsError(f"cannot move both {claimed[nfc(target)]} and {e.path} "
-                                      f"to {target}")
-                claimed[nfc(target)] = e.path
-            plan.append((e, parent_id, parent_path, name))
-        moved = []
+        plan = self._plan_transfer(sources, norm(dst), verb="move", allow_same=True)
+        moved: list[tuple[str, str]] = []
         for e, parent_id, parent_path, name in plan:
             if nfc(e.path) == nfc(f"{parent_path}/{name}"):
                 emit(on_event, "unchanged", f"{e.path}: already there", e.path)
@@ -584,32 +610,11 @@ class Device(Client):
         may instead name a new file. Name clashes are checked before anything is
         copied. Returns [(source_path, new_path), ...]."""
         sources, _ = self.find_all(patterns, regex)
-        dst = norm(dst)
-        d = self.try_resolve(dst)
-        if d is not None and not d.is_folder:
-            raise ExistsError(f"{dst} already exists")
         folders = [e.path for e in sources if e.is_folder]
         if folders:
             raise QuadernoError(f"cannot copy the folder {folders[0]} (only documents can be copied)")
-        if len(sources) > 1 and d is None:
-            raise QuadernoError(f"{len(sources)} items to copy: {dst} must be an existing folder")
-        taken = {nfc(c.name) for c in self._children(d.id)} if d is not None else set()
-        plan: list[tuple[Entry, str, str, str]] = []
-        claimed: dict[str, str] = {}
-        for e in sources:
-            if d is not None:
-                parent_id, parent_path, name = d.id, d.path, e.name
-            else:  # copy to `dst`, which doesn't exist: a new name
-                parent_path, name = dst.rsplit("/", 1)
-                parent_id = self.resolve(parent_path).id
-            target = f"{parent_path}/{name}"
-            if nfc(name) in taken:
-                raise ExistsError(f"cannot copy {e.path}: {target} already exists")
-            if nfc(target) in claimed:
-                raise ExistsError(f"cannot copy both {claimed[nfc(target)]} and {e.path} to {target}")
-            claimed[nfc(target)] = e.path
-            plan.append((e, parent_id, parent_path, name))
-        copied = []
+        plan = self._plan_transfer(sources, norm(dst), verb="copy")
+        copied: list[tuple[str, str]] = []
         for e, parent_id, parent_path, name in plan:
             r = self.request("POST", f"/documents/{e.id}/copy",
                              {"parent_folder_id": parent_id, "file_name": name}, ok=(200, 201))
@@ -659,6 +664,7 @@ class Device(Client):
         return plan
 
     def _delete_empty_folder(self, e: Entry, on_event: EventHandler | None) -> None:
+        """Verify folder ``e`` has no children and delete it on the device."""
         # Firmware refuses non-empty folder deletion with 400/40018 unless
         # force_delete_flag="true" is passed; we still verify emptiness up front
         # so rm -r deletes items individually with progress events.
@@ -752,6 +758,7 @@ class Device(Client):
 
     # --- viewer & note templates -----------------------------------------------
     def _single_document(self, path: PathOrEntry, regex: bool = False) -> Entry:
+        """Resolve ``path``/pattern to exactly one document ``Entry`` or raise ``QuadernoError``."""
         matches = [path] if isinstance(path, Entry) else self.find(path, regex)[0]
         docs = [e for e in matches if e.is_document]
         if len(docs) != 1:
@@ -899,6 +906,7 @@ class Device(Client):
         return value
 
     def timezone(self) -> str | None:
+        """Return the device's configured IANA timezone string, or ``None`` if absent."""
         value = (self.request("GET", "/system/configs/timezone") or {}).get("value")
         return value if isinstance(value, str) else None
 
@@ -972,6 +980,7 @@ class Device(Client):
         """Firmware, storage, battery, owner, MAC, Wi-Fi state: the device's raw
         answers (a part that failed holds {'error': ...})."""
         def get(path: str) -> JsonObject:
+            """Fetch one status endpoint, returning ``{'error': ...}`` on failure."""
             try:
                 return self.request("GET", path) or {}
             except QuadernoError as err:

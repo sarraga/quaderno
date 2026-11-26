@@ -40,6 +40,22 @@ def _try_cached_wifi(cached_addr: str, serial_hint: str | None, *,
 def _discover_wifi(serial_hint: str | None, *, cached_addr: str | None,
                    mdns_timeout: float, on_wifi_addr: Callable[[str], None] | None,
                    pinned_cert: bytes | None = None) -> str:
+    """Resolve a Wi-Fi address via cached probe first, then mDNS/Bonjour discovery.
+
+    Args:
+        serial_hint: Paired device serial number, or ``None``.
+        cached_addr: Previously cached Wi-Fi IP from ``wifi_addr.dat``, or ``None``.
+        mdns_timeout: Discovery timeout in seconds if cache misses.
+        on_wifi_addr: Optional callback invoked with a freshly discovered IP.
+        pinned_cert: Optional DER TLS certificate for cryptographic probe checks.
+
+    Returns:
+        Reachable Wi-Fi IP address string.
+
+    Raises:
+        DeviceNotFoundError: If no matching device is discovered on Wi-Fi.
+        DeviceUnreachableError: If the discovered device refuses port 8443.
+    """
     if cached_addr and _try_cached_wifi(cached_addr, serial_hint, pinned_cert=pinned_cert):
         return cached_addr
     if pinned_cert is not None:

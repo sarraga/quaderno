@@ -101,7 +101,9 @@ def show(event: Event) -> None:
 
 
 def open_device(args: Args) -> Device:
+    """Connect and authenticate to the device using CLI flags in ``args``."""
     def on_switch(tty: str, serial: str | None) -> None:
+        """Report USB serial-to-Ethernet mode switching when ``-v`` is enabled."""
         if args.verbose:
             print(f"switching {tty} ({serial}) to USB Ethernet", file=sys.stderr)
     dev = connect(addr=args.addr, config_dir=args.config_dir, on_switch=on_switch,
@@ -116,7 +118,7 @@ def open_device(args: Args) -> Device:
 # --- commands (each takes a Device and the parsed args) ---------------------------
 
 def _row(e: Entry, long: bool, full_path: bool) -> str:
-    """One listing line: the name or full path, and with -l size, date and pages."""
+    """Format one listing line: name/full path, plus size, date, and pages with ``-l``."""
     name = (e.path if full_path else e.name) + ("/" if e.is_folder else "")
     if not long:
         return name
@@ -127,6 +129,7 @@ def _row(e: Entry, long: bool, full_path: bool) -> str:
 
 
 def cmd_ls(dev: Device, args: Args) -> None:
+    """Handle ``quaderno ls``: list a folder or pattern matches."""
     rows, by_pattern = dev.ls(args.path, recursive=args.recursive, regex=args.regex)
     full_path = args.recursive or by_pattern
     for e in rows:
@@ -139,6 +142,7 @@ _SORT_FIELDS = {"name": "entry_name", "title": "title", "author": "author",
 
 
 def cmd_search(dev: Device, args: Args) -> None:
+    """Handle ``quaderno search``: search device metadata, body text, or marks."""
     order = f"{_SORT_FIELDS[args.sort]}_{'desc' if args.desc else 'asc'}" if args.sort else None
     entry_type = "notes" if args.notes else "docs" if args.docs else "all"
     origin = getattr(args, "origin_folder", None)
@@ -151,10 +155,12 @@ def cmd_search(dev: Device, args: Args) -> None:
 
 
 def cmd_cp(dev: Device, args: Args) -> None:
+    """Handle ``quaderno cp``: copy documents server-side on the device."""
     dev.copy(args.src, args.dst, regex=args.regex, on_event=show)
 
 
 def cmd_viewing(dev: Device, args: Args) -> None:
+    """Handle ``quaderno viewing``: print currently open documents and page numbers."""
     views = dev.current_viewing().get("views")
     if not isinstance(views, list) or not views:
         print("nothing is open on the device")
@@ -171,6 +177,7 @@ def cmd_viewing(dev: Device, args: Args) -> None:
 
 
 def cmd_config(dev: Device, args: Args) -> None:
+    """Handle ``quaderno config``: list, read, or update device configuration keys."""
     if getattr(args, "all_configs", False):
         print(json.dumps(dev.configs_v3(), indent=2))
         return
@@ -188,20 +195,21 @@ def cmd_config(dev: Device, args: Args) -> None:
 
 
 def cmd_get(dev: Device, args: Args) -> None:
+    """Handle ``quaderno get``: download documents or recursive folder trees."""
     dev.get(args.remote, args.output or ".", recursive=args.recursive, regex=args.regex,
             on_event=show)
 
 
 def cmd_put(dev: Device, args: Args) -> int | None:
-    """Uploads what it can, like cp. Exit status 1 if anything named couldn't be
-    uploaded (missing, not a PDF, a folder without -r). Files already on the
-    device and non-PDFs inside folders uploaded with -r don't count."""
+    """Handle ``quaderno put``: upload PDFs/folders; returns 1 if any named path failed."""
     res = dev.put(args.local, args.dest, recursive=args.recursive, on_event=show)
     return 1 if res.missing or res.rejected else None
 
 
 def cmd_rm(dev: Device, args: Args) -> None:
+    """Handle ``quaderno rm``: delete documents or folders with pattern confirmation."""
     def confirm(plan: list[Entry]) -> bool:
+        """Prompt for confirmation on pattern matches when attached to a TTY."""
         print(f"pattern matches {len(plan)}:")
         for e in plan:
             print("  " + e.path + ("/" if e.is_folder else ""))
@@ -217,21 +225,25 @@ def cmd_rm(dev: Device, args: Args) -> None:
 
 
 def cmd_mkdir(dev: Device, args: Args) -> None:
+    """Handle ``quaderno mkdir``: create one or more device folders."""
     for path in args.remote:
         dev.mkdir(path, parents=args.parents, on_event=show)
 
 
 def cmd_mv(dev: Device, args: Args) -> None:
+    """Handle ``quaderno mv``: move or rename documents and folders."""
     dev.move(args.src, args.dst, regex=args.regex, on_event=show)
 
 
 def cmd_info(dev: Device, args: Args) -> None:
+    """Handle ``quaderno info``: print firmware, storage, battery, owner, and Wi-Fi status."""
     info = dev.info()
     if args.json:
         print(json.dumps(info, indent=2))
         return
 
     def val(d: JsonObject, k: str = "value") -> object:
+        """Extract display field ``k`` (or ``'error'`` / ``'?'``) from an info sub-object."""
         return d.get(k, d.get("error", "?"))
     st, b = info["storage"], info["battery"]
     print(f"address        {dev.addr}")
@@ -256,6 +268,7 @@ def cmd_info(dev: Device, args: Args) -> None:
 
 
 def cmd_screenshot(dev: Device, args: Args) -> None:
+    """Handle ``quaderno screenshot``: save the current screen as PNG or JPEG."""
     fmt = getattr(args, "format", None)
     default_out = "quaderno-screen.jpg" if fmt == "jpeg" else "quaderno-screen.png"
     output = args.output or default_out
@@ -264,16 +277,19 @@ def cmd_screenshot(dev: Device, args: Args) -> None:
 
 
 def cmd_ping(dev: Device, args: Args) -> None:
+    """Handle ``quaderno ping``: verify authenticated connectivity and print ``ok``."""
     dev.ping()
     print("ok")
 
 
 def cmd_marks(dev: Device, args: Args) -> None:
+    """Handle ``quaderno marks``: list preset annotation mark names."""
     for m in dev.preset_marks():
         print(m)
 
 
 def cmd_replace(dev: Device, args: Args) -> None:
+    """Handle ``quaderno replace``: replace a document's PDF content in place."""
     res = dev.replace_document(args.remote_doc, args.file, target_revision=args.revision,
                                on_event=show)
     rev = res.get("file_revision")
@@ -282,6 +298,7 @@ def cmd_replace(dev: Device, args: Args) -> None:
 
 
 def cmd_annotations(dev: Device, args: Args) -> None:
+    """Handle ``quaderno annotations``: download raw annotation bytes for one page."""
     output = args.output or f"annotations-p{args.page}.bin"
     assert args.page is not None
     n = dev.download_annotation(args.remote_doc, args.page, output)
@@ -289,18 +306,20 @@ def cmd_annotations(dev: Device, args: Args) -> None:
 
 
 def cmd_pastlog(dev: Device, args: Args) -> None:
+    """Handle ``quaderno pastlog``: download the encrypted diagnostic log archive."""
     output = args.output or "quaderno-pastlog.bin"
     n = dev.download_pastlog(output)
     print(f"saved {output} ({human(n)})")
 
 
 def cmd_templates(dev: Device, args: Args) -> None:
+    """Handle ``quaderno templates``: list, upload, rename, or delete note templates."""
     if args.action == "ls":
         for t in dev.note_templates():
             tid = t.get("note_template_id", "?")
             name = t.get("template_name", "?")
             mod = t.get("is_modifiable", "")
-            print(f"{tid}  {name}" + (f"  (modifiable={mod})" if mod else ""))
+            print(_tty_safe(f"{tid}  {name}" + (f"  (modifiable={mod})" if mod else "")))
     elif args.action == "add":
         tid = dev.upload_note_template(args.file, name=args.name, on_event=show)
         print(tid)
@@ -314,6 +333,7 @@ def cmd_templates(dev: Device, args: Args) -> None:
 
 
 def cmd_wifi(dev: Device, args: Args) -> None:
+    """Handle ``quaderno wifi``: inspect, toggle, scan, list, add, or remove Wi-Fi APs."""
     if args.action == "status":
         state: JsonObject = dict(dev.wifi_state())
         if isinstance(state.get("ssid"), str):
@@ -342,6 +362,7 @@ def cmd_wifi(dev: Device, args: Args) -> None:
 
 
 def cmd_power(dev: Device, args: Args) -> None:
+    """Handle ``quaderno power``: sleep, wake, reboot, or shut down the device."""
     actions: dict[str, Callable[[], None]] = {
         "sleep": dev.sleep, "wake": dev.wake, "reboot": dev.reboot, "shutdown": dev.shutdown,
     }
@@ -350,6 +371,7 @@ def cmd_power(dev: Device, args: Args) -> None:
 
 
 def cmd_firmware(dev: Device, args: Args) -> None:
+    """Handle ``quaderno firmware``: precheck, upload, or start a firmware update."""
     if args.action == "precheck":
         print(json.dumps(dev.firmware_precheck(), indent=2))
     elif args.action == "upload":
@@ -363,6 +385,7 @@ def cmd_firmware(dev: Device, args: Args) -> None:
 
 
 def cmd_pen_buttons(dev: Device, args: Args) -> None:
+    """Handle ``quaderno pen-buttons``: inspect or assign pen button functions."""
     if args.action == "ls":
         print(json.dumps(dev.pen_buttons(), indent=2))
     elif args.action == "set":
@@ -371,6 +394,7 @@ def cmd_pen_buttons(dev: Device, args: Args) -> None:
 
 
 def cmd_certs(dev: Device, args: Args) -> None:
+    """Handle ``quaderno certs``: list, install CA/client, or clear user certificates."""
     if args.action == "ls":
         print(json.dumps({"ca": dev.ca_certificates(), "client": dev.client_certificates()}, indent=2))
     elif args.action == "add-ca":
@@ -393,12 +417,14 @@ def cmd_certs(dev: Device, args: Args) -> None:
 
 
 def cmd_open(dev: Device, args: Args) -> None:
+    """Handle ``quaderno open``: open a matching document (and optional page) on screen."""
     e = dev.open(args.target, page=args.page, regex=args.regex)
     where = f" at page {args.page}" if args.page is not None else ""
     print(f"opened {e.path}{where} on the device")
 
 
 def local_timezone_name() -> str:
+    """Return this computer's IANA timezone name from ``/etc/localtime``, or ``TZ``."""
     try:
         return os.readlink("/etc/localtime").split("zoneinfo/", 1)[1]
     except (OSError, IndexError):
@@ -406,6 +432,7 @@ def local_timezone_name() -> str:
 
 
 def cmd_time(dev: Device, args: Args) -> None:
+    """Handle ``quaderno time``: set device UTC clock and report timezone mismatches."""
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     print(f"device clock set to {dev.set_time(now)}")
     tz = dev.timezone()
@@ -425,6 +452,7 @@ def cmd_time(dev: Device, args: Args) -> None:
 
 
 def cmd_sync(dev: Device, args: Args) -> None:
+    """Handle ``quaderno sync``: incrementally mirror a remote folder to local disk."""
     dev.sync(args.directory, args.folder, delete=args.delete, dry_run=args.dry_run,
              force=args.force, on_event=show)
 
@@ -452,7 +480,9 @@ echo "done: unplug the QUADERNO and plug it back in"
 
 
 def cmd_pair(args: Args) -> None:
+    """Handle ``quaderno pair``: discover the device and run interactive or pin-file pairing."""
     def read_pin() -> str:
+        """Read the device PIN from ``--pin-file``, interactive prompt, or stdin."""
         prompt = "Enter the PIN shown on the QUADERNO: "
         if args.pin_file:
             # Lets another process (or person) supply the PIN by writing this file.
@@ -474,9 +504,12 @@ def cmd_pair(args: Args) -> None:
         return sys.stdin.readline()
 
     def on_event(ev: Event) -> None:
-        print(ev.message, file=sys.stderr if ev.warning else sys.stdout, flush=True)
+        """Print pairing progress immediately, sending warnings to stderr."""
+        stream = sys.stderr if ev.warning else sys.stdout
+        print(_tty_safe(ev.message, stream), file=stream, flush=True)
 
     def on_switch(tty: str, serial: str | None) -> None:
+        """Log USB serial-mode switching during pairing when ``-v`` is set."""
         if args.verbose:
             print(f"switching {tty} ({serial})", file=sys.stderr)
     transport = discovery.parse_transport(args.transport or os.environ.get("QUADERNO_TRANSPORT"))
@@ -486,13 +519,8 @@ def cmd_pair(args: Args) -> None:
                  on_event=on_event)
 
 
-def complete(argv: list[str]) -> int:
-    """`quaderno __complete [--dirs] [--config DIR] [--addr ADDR] [--usb|--wifi] [--] PREFIX`:
-    device paths for shell Tab completion, one per line, folders ending in '/'.
-    Lists the folder PREFIX is in, keeping the folder part exactly as typed. The
-    shell passes on global options from the command line being completed.
-    Never prints errors; prints nothing (at once) when the device isn't connected
-    (never blocks on a slow mDNS scan)."""
+def _parse_complete_args(argv: list[str]) -> tuple[bool, str | None, str | None, str | None, str]:
+    """Parse ``__complete`` flags into ``(dirs_only, config_dir, addr, transport_flag, prefix)``."""
     dirs_only = False
     config_dir: str | None = None
     addr: str | None = os.environ.get("QUADERNO_ADDR")
@@ -518,22 +546,41 @@ def complete(argv: list[str]) -> int:
             break
         else:
             prefix = a
+    return dirs_only, config_dir, addr, transport_flag, prefix
+
+
+def _resolve_complete_target(addr: str | None, config_dir: str | None,
+                             transport: discovery.Transport) -> tuple[str, credentials.Credentials] | None:
+    """Resolve ``(target_addr, creds)`` for Tab completion without blocking on mDNS."""
+    if addr:
+        return addr, credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+    if transport != "wifi" and usb.is_supported() and usb.usb_devices():
+        creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+        return usb.discover(creds.serial), creds
+    if transport != "usb":
+        creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+        cached = credentials.load_wifi_addr(creds.source)
+        if cached and usb.probe(cached, timeout=0.8):
+            return cached, creds
+    return None
+
+
+def complete(argv: list[str]) -> int:
+    """Handle ``quaderno __complete`` for zsh remote path Tab completion.
+
+    Args:
+        argv: Arguments following ``__complete`` (options plus ``-- PREFIX``).
+
+    Returns:
+        Always ``0``; suppresses errors and never blocks on a cold mDNS browse.
+    """
+    dirs_only, config_dir, addr, transport_flag, prefix = _parse_complete_args(argv)
     try:
         transport = discovery.parse_transport(transport_flag or os.environ.get("QUADERNO_TRANSPORT"))
-        target = addr
-        if target:
-            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
-        elif transport != "wifi" and usb.is_supported() and usb.usb_devices():
-            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
-            target = usb.discover(creds.serial)
-        elif transport != "usb":
-            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
-            cached = credentials.load_wifi_addr(creds.source)
-            if not cached or not usb.probe(cached, timeout=0.8):
-                return 0
-            target = cached
-        else:
+        resolved = _resolve_complete_target(addr, config_dir, transport)
+        if resolved is None:
             return 0
+        target, creds = resolved
         with Device(target, creds.client_id, creds.key, timeout=5,
                     pinned_cert=creds.pinned_cert) as dev:
             dev.authenticate()
@@ -552,33 +599,11 @@ def complete(argv: list[str]) -> int:
 
 # --- argument parsing -------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="quaderno",
-                                 description="Fujitsu QUADERNO over USB or Wi-Fi: files, sync, pairing.")
-    ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' or '192.168.1.42' (default: USB)")
-    tr = ap.add_mutually_exclusive_group()
-    tr.add_argument("--wifi", dest="transport", action="store_const", const="wifi",
-                    help="discover over Wi-Fi via mDNS (opt-in; skips USB)")
-    tr.add_argument("--usb", dest="transport", action="store_const", const="usb",
-                    help="connect over USB (default; overrides $QUADERNO_TRANSPORT)")
-    ap.add_argument("--config", dest="config_dir", metavar="DIR",
-                    help="credentials directory, for reading and for `pair` "
-                         "(default: $QUADERNO_CONFIG or ~/.config/quaderno)")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    # Remote paths in ls/get/mv/rm/open accept glob patterns ('Fighter*'); -E makes
-    # them regular expressions. Quote them so the shell leaves them alone.
-    pat = argparse.ArgumentParser(add_help=False)
-    pat.add_argument("-E", "--regex", action="store_true",
-                     help="treat remote path components as regular expressions "
-                          "(case-insensitive search) instead of glob patterns")
+_AddParser = Callable[..., argparse.ArgumentParser]
 
-    def add(name: str, fn: Command | None, help: str,
-            patterns: bool = False) -> argparse.ArgumentParser:
-        p = sub.add_parser(name, help=help, parents=[pat] if patterns else [])
-        p.set_defaults(fn=fn)
-        return p
 
+def _add_file_commands(add: _AddParser) -> None:
+    """Register file, folder, search, sync, and document transfer subcommands."""
     p = add("ls", cmd_ls, "list a folder (default: Document)", patterns=True)
     p.add_argument("path", nargs="?", default=ROOT)
     p.add_argument("-l", "--long", action="store_true", help="size, date, pages")
@@ -607,13 +632,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("src", nargs="+")
     p.add_argument("dst")
 
-    p = add("info", cmd_info, "firmware, storage, battery, owner")
-    p.add_argument("--json", action="store_true")
+    p = add("cp", cmd_cp, "copy documents on the device (into a folder, or to a new name)",
+            patterns=True)
+    p.add_argument("src", nargs="+")
+    p.add_argument("dst")
 
-    p = add("screenshot", cmd_screenshot, "save a PNG or JPEG of the current screen")
-    p.add_argument("output", nargs="?", default=None)
-    p.add_argument("--format", choices=["png", "jpeg"], default=None,
-                   help="image format (default: inferred from filename, else png)")
+    p = add("replace", cmd_replace, "replace an existing document's PDF content in place")
+    p.add_argument("file", metavar="local")
+    p.add_argument("remote_doc", metavar="remote")
+    p.add_argument("--revision", default=None, help="expected file_revision guard")
+
+    p = add("annotations", cmd_annotations, "download raw annotation bytes for one page")
+    p.add_argument("remote_doc", metavar="remote")
+    p.add_argument("page", type=int)
+    p.add_argument("-o", "--output", default=None)
 
     p = add("sync", cmd_sync, "mirror a device folder into a local directory (incremental)")
     p.add_argument("directory", metavar="local", help="local directory (created if missing)")
@@ -624,10 +656,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
     p.add_argument("--force", action="store_true",
                    help="allow a first sync into a non-empty directory (existing files are kept)")
-
-    p = add("open", cmd_open, "open a document on the device's screen", patterns=True)
-    p.add_argument("target", metavar="remote")
-    p.add_argument("-p", "--page", type=int, help="page number")
 
     p = add("search", cmd_search, "find documents by name, text, or annotation mark")
     p.add_argument("keyword")
@@ -646,20 +674,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="annotation kind for -t mark (default: all)")
     p.add_argument("-l", "--long", action="store_true", help="size, date, pages")
 
-    p = add("cp", cmd_cp, "copy documents on the device (into a folder, or to a new name)",
-            patterns=True)
-    p.add_argument("src", nargs="+")
-    p.add_argument("dst")
 
-    p = add("replace", cmd_replace, "replace an existing document's PDF content in place")
-    p.add_argument("file", metavar="local")
-    p.add_argument("remote_doc", metavar="remote")
-    p.add_argument("--revision", default=None, help="expected file_revision guard")
+def _add_device_commands(add: _AddParser) -> None:
+    """Register viewer, settings, Wi-Fi, certificates, firmware, and utility subcommands."""
+    p = add("info", cmd_info, "firmware, storage, battery, owner")
+    p.add_argument("--json", action="store_true")
 
-    p = add("annotations", cmd_annotations, "download raw annotation bytes for one page")
-    p.add_argument("remote_doc", metavar="remote")
-    p.add_argument("page", type=int)
-    p.add_argument("-o", "--output", default=None)
+    p = add("screenshot", cmd_screenshot, "save a PNG or JPEG of the current screen")
+    p.add_argument("output", nargs="?", default=None)
+    p.add_argument("--format", choices=["png", "jpeg"], default=None,
+                   help="image format (default: inferred from filename, else png)")
+
+    p = add("open", cmd_open, "open a document on the device's screen", patterns=True)
+    p.add_argument("target", metavar="remote")
+    p.add_argument("-p", "--page", type=int, help="page number")
 
     add("viewing", cmd_viewing, "show which document is open on the device")
     add("marks", cmd_marks, "list preset annotation marks")
@@ -743,9 +771,41 @@ def build_parser() -> argparse.ArgumentParser:
                              "NetworkManager profile); run it with `quaderno linux-setup | sh`")
 
     p = add("pair", None, "pair with the device using the PIN on its screen")
-    p.add_argument("--force", action="store_true",
-                   help="replace an existing pairing")
+    p.add_argument("--force", action="store_true", help="replace an existing pairing")
     p.add_argument("--pin-file", help="read the PIN from this file once it appears (instead of a prompt)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level ``quaderno`` CLI ``ArgumentParser``."""
+    ap = argparse.ArgumentParser(prog="quaderno",
+                                 description="Fujitsu QUADERNO over USB or Wi-Fi: files, sync, pairing.")
+    ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' or '192.168.1.42' (default: USB)")
+    tr = ap.add_mutually_exclusive_group()
+    tr.add_argument("--wifi", dest="transport", action="store_const", const="wifi",
+                    help="discover over Wi-Fi via mDNS (opt-in; skips USB)")
+    tr.add_argument("--usb", dest="transport", action="store_const", const="usb",
+                    help="connect over USB (default; overrides $QUADERNO_TRANSPORT)")
+    ap.add_argument("--config", dest="config_dir", metavar="DIR",
+                    help="credentials directory, for reading and for `pair` "
+                         "(default: $QUADERNO_CONFIG or ~/.config/quaderno)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    # Remote paths in ls/get/mv/rm/open accept glob patterns ('Fighter*'); -E makes
+    # them regular expressions. Quote them so the shell leaves them alone.
+    pat = argparse.ArgumentParser(add_help=False)
+    pat.add_argument("-E", "--regex", action="store_true",
+                     help="treat remote path components as regular expressions "
+                          "(case-insensitive search) instead of glob patterns")
+
+    def add(name: str, fn: Command | None, help: str,
+            patterns: bool = False) -> argparse.ArgumentParser:
+        """Create a subcommand parser wired to handler ``fn``."""
+        p = sub.add_parser(name, help=help, parents=[pat] if patterns else [])
+        p.set_defaults(fn=fn)
+        return p
+
+    _add_file_commands(add)
+    _add_device_commands(add)
     return ap
 
 
@@ -753,7 +813,7 @@ EXIT_ERROR, EXIT_CONNECT, EXIT_AUTH = 1, 3, 4  # 2 is argparse's usage error
 
 
 def exit_code(err: QuadernoError) -> int:
-    """3: the device can't be reached; 4: pairing/credentials/identity; 1: the rest."""
+    """Map a ``QuadernoError`` subclass to its CLI exit code (1, 3, or 4)."""
     if isinstance(err, ConnectError):
         return EXIT_CONNECT
     if isinstance(err, (AuthError, PairingError)):
@@ -762,13 +822,45 @@ def exit_code(err: QuadernoError) -> int:
 
 
 def describe_os_error(err: OSError) -> str:
-    """'PATH: reason' for a local file problem, as cp and friends print it."""
+    """Format a local ``OSError`` as ``'PATH: reason'`` (like ``cp``)."""
     if err.filename is not None and err.strerror:
         return f"{err.filename}: {err.strerror}"
     return str(err)
 
 
+def _cmd_addr(args: Args) -> None:
+    """Handle ``quaderno addr``: discover and print the USB or Wi-Fi device address."""
+    serial: str | None = None
+    cred_dir: str | None = None
+    cached_addr: str | None = None
+    pinned_cert: bytes | None = None
+    try:
+        creds = credentials.load_credentials(credentials.find_credentials_dir(args.config_dir))
+        serial, cred_dir, pinned_cert = creds.serial, creds.source, creds.pinned_cert
+        cached_addr = credentials.load_wifi_addr(cred_dir)
+    except QuadernoError:
+        pass
+    transport = discovery.parse_transport(args.transport or os.environ.get("QUADERNO_TRANSPORT"))
+    save_cb = (lambda a: credentials.save_wifi_addr(cred_dir, a)) if cred_dir else None
+    if pinned_cert is not None:
+        found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+            serial, transport=transport, cached_addr=cached_addr,
+            on_wifi_addr=save_cb, pinned_cert=pinned_cert)
+    else:
+        found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+            serial, transport=transport, cached_addr=cached_addr, on_wifi_addr=save_cb)
+    print(found_addr)
+
+
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for ``quaderno``.
+
+    Args:
+        argv: Explicit argument list (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 on success, 1/3/4 on ``QuadernoError``, 130 on Ctrl-C).
+    """
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["__complete"]:
         return complete(argv[1:])
@@ -782,28 +874,7 @@ def main(argv: list[str] | None = None) -> int:
             print(linux_setup_script(), end="")
             return 0
         if args.cmd == "addr":
-            serial: str | None = None
-            cred_dir: str | None = None
-            cached_addr: str | None = None
-            pinned_cert: bytes | None = None
-            try:
-                creds = credentials.load_credentials(
-                    credentials.find_credentials_dir(args.config_dir))
-                serial, cred_dir, pinned_cert = creds.serial, creds.source, creds.pinned_cert
-                cached_addr = credentials.load_wifi_addr(cred_dir)
-            except QuadernoError:
-                pass
-            transport = discovery.parse_transport(
-                args.transport or os.environ.get("QUADERNO_TRANSPORT"))
-            save_cb = (lambda a: credentials.save_wifi_addr(cred_dir, a)) if cred_dir else None
-            if pinned_cert is not None:
-                found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
-                    serial, transport=transport, cached_addr=cached_addr,
-                    on_wifi_addr=save_cb, pinned_cert=pinned_cert)
-            else:
-                found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
-                    serial, transport=transport, cached_addr=cached_addr, on_wifi_addr=save_cb)
-            print(found_addr)
+            _cmd_addr(args)
             return 0
         fn = args.fn
         if fn is None:  # every other command sets one

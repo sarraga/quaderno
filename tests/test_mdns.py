@@ -353,6 +353,33 @@ def test_avahi_parsing_fast_path_and_fallback(monkeypatch: pytest.MonkeyPatch) -
     assert len(devs) == 1 and devs[0].addr == "192.168.0.99"
 
 
+def test_browse_bonjour_verifies_candidates_and_deduplicates(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from quaderno import bonjour
+    monkeypatch.setattr(mdns, "PLATFORM", "darwin")
+    monkeypatch.setattr(
+        bonjour, "resolve_services",
+        lambda services, *, timeout, max_items=16: [
+            ("Rogue._dp_fujitsu._tcp.local", "rogue.local", 22, ["192.168.0.5"]),
+            ("DP._dp_fujitsu._tcp.local", "Android-2.local", 8080,
+             ["fe80::1", "2a02::1", "192.168.0.99"]),
+        ],
+    )
+    probed: list[str] = []
+
+    def fake_fetch(ip: str, port: int = 8080) -> tuple[bool, str | None]:
+        probed.append(ip)
+        return True, "850000302014492"
+
+    monkeypatch.setattr(mdns, "fetch_serial", fake_fetch)
+    monkeypatch.setattr(mdns, "probe_tls_pin", lambda ip, pin, timeout=1.5: ip == "192.168.0.99")
+    devs = mdns._browse_bonjour((SERVICE,), timeout=2.0, want_serial="850000302014492",
+                                pinned_cert=b"CERT")
+    assert devs == [WifiDevice("192.168.0.99", 8080, "850000302014492",
+                               "DP._dp_fujitsu._tcp.local", "Android-2.local")]
+    assert probed == ["192.168.0.99"]
+
+
 def test_multicast_interface_parsing_skips_loopback_and_vpn() -> None:
     mac_ifconfig = """\
 lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384

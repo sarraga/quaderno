@@ -51,20 +51,27 @@ class Entry:
 
     @property
     def is_folder(self) -> bool:
+        """``True`` when this entry represents a device folder."""
         return self.type == "folder"
 
     @property
     def is_document(self) -> bool:
+        """``True`` when this entry represents a PDF document or notebook."""
         return self.type == "document"
 
     @property
     def relpath(self) -> str:
+        """Device path relative to ``Document/``, or ``''`` for the root folder."""
         return self.path[len(ROOT) + 1:] if self.path.startswith(ROOT + "/") else ""
 
     @property
     def mtime(self) -> int | None:
-        """Modification time as epoch seconds; None if the device gave none.
-        Raises ProtocolError if it gave one this client can't read."""
+        """Modification time as epoch seconds, or ``None`` if absent.
+
+        Raises:
+            ProtocolError: If ``modified`` is present but not a valid ISO-8601
+                timestamp with a UTC offset.
+        """
         try:
             return parse_device_time(self.modified)
         except ValueError as err:
@@ -73,9 +80,20 @@ class Entry:
 
     @classmethod
     def from_api(cls, d: JsonObject) -> "Entry":
-        """Build from a Web API entry. Dates are kept as the device's text and
-        only parsed when used (mtime); see _int_field for size and page count."""
+        """Build an ``Entry`` from a raw Web API JSON object.
+
+        Args:
+            d: Decoded JSON object containing at least ``entry_id``.
+
+        Returns:
+            Populated immutable ``Entry``.
+
+        Raises:
+            ProtocolError: If ``entry_id`` is missing or any string metadata
+                field has a non-string JSON type.
+        """
         def opt_str(key: str) -> str | None:
+            """Return optional string field ``d[key]``, rejecting non-string values."""
             v = d.get(key)
             if v is None:
                 return None

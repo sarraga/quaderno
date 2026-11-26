@@ -31,6 +31,7 @@ Body = Mapping[str, Any] | bytes | None  # any JSON mapping/TypedDict is sent as
 
 
 def _unreachable(err: BaseException) -> DeviceUnreachableError:
+    """Wrap a low-level transport ``OSError`` or HTTP disconnect as ``DeviceUnreachableError``."""
     return DeviceUnreachableError(f"lost contact with the device ({err.__class__.__name__}: "
                                   f"{err}); is it still connected and awake?")
 
@@ -45,6 +46,11 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._pin = pin
 
     def connect(self) -> None:
+        """Open the TLS socket and verify the peer DER certificate against ``self._pin``.
+
+        Raises:
+            CertificateError: If ``self._pin`` is set and does not match the peer cert.
+        """
         super().connect()
         if self._pin is None:
             return
@@ -80,6 +86,7 @@ class Client:
 
     # --- connection ------------------------------------------------------------
     def close(self) -> None:
+        """Close the kept-alive HTTPS connection, if open."""
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -116,30 +123,59 @@ class Client:
                 raise
         raise DeviceUnreachableError(f"{method} {path}: lost the connection to the device")
 
+    def _update_cookies(self, resp: http.client.HTTPResponse) -> None:
+        """Merge any ``Set-Cookie`` headers from ``resp`` into ``self.cookies``."""
+        for h in resp.headers.get_all("Set-Cookie") or []:
+            name, _, rest = h.partition("=")
+            self.cookies[name.strip()] = rest.split(";", 1)[0]
+
+    def _read_body(self, method: str, path: str, resp: http.client.HTTPResponse,
+                   stream_to: BinaryIO | None) -> JsonObject | int | None:
+        """Stream a binary body into ``stream_to`` or read and decode a bounded JSON body."""
+        if stream_to is not None:
+            total = 0
+            while chunk := resp.read(1 << 20):
+                stream_to.write(chunk)
+                total += len(chunk)
+            return total
+        answer = resp.read(MAX_JSON_BYTES + 1)
+        if len(answer) > MAX_JSON_BYTES:
+            self.close()
+            raise ProtocolError(f"{method} {path}: response exceeds {MAX_JSON_BYTES} bytes")
+        return self._json(method, path, answer) if answer else None
+
     def _request(self, method: str, path: str, body: Body = None,
                  headers: dict[str, str] | None = None, ok: Collection[int] = (200, 204),
                  stream_to: BinaryIO | None = None,
                  _reauth: bool = True) -> JsonObject | int | None:
-        """One Web API call. A JSON object body is encoded; the answer is decoded
-        (None if empty), or with `stream_to`, written there and its size returned.
-        The typed entry points are request, request_json and request_stream."""
+        """Execute one Web API call with cookie handling and single-retry 401 re-auth.
+
+        Args:
+            method: HTTP verb (``GET``, ``POST``, ``PUT``, ``DELETE``).
+            path: API path (with optional query string).
+            body: Optional JSON mapping, raw bytes, or ``None``.
+            headers: Extra HTTP headers merged onto defaults.
+            ok: Accepted HTTP status codes.
+            stream_to: When set, write binary response bytes here and return byte count.
+            _reauth: Internal guard limiting automatic 401 re-authentication to one retry.
+
+        Returns:
+            Decoded ``JsonObject``, byte count (when ``stream_to`` is set), or ``None``.
+        """
         hdrs = {"Host": f"digitalpaper.local:{HTTPS_PORT}", "Accept": "application/json"}
         if self.cookies:
             hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
-        data: bytes | None
         if isinstance(body, Mapping):
-            data = json.dumps(body).encode()
+            data: bytes | None = json.dumps(body).encode()
             hdrs["Content-Type"] = "application/json"
         else:
             data = body
         hdrs.update(headers or {})
         resp = self._send(method, path, data, hdrs)
-        result: JsonObject | int | None
+        result: JsonObject | int | None = None
         reauth_needed = False
         try:
-            for h in resp.headers.get_all("Set-Cookie") or []:
-                name, _, rest = h.partition("=")
-                self.cookies[name.strip()] = rest.split(";", 1)[0]
+            self._update_cookies(resp)
             if resp.status not in ok:
                 err_data = resp.read(MAX_ERR_BYTES)
                 if (resp.status == 401 and _reauth and self.key is not None
@@ -147,18 +183,8 @@ class Client:
                     reauth_needed = True
                 else:
                     raise self._http_error(method, path, resp.status, err_data)
-            elif stream_to is not None:
-                total = 0
-                while chunk := resp.read(1 << 20):
-                    stream_to.write(chunk)
-                    total += len(chunk)
-                result = total
             else:
-                answer = resp.read(MAX_JSON_BYTES + 1)
-                if len(answer) > MAX_JSON_BYTES:
-                    self.close()
-                    raise ProtocolError(f"{method} {path}: response exceeds {MAX_JSON_BYTES} bytes")
-                result = self._json(method, path, answer) if answer else None
+                result = self._read_body(method, path, resp, stream_to)
         except QuadernoError:
             if resp.will_close:
                 self.close()
@@ -212,6 +238,7 @@ class Client:
 
     @staticmethod
     def _http_error(method: str, path: str, status: int, data: bytes) -> QuadernoError:
+        """Map an unexpected HTTP ``status`` and JSON error body to a typed ``QuadernoError``."""
         code = None
         try:
             err = json.loads(data)
@@ -235,6 +262,7 @@ class Client:
 
     @staticmethod
     def _json(method: str, path: str, data: bytes) -> JsonObject:
+        """Decode ``data`` as a JSON object, raising ``ProtocolError`` otherwise."""
         try:
             value = json.loads(data)
         except ValueError as err:
@@ -247,6 +275,13 @@ class Client:
 
     # --- login -----------------------------------------------------------------
     def authenticate(self) -> None:
+        """Perform nonce-challenge RSA-SHA256 login (``GET /auth/nonce`` -> ``PUT /auth``).
+
+        Raises:
+            AuthError: If no private key is configured.
+            LoginError: If the device rejects this client (HTTP 400/401/403/404).
+            CertificateError: If TLS pinning fails on connect.
+        """
         if self.key is None:
             raise AuthError("no private key to log in with")
         try:
@@ -265,17 +300,20 @@ class Client:
     # --- raw document & binary transfer ----------------------------------------
     def download_to(self, doc_id: str, fh: BinaryIO,
                     byte_range: tuple[int, int | None] | None = None) -> int:
+        """Stream document ``doc_id`` PDF bytes into ``fh``; returns bytes written."""
         return self.request_stream("GET", f"/documents/{quote(doc_id, safe='')}/file", fh,
                                    headers={"Accept": "*/*"}, byte_range=byte_range)
 
     def download_annotation_to(self, doc_id: str, page: int, fh: BinaryIO,
                                byte_range: tuple[int, int | None] | None = None) -> int:
+        """Stream raw annotation bytes for ``page`` of ``doc_id`` into ``fh``; returns bytes written."""
         return self.request_stream(
             "GET", f"/documents/{quote(doc_id, safe='')}/annotations/{int(page)}", fh,
             headers={"Accept": "*/*"}, byte_range=byte_range)
 
     def download_pastlog_to(self, fh: BinaryIO,
                             byte_range: tuple[int, int | None] | None = None) -> int:
+        """Stream the encrypted diagnostic pastlog archive into ``fh``; returns bytes written."""
         return self.request_stream("GET", "/system/controls/pastlog", fh,
                                    headers={"Accept": "*/*"}, byte_range=byte_range)
 
@@ -342,6 +380,7 @@ class Client:
 
     def _send_file(self, local: str, doc_id: str, *, target_revision: str | None = None,
                    file_hash: str | None = None) -> FileUploadResult:
+        """Upload local PDF ``local`` to ``/documents/{doc_id}/file`` in chunks."""
         # The multipart filename is ignored: the document's name was set by the
         # POST in upload_file. A fixed ASCII value keeps arbitrary file names
         # (quotes, non-ASCII) out of a header the device has to parse.
@@ -379,6 +418,7 @@ class Client:
                      {"Content-Type": f"multipart/form-data; boundary={boundary}"})
 
     def create_folder(self, parent_id: str, name: str, ext_id: str | None = None) -> str:
+        """Create a folder named ``name`` under ``parent_id``; returns the new folder ID."""
         if ext_id is not None:
             return json_str(self.request_json("POST", "/folders2", {
                 "parent_folder_id": parent_id, "folder_name": name, "ext_id": ext_id}),

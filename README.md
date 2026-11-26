@@ -505,12 +505,13 @@ quaderno/
   crypto.py       RSA/AES via `cryptography`, HMAC, Diffie-Hellman, PEM/DER
   credentials.py  where credentials live; loading and saving them (including cached Wi-Fi IP)
   usb.py          finding the device on USB (`ioreg -a` on macOS, sysfs on Linux), USB mode switch, address
-  mdns.py         finding the device on Wi-Fi via stdlib mDNS (`_dp_fujitsu._tcp.local`)
-  discovery.py    unified discovery across USB and Wi-Fi (with cached Wi-Fi fast path)
+  mdns.py         finding the device on Wi-Fi via stdlib mDNS (`_dp_fujitsu._tcp.local`) and TLS pin check
+  bonjour.py      macOS Bonjour (`mDNSResponder` via `libSystem.B.dylib`) leaf resolver
+  discovery.py    unified discovery across USB and Wi-Fi (with TLS-pinned cached Wi-Fi fast path)
   entry.py        Entry: a document or folder
   events.py       Event: progress reports from API operations
   errors.py       the exception hierarchy
-  util.py         paths, patterns, time and size formatting
+  util.py         paths, patterns, terminal sanitization, time and size formatting
   cli.py          the `quaderno` command: argument parsing and printing only
   linux/          udev rule and NetworkManager profile, installed by `quaderno linux-setup`
 docs/MANUAL.md    user manual: what you can do, task by task
@@ -593,24 +594,24 @@ dptrp1 --client-id ~/.config/quaderno/deviceid.dat --key ~/.config/quaderno/priv
 Every failure is a `quaderno.QuadernoError`. The subclasses tell you what went wrong; scripts using the command get the same distinction through the exit code.
 
 ```
-QuadernoError                    base: .status (HTTP status, when there is one)
-├── ConnectError                 can't reach the device, or can't read the USB device list   exit 3
-│   ├── DeviceNotFoundError      no QUADERNO on USB, or not the paired one
-│   ├── SerialModeError          stuck in serial mode (see below)
-│   └── DeviceUnreachableError   network mode but no interface, link down or silent; or the connection dropped
-├── AuthError                                                                exit 4
-│   ├── NotPairedError           no credentials
-│   ├── LoginError               the device rejected this client's key
-│   └── CertificateError         TLS certificate differs from the saved one
-├── PairingError                                                             exit 4
-│   └── WrongPinError
-├── RequestError                 the device answered with an HTTP error: .status, .code   exit 1
-│   ├── LockedError              HTTP 423: resource is locked (e.g. open in viewer)        exit 1
-│   └── StorageFullError         HTTP 507: insufficient storage on the device              exit 1
-├── ProtocolError                the device's answer is malformed (not JSON)            exit 1
-├── NotFoundError                path doesn't exist, or a pattern matched nothing        exit 1
-├── ExistsError                  target already exists                                   exit 1
-└── NotEmptyError                folder not empty                                        exit 1
+QuadernoError                    base: .status (HTTP status, when there is one)              exit 1
+├── ConnectError                 can't reach device, unknown transport, or USB list failed   exit 3
+│   ├── DeviceNotFoundError      no QUADERNO on USB or Wi-Fi, wrong serial, or multiple
+│   ├── SerialModeError          stuck in USB serial mode (see below)
+│   └── DeviceUnreachableError   interface/link down, port 8443 refuses/fails pin, or connection dropped
+├── AuthError                    credentials or device identity problems                     exit 4
+│   ├── NotPairedError           no credentials or incomplete pairing directory
+│   ├── LoginError               the device rejected this client's RSA signature
+│   └── CertificateError         TLS certificate differs from devicecert.bin (or cert corrupt)
+├── PairingError                 PIN pairing protocol or crypto failure                      exit 4
+│   └── WrongPinError            HTTP 403/40301: entered PIN did not match
+├── RequestError                 HTTP error (.status, .code) or stalled chunked upload       exit 1
+│   ├── LockedError              HTTP 423: resource is locked (e.g. open in viewer)
+│   └── StorageFullError         HTTP 507: insufficient storage on the device
+├── ProtocolError                malformed, non-JSON, oversized, or out-of-range answer      exit 1
+├── NotFoundError                path doesn't exist (HTTP 404) or pattern matched nothing    exit 1
+├── ExistsError                  target already exists (upload, mkdir, move, cp)             exit 1
+└── NotEmptyError                folder not empty (rm without recursive)                     exit 1
 ```
 
 A local file problem, such as `get -o` into a directory that doesn't exist, prints `quaderno: PATH: reason` and exits 1. Exit code 2 is a command-line usage error, and 130 means you pressed Ctrl-C. Network failures in the middle of a command, such as the cable being pulled, become `DeviceUnreachableError`, not a Python traceback.

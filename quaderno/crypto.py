@@ -38,15 +38,22 @@ DH_G = 2
 # --- RSA ---------------------------------------------------------------------
 
 def pem_encode(label: str, der: bytes) -> str:
+    """Wrap raw ``der`` bytes in a 64-column PEM block with ``label``."""
     b64 = base64.b64encode(der).decode()
     lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
     return f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----\n"
 
 
 def generate_keypair(bits: int = 2048) -> tuple[str, str]:
-    """(private_pem, public_pem): PKCS#1 'RSA PRIVATE KEY', and the public key as
-    SubjectPublicKeyInfo DER under an 'RSA PUBLIC KEY' label, the layout the device
-    accepts at pairing (see the module docstring)."""
+    """Generate an RSA key pair in the PEM formats the device expects.
+
+    Args:
+        bits: RSA modulus size in bits (default ``2048``).
+
+    Returns:
+        ``(private_pem, public_pem)`` where ``private_pem`` is PKCS#1
+        ``RSA PRIVATE KEY`` and ``public_pem`` is SPKI DER under ``RSA PUBLIC KEY``.
+    """
     key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
     private_pem = key.private_bytes(serialization.Encoding.PEM,
                                     serialization.PrivateFormat.TraditionalOpenSSL,
@@ -57,6 +64,17 @@ def generate_keypair(bits: int = 2048) -> tuple[str, str]:
 
 
 def load_private_key(pem: str | bytes) -> rsa.RSAPrivateKey:
+    """Parse an unencrypted PEM RSA private key.
+
+    Args:
+        pem: PEM text or bytes.
+
+    Returns:
+        Loaded ``RSAPrivateKey``.
+
+    Raises:
+        AuthError: If ``pem`` cannot be parsed or is not an RSA key.
+    """
     try:
         key = serialization.load_pem_private_key(pem.encode() if isinstance(pem, str) else pem,
                                                  password=None)
@@ -68,23 +86,30 @@ def load_private_key(pem: str | bytes) -> rsa.RSAPrivateKey:
 
 
 def sign(key: rsa.RSAPrivateKey, data: bytes) -> bytes:
-    """RSA-SHA256, PKCS#1 v1.5 (the login nonce signature)."""
+    """Sign ``data`` with RSA-SHA256 PKCS#1 v1.5 (used for login nonces)."""
     return key.sign(data, padding.PKCS1v15(), hashes.SHA256())
 
 
 # --- symmetric pieces of pairing ---------------------------------------------
 
 def hmac_sha256(key: bytes, data: bytes) -> bytes:
+    """Return the 32-byte HMAC-SHA256 digest of ``data`` under ``key``."""
     return hmac.new(key, data, hashlib.sha256).digest()
 
 
 def aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Encrypt ``data`` with AES-CBC and PKCS#7 padding under ``(key, iv)``."""
     padder = sym_padding.PKCS7(128).padder()
     enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
     return enc.update(padder.update(data) + padder.finalize()) + enc.finalize()
 
 
 def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Decrypt PKCS#7-padded AES-CBC ``data`` under ``(key, iv)``.
+
+    Raises:
+        PairingError: If ciphertext length or PKCS#7 padding is invalid.
+    """
     try:
         dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
         unpadder = sym_padding.PKCS7(128).unpadder()
@@ -94,13 +119,25 @@ def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 
 
 def wrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
-    """AES-128-CBC(data + first 8 bytes of HMAC-SHA256(data)) + IV: the format the
-    device uses in both directions during pairing."""
+    """Encrypt ``data`` with a trailing 8-byte HMAC tag and 16-byte random IV."""
     iv = secrets.token_bytes(16)
     return aes_cbc_encrypt(kw_key, iv, data + hmac_sha256(auth_key, data)[:8]) + iv
 
 
 def unwrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
+    """Decrypt and verify a pairing payload produced by ``wrap()``.
+
+    Args:
+        data: Ciphertext concatenated with its 16-byte IV (minimum 32 bytes).
+        auth_key: 32-byte HMAC-SHA256 key.
+        kw_key: 16-byte AES-128 key.
+
+    Returns:
+        Verified plaintext bytes.
+
+    Raises:
+        PairingError: If truncated, undecryptable, or HMAC tag mismatches.
+    """
     if len(data) < 32:
         raise PairingError("pairing: wrapped message is too short")
     plain = aes_cbc_decrypt(kw_key, data[-16:], data[:-16])

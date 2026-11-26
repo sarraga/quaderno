@@ -60,37 +60,73 @@ def reg_request(addr: str, method: str, path: str,
 
 
 def _b64(b: bytes) -> str:
+    """Encode ``b`` as an ASCII base64 string."""
     return base64.b64encode(b).decode()
 
 
 def _field(m: JsonObject, key: str) -> bytes:
-    """A base64 field of a pairing message, decoded."""
+    """Decode base64 field ``key`` from pairing message ``m`` into raw bytes.
+
+    Raises:
+        ProtocolError: If ``key`` is missing, non-string, or invalid base64.
+    """
     try:
         return base64.b64decode(json_str(m, key), validate=True)
     except binascii.Error as err:
         raise ProtocolError(f"pairing: field {key!r} isn't base64: {err}") from err
 
 
+def _reg_post(addr: str, path: str, body: JsonObject | None, want: int) -> JsonObject:
+    """POST one registration step to ``addr:8080`` and validate status and JSON body.
+
+    Args:
+        addr: Device IP address.
+        path: Registration endpoint path (e.g. ``'/register/pin'``).
+        body: Optional JSON request object.
+        want: Expected HTTP status code (``200`` or ``204``).
+
+    Returns:
+        Decoded JSON object (empty dict when ``want == 204``).
+
+    Raises:
+        WrongPinError: On ``POST /register/ca`` HTTP 403/40301.
+        PairingError: On any other unexpected HTTP status.
+        ProtocolError: If a 200 response body is not a JSON object.
+    """
+    status, res = reg_request(addr, "POST", path, body)
+    if status != want:
+        code = res.get("error_code") if isinstance(res, dict) else None
+        if path == "/register/ca" and status == 403 and code == "40301":
+            raise WrongPinError("pairing failed: wrong PIN")
+        raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res!r}")
+    if isinstance(res, dict):
+        return res
+    if want == 204:
+        return {}
+    raise ProtocolError(f"pairing: POST {path}: the device's answer isn't JSON: {res!r}")
+
+
 def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], str]) -> bytes:
-    """Run the PIN exchange; returns the certificate the device hands over.
-    `read_pin()` is called once the device shows the PIN."""
+    """Run the 4-step DH + PIN registration exchange; returns the device's TLS cert bytes.
+
+    Args:
+        addr: Device IP address (port 8080).
+        client_id: Newly generated client UUID string.
+        public_pem: Client RSA public key PEM string.
+        read_pin: Zero-arg callback invoked once the PIN is shown on the device.
+
+    Returns:
+        Raw certificate bytes returned by the device (PEM or DER).
+
+    Raises:
+        WrongPinError: If the entered PIN does not match.
+        PairingError: On DH, nonce, HMAC, unwrap, or PIN-proof failure.
+        ProtocolError: On malformed/oversized registration JSON.
+    """
     H = crypto.hmac_sha256
     u = _field
 
-    def call(path: str, body: JsonObject | None, want: int) -> JsonObject:
-        status, res = reg_request(addr, "POST", path, body)
-        if status != want:
-            code = res.get("error_code") if isinstance(res, dict) else None
-            if path == "/register/ca" and status == 403 and code == "40301":
-                raise WrongPinError("pairing failed: wrong PIN")
-            raise PairingError(f"pairing: POST {path} -> HTTP {status}: {res!r}")
-        if isinstance(res, dict):
-            return res
-        if want == 204:  # no body expected
-            return {}
-        raise ProtocolError(f"pairing: POST {path}: the device's answer isn't JSON: {res!r}")
-
-    m1 = call("/register/pin", None, 200)
+    m1 = _reg_post(addr, "/register/pin", None, 200)
     n1, mac, yb = u(m1, "a"), u(m1, "b"), u(m1, "c")  # yb as sent (may carry a 0x00 sign byte)
     if len(yb) > 512:
         raise PairingError("pairing: device sent an oversized DH value")
@@ -100,8 +136,8 @@ def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], 
     auth_key, kw_key = dk[:32], dk[32:]
 
     m2hmac = H(auth_key, n1 + mac + yb + n1 + n2 + mac + ya)
-    m3 = call("/register/hash", {"a": _b64(n1), "b": _b64(n2), "c": _b64(mac),
-                                 "d": _b64(ya), "e": _b64(m2hmac)}, 200)
+    m3 = _reg_post(addr, "/register/hash", {"a": _b64(n1), "b": _b64(n2), "c": _b64(mac),
+                                            "d": _b64(ya), "e": _b64(m2hmac)}, 200)
     if u(m3, "a") != n2:
         raise PairingError("pairing: nonce mismatch")
     e_hash, m3hmac = u(m3, "b"), u(m3, "e")
@@ -113,8 +149,8 @@ def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], 
     r_hash = H(auth_key, rs + psk + yb + ya)
     wrapped_rs = crypto.wrap(rs, auth_key, kw_key)
     m4hmac = H(auth_key, n2 + e_hash + m3hmac + n1 + r_hash + wrapped_rs)
-    m5 = call("/register/ca", {"a": _b64(n1), "b": _b64(r_hash), "d": _b64(wrapped_rs),
-                               "e": _b64(m4hmac)}, 200)
+    m5 = _reg_post(addr, "/register/ca", {"a": _b64(n1), "b": _b64(r_hash), "d": _b64(wrapped_rs),
+                                          "e": _b64(m4hmac)}, 200)
     if u(m5, "a") != n2:
         raise PairingError("pairing: nonce mismatch")
     wrapped_es_cert, m5hmac = u(m5, "d"), u(m5, "e")
@@ -129,7 +165,7 @@ def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], 
 
     wrapped_id_key = crypto.wrap(client_id.encode() + public_pem.encode(), auth_key, kw_key)
     m6hmac = H(auth_key, n2 + wrapped_es_cert + m5hmac + n1 + wrapped_id_key)
-    call("/register", {"a": _b64(n1), "d": _b64(wrapped_id_key), "e": _b64(m6hmac)}, 204)
+    _reg_post(addr, "/register", {"a": _b64(n1), "d": _b64(wrapped_id_key), "e": _b64(m6hmac)}, 204)
     return cert
 
 

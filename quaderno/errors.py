@@ -1,30 +1,45 @@
 """Exceptions raised by the quaderno package.
 
-    QuadernoError                    base: .status (HTTP status, when there is one)
-    ├── ConnectError                 can't reach the device, or can't read the USB device list
-    │   ├── DeviceNotFoundError      no QUADERNO on USB, or not the paired one
-    │   ├── SerialModeError          stuck in serial mode: ignored the switch to USB networking
-    │   └── DeviceUnreachableError   network mode but no interface, link down or not answering;
-    │                                or the connection dropped
-    ├── AuthError
-    │   ├── NotPairedError           no credentials
-    │   ├── LoginError               the device rejected this client's key
-    │   └── CertificateError         TLS certificate differs from the one saved at pairing
-    ├── PairingError
-    │   └── WrongPinError
-    ├── RequestError                 the device answered with an HTTP error: .status, .code
+    QuadernoError                    base: .status (HTTP status, when there is one)  [exit 1]
+    ├── ConnectError                 can't reach the device, invalid transport,      [exit 3]
+    │   │                            or OS USB-list failure
+    │   ├── DeviceNotFoundError      no QUADERNO on USB or Wi-Fi, wrong serial,
+    │   │                            or ambiguous multiple devices
+    │   ├── SerialModeError          stuck in USB serial mode (ignored mode switch)
+    │   └── DeviceUnreachableError   interface/link down, port 8443 refuses/fails
+    │                                TLS pin during discovery, or connection dropped
+    ├── AuthError                    credentials or device identity failure          [exit 4]
+    │   ├── NotPairedError           no credentials found or incomplete pairing dir
+    │   ├── LoginError               the device rejected this client's RSA signature
+    │   └── CertificateError         TLS certificate differs from devicecert.bin
+    │                                (or devicecert.bin is corrupt)
+    ├── PairingError                 PIN pairing protocol or crypto check failed     [exit 4]
+    │   └── WrongPinError            HTTP 403/40301: entered PIN did not match
+    ├── RequestError                 HTTP 4xx/5xx error (.status, .code) or stalled  [exit 1]
+    │   │                            chunked upload
     │   ├── LockedError              HTTP 423: resource is locked (e.g. open in viewer)
     │   └── StorageFullError         HTTP 507: insufficient storage on the device
-    ├── ProtocolError                the device's answer is malformed (not JSON; Entry.mtime: bad date)
-    ├── NotFoundError                path doesn't exist, or a pattern matched nothing
-    ├── ExistsError                  target already exists
-    └── NotEmptyError                folder not empty
+    ├── ProtocolError                malformed, non-JSON, oversized, or out-of-range [exit 1]
+    │                                device answer (also Entry.mtime bad date)
+    ├── NotFoundError                remote path doesn't exist (HTTP 404) or pattern [exit 1]
+    │                                matched nothing locally (not a RequestError
+    │                                because pattern misses occur without an HTTP 404)
+    ├── ExistsError                  target already exists (upload, mkdir, move, cp) [exit 1]
+    └── NotEmptyError                folder not empty (rm without recursive)         [exit 1]
+
+Local filesystem errors (missing local directory, permissions, disk full) are left
+as standard Python `OSError`s.
 """
 
 
 class QuadernoError(Exception):
-    """Any failure talking to the device or carrying out an operation.
-    `status` is the HTTP status the device answered with, when there was one."""
+    """Base exception for any failure talking to the device or carrying out an
+    operation.
+
+    Args:
+        msg: Human-readable explanation suitable for stderr.
+        status: HTTP status code returned by the device, or ``None``.
+    """
 
     def __init__(self, msg: str, status: int | None = None) -> None:
         super().__init__(msg)
@@ -32,51 +47,63 @@ class QuadernoError(Exception):
 
 
 class ConnectError(QuadernoError):
-    """The device can't be reached."""
+    """The device cannot be reached, the requested transport is unknown, or the
+    OS USB device list cannot be read (CLI exit code 3)."""
 
 
 class DeviceNotFoundError(ConnectError):
-    """No QUADERNO on USB (not plugged in, or a charge-only cable), not the one
-    the credentials were paired with, or none with a usable serial number."""
+    """No matching QUADERNO was found on USB or Wi-Fi (unplugged, charge-only
+    cable, Wi-Fi off/unreachable, wrong serial, or multiple devices without
+    ``--addr``)."""
 
 
 class SerialModeError(ConnectError):
-    """The device is on USB but stayed in serial mode: it ignored the command that
-    switches it to USB networking. Seen when it is in standby, e.g. after the
-    computer slept. Waking it (power button) or re-plugging it fixes this."""
+    """The device is on USB but stayed in CDC-ACM serial mode: it ignored the
+    command that switches it to USB networking. Seen when it is in standby, e.g.
+    after the computer slept. Waking it (power button) or re-plugging fixes it."""
 
 
 class DeviceUnreachableError(ConnectError):
-    """The device is in USB network mode but has no network interface, its link is
-    down, or it doesn't answer; or the connection broke."""
+    """The device was found on USB or Wi-Fi, but has no network interface, its
+    link is down, port 8443 refused (or failed TLS pin during discovery), or an
+    active connection dropped mid-request."""
 
 
 class AuthError(QuadernoError):
-    """Credentials or device identity problems."""
+    """Credentials, private key, or device identity problems (CLI exit code 4)."""
 
 
 class NotPairedError(AuthError):
-    """No pairing credentials found."""
+    """No pairing credentials found, or a required file in the credentials
+    directory is missing."""
 
 
 class LoginError(AuthError):
-    """The device rejected this client's key."""
+    """The device rejected this client's key during ``PUT /auth``."""
 
 
 class CertificateError(AuthError):
-    """The device's TLS certificate differs from the one saved at pairing."""
+    """The device's TLS certificate differs from ``devicecert.bin``, or
+    ``devicecert.bin`` itself cannot be parsed as a valid X.509 certificate."""
 
 
 class PairingError(QuadernoError):
-    """The PIN pairing failed."""
+    """The PIN pairing protocol failed (HMAC, DH, decryption, timeout, or
+    already paired without ``--force``; CLI exit code 4)."""
 
 
 class WrongPinError(PairingError):
-    """The PIN entered doesn't match the one on the device's screen."""
+    """HTTP 403 (40301): the PIN entered doesn't match the one on the screen."""
 
 
 class RequestError(QuadernoError):
-    """The device answered with an HTTP error. `code` is its error_code, e.g. '40006'."""
+    """The device answered with an HTTP error or a chunked upload stalled.
+
+    Args:
+        msg: Human-readable explanation.
+        status: HTTP status code, or ``None`` for non-HTTP transfer stalls.
+        code: Device JSON ``error_code`` string (e.g. ``'40006'``), or ``None``.
+    """
 
     def __init__(self, msg: str, status: int | None = None, code: str | None = None) -> None:
         super().__init__(msg, status)
@@ -92,15 +119,22 @@ class StorageFullError(RequestError):
 
 
 class ProtocolError(QuadernoError):
-    """The device answered, but with something this client can't read: a body that
-    isn't JSON, or (from Entry.mtime) a date in an unexpected format. Usually means
-    a firmware change. Where only a displayed or cosmetic value is affected the
-    operation goes on with a logged warning instead: an unreadable size or page
-    count reads as missing, and download() keeps the file without its date."""
+    """The device answered with something this client cannot safely accept:
+    non-JSON or oversized payloads, missing/non-string required fields,
+    out-of-range upload offsets, or (from ``Entry.mtime``) an unreadable date.
+    Cosmetic fields (display size, page count, download mtime) log a warning
+    instead of aborting."""
 
 
 class NotFoundError(QuadernoError):
-    """A path doesn't exist on the device, or a pattern matched nothing."""
+    """A remote path does not exist (HTTP 404) or a glob/regex pattern matched
+    no entries.
+
+    Args:
+        msg: Human-readable explanation.
+        status: HTTP status code (defaults to ``404``).
+        code: Device JSON ``error_code`` string, or ``None``.
+    """
 
     def __init__(self, msg: str, status: int | None = 404, code: str | None = None) -> None:
         super().__init__(msg, status)
@@ -108,8 +142,8 @@ class NotFoundError(QuadernoError):
 
 
 class ExistsError(QuadernoError):
-    """The target already exists (upload, mkdir, move)."""
+    """The target path already exists (upload, mkdir, move, or copy)."""
 
 
 class NotEmptyError(QuadernoError):
-    """A folder isn't empty (delete without recursive)."""
+    """A folder isn't empty when deleting without ``recursive=True``."""
