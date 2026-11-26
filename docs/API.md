@@ -5,6 +5,9 @@ Reference for the Web API of the Fujitsu QUADERNO Gen 2 / Gen 3C (firmware `2.2.
 ## 1. Discovery, Ports & Wire Conventions
 
 - **mDNS / Bonjour**: `_dp_fujitsu._tcp.`, instance prefix `Digital Paper `, port `8080`, hostname `digitalpaper.local`.
+- **USB transport (CDC-ACM → CDC-ECM)**: On plug-in the device enumerates as USB VID `0x04C5`, PID `0x1656` (CDC-ACM serial). Writing `01 00 00 01 00 00 00 01 01 04` switches it to PID `0x1657` (CDC-ECM Ethernet), reachable at link-local IPv6 `fe80::...` derived from its serial number (`usb.ipv6_from_serial()`).
+  - **macOS**: Serial port `/dev/cu.usbmodem*`, Ethernet interface `enN` (e.g. `en8`), discovered via `ioreg -a -r -c IOUSBHostDevice -l`. No OS setup required.
+  - **Linux**: Serial port `/dev/ttyACM*` (needs `uaccess` ACL or `dialout` group), Ethernet interface `ethN`/`usbN` renamed to `quaderno0` by [`quaderno/linux/60-quaderno.rules`](../quaderno/linux/60-quaderno.rules) and configured with IPv6 link-local only by [`quaderno/linux/quaderno.nmconnection`](../quaderno/linux/quaderno.nmconnection) (installed via `quaderno linux-setup | sh`). Discovered via `/sys/bus/usb/devices` and `/sys/class/net/<iface>/carrier`; `usb.discover()` waits through the ~1–2 s sysfs re-enumeration gap after leaving `0x1656`.
 - **JSON style**: All wire keys are `snake_case`, and null fields are left out. Every struct in [`quaderno/models.py`](../quaderno/models.py) describes one request or response body.
 - **Timestamps**: UTC ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
 - **Session cookie (`Credentials`)**: Issued by `PUT /auth`. Expires after **30 minutes idle** or **24 hours total**. `quaderno.Client` automatically re-authenticates once on HTTP `401`.

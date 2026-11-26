@@ -37,31 +37,105 @@ You don't need Fujitsu's app. If you already use it, both can be used side by si
 
 ## Install it
 
-In a terminal (on a Mac, the Terminal app):
+First, clone the repository in a terminal (on a Mac, the Terminal app):
 
-```
+```sh
 git clone https://github.com/sarraga/quaderno.git ~/quaderno
 cd ~/quaderno
+```
+
+Then follow the section for your system.
+
+### macOS
+
+macOS needs no extra drivers, permissions, or network setup. Create a virtual environment, install `quaderno`, and link it onto your `PATH`:
+
+```sh
 python3 -m venv .venv
 .venv/bin/pip install -e .
+mkdir -p ~/bin
+ln -sf ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
 ```
 
-To type plain `quaderno` from any folder, link it into a folder that's on your PATH, for example `~/bin`:
+When you plug in the tablet, macOS lets your terminal open its USB serial port directly and automatically sets up its USB network link (typically named `en8` or similar).
+
+### Linux
+
+First, create a virtual environment, install `quaderno`, and link it onto your `PATH` (`~/.local/bin` is standard on Linux desktops):
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e .
+mkdir -p ~/.local/bin
+ln -sf ~/quaderno/.venv/bin/quaderno ~/.local/bin/quaderno
+```
+
+**Why Linux needs one extra setup step**
+
+When you plug in the QUADERNO, it doesn't appear as a network device right away. It starts as a USB serial port (`/dev/ttyACM0`), and `quaderno` sends a short 10-byte command to switch it into USB networking mode:
 
 ```
-ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
+  Plug in USB cable
+         │
+         ▼
+  Serial mode (04c5:1656 → /dev/ttyACM0)
+    • Owned by root:dialout (crw-rw----) ──► your user is blocked
+    • ModemManager may probe it as a modem
+         │
+         │  quaderno sends the mode-switch command
+         ▼
+  Network mode (04c5:1657 → quaderno0)
+    • NetworkManager's default wired profile waits for DHCP and drops the link
+    • Needs an IPv6 link-local-only profile (fe80::.../64)
+         │
+         ▼
+  Ready: quaderno talks HTTPS to fe80::...%quaderno0
 ```
 
-**On Linux, one more step.** Linux doesn't let ordinary users open the tablet's USB connection, and its network manager can drop the link the tablet uses. `quaderno linux-setup` prints a short script that fixes both. Read it, then run it; it asks for your password:
+Linux protects serial ports like `/dev/ttyACM0` because on multi-user Unix systems they belonged to modems and hardware terminals. By default, `/dev/ttyACM0` looks like this:
 
+```sh
+$ ls -l /dev/ttyACM0
+crw-rw---- 1 root dialout 166, 0 ... /dev/ttyACM0
 ```
-quaderno linux-setup         # show what it will do
-quaderno linux-setup | sh    # do it
+
+Only `root` and members of the `dialout` group (`uucp` on Arch) can read or write it (`rw-`); everyone else has no access (`---`). Normal desktop users aren't in `dialout`, so running `quaderno` from a terminal fails with `no permission to open /dev/ttyACM0`.
+
+**Fix it once with `quaderno linux-setup`**
+
+`quaderno linux-setup` prints a short script that installs two system files:
+
+1. **A udev rule** (`60-quaderno.rules`): grants your local desktop session permission on the QUADERNO's serial port only (without giving your account access to every serial port on the machine), tells ModemManager to leave it alone, and names its network interface `quaderno0`.
+2. **A NetworkManager profile** (`quaderno.nmconnection`): gives `quaderno0` an IPv6 link-local address and turns off DHCP so NetworkManager doesn't drop the link.
+
+Inspect the script, then run it (`sudo` asks for your password):
+
+```sh
+quaderno linux-setup         # show what it will install
+quaderno linux-setup | sh    # install both files
 ```
 
-Then unplug the tablet and plug it back in. You do this once per computer.
+Then **unplug the tablet and plug it back in**. You do this once per computer.
 
-The README also explains how to turn on Tab completion, which completes the names of files on the tablet as you type.
+> **Using Linux over SSH or a non-desktop terminal?** The udev rule's automatic access (`uaccess`) applies only to a user logged in locally at the computer's screen/keyboard. Over SSH, add your user to the `dialout` group (`uucp` on Arch) instead, then log out and back in so the new group takes effect:
+>
+> ```sh
+> sudo usermod -aG dialout $USER
+> ```
+
+**Check that Linux sees the tablet**
+
+After re-plugging, you can see the permission ACL (`+` in `ls -l`, `user:<you>:rw-` in `getfacl`) and test the cold switch from serial mode (`04c5:1656`) to network mode (`04c5:1657`):
+
+```sh
+lsusb -d 04c5:               # Bus ... ID 04c5:1656 Fujitsu, Ltd FMVDP41
+getfacl /dev/ttyACM0         # includes user:<you>:rw-
+quaderno -v addr             # switches mode (~4 s) -> fe80::c8d3:84ff:fec2:323b%quaderno0
+ip -br addr show quaderno0   # quaderno0  UP  fe80::.../64
+nmcli device status          # quaderno0  ethernet  connected  QUADERNO
+```
+
+The README also explains how to turn on Tab completion (zsh), which completes the names of files on the tablet as you type.
 
 ## First steps
 
@@ -90,10 +164,10 @@ quaderno ping
 quaderno info
 ```
 
-`ping` answers `ok` when everything is connected. `info` shows a summary like this:
+`ping` answers `ok` when everything is connected. `info` shows a summary like this (the interface after `%` is `en8` or similar on macOS, and `quaderno0` on Linux):
 
 ```
-address        fe80::c8d3:84ff:fec2:323b%en8
+address        fe80::c8d3:84ff:fec2:323b%en8         # %quaderno0 on Linux
 api version    2.1
 firmware       2.2.09.11030FP
 owner          Your Name

@@ -6,45 +6,140 @@ It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
 **New here? Start with the [manual](docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
 
-Tested against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP, Web API 2.1, macOS 27.2 and Python 3.14. The full cycle (plug in, USB mode switch, pairing, login, file operations) was tested with the official app closed. Linux support is newer and hasn't been tried with the device yet. The code differs between the two systems only in how it finds the device on USB, and the offline tests check the Linux side against a simulated sysfs.
+Tested end-to-end against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP and Web API 2.1 on both **macOS** and **Linux** (systemd-udevd + NetworkManager). The full cycle (cold plug-in, USB mode switch, pairing, login, info, config, search, screenshot, download, and file operations) was exercised with the official app closed. The code differs between the two systems only in how it finds the device on USB (`ioreg` on macOS, `sysfs` on Linux), and the offline test suite covers both.
 
 ## Install
 
-You need macOS or Linux, Python 3.11 or newer, and a USB cable that carries data. Linux also needs the one-time [Linux setup](#linux-setup) below. Install it into its own virtual environment; editable mode means changes to the code take effect immediately:
+You need macOS or Linux, Python 3.11 or newer, and a USB cable that carries data. Clone the repository first:
 
-```
+```sh
 git clone https://github.com/sarraga/quaderno.git ~/quaderno
 cd ~/quaderno
+```
+
+Install in editable mode (`-e .`, or `-e '.[test]'` for development with `pytest` and `mypy`) so changes to the code take effect immediately. `pip` also installs `cryptography`. Without `quaderno` on your `PATH`, `.venv/bin/python -m quaderno` works the same.
+
+### macOS
+
+macOS needs no extra drivers, permissions, or network configuration—the logged-in user can open `/dev/cu.usbmodem*` directly, and the kernel creates an Ethernet interface (`enN`, e.g. `en8`) with an IPv6 link-local address automatically once `quaderno` switches the device out of serial mode:
+
+```sh
 python3 -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/quaderno --help
+.venv/bin/pip install -e '.[test]'   # or -e . if you don't need pytest/mypy
+mkdir -p ~/bin
+ln -sf ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
+quaderno --help
 ```
 
-`pip install` also installs `cryptography`. Without the `quaderno` command on your PATH, `.venv/bin/python -m quaderno` works the same. To run plain `quaderno` from anywhere, link it into a folder that is on your PATH, for example `~/bin`:
+### Linux
+
+#### 1. Install the package
+
+Create a virtual environment and symlink the CLI into `~/.local/bin` (standard on Linux desktops, without putting `.venv`'s `python` ahead of system Python):
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e '.[test]'   # or -e . if you don't need pytest/mypy
+mkdir -p ~/.local/bin
+ln -sf ~/quaderno/.venv/bin/quaderno ~/.local/bin/quaderno
+which quaderno
+```
+
+#### 2. Why Linux needs extra permissions and network setup
+
+Unlike macOS, Linux enforces strict multi-user permissions on serial devices and hands new wired USB interfaces to NetworkManager's default DHCP policy. Both steps in the USB bring-up need a one-time root configuration:
 
 ```
-ln -s ~/quaderno/.venv/bin/quaderno ~/bin/quaderno
+  Plug in USB cable
+         │
+         ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ 1. CDC-ACM serial mode  (VID 04c5, PID 1656 → /dev/ttyACM0)         │
+  │    Default node: crw-rw---- 1 root dialout  (/dev/ttyACM0)          │
+  │      • ordinary users have "---" → PermissionError on open()        │
+  │      • ModemManager probes new ttyACM* ports with AT commands       │
+  │                                                                     │
+  │    Fixed by 60-quaderno.rules:                                      │
+  │      • TAG+="uaccess"  → systemd-logind adds ACL user:<you>:rw-     │
+  │      • ID_MM_DEVICE_IGNORE="1" → ModemManager leaves it alone       │
+  └─────────────────────────────────────────────────────────────────────┘
+         │  quaderno writes 10-byte SWITCH_TO_CDC_ECM to /dev/ttyACM0
+         ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ 2. USB re-enumeration gap (~1–2 s)                                  │
+  │    04c5:1656 drops off /sys/bus/usb/devices before 04c5:1657        │
+  │    appears; usb.discover() waits through this gap.                  │
+  └─────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ 3. CDC-ECM Ethernet mode  (VID 04c5, PID 1657 → eth0 / usb0)        │
+  │    Default NM wired profile waits for DHCP + IPv6 RA (neither is    │
+  │    sent by the tablet) and can drop the link on timeout.            │
+  │                                                                     │
+  │    Fixed by 60-quaderno.rules + quaderno.nmconnection:              │
+  │      • udev renames interface → quaderno0 and brings link UP        │
+  │      • NM matches quaderno* with ipv4=disabled, ipv6=link-local     │
+  └─────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  quaderno0 UP (fe80::.../64) ──► HTTPS :8443 to fe80::...%quaderno0
 ```
 
-### Linux setup
+**Understanding the `/dev/ttyACM0` permission issue (`uaccess` vs. `dialout`)**
 
-Linux needs a one-time setup that `pip` can't do, because it needs root:
+On Linux, USB serial devices (`/dev/ttyACM0`) inherit Unix's multi-user model for modems and hardware terminals:
 
-- **The serial port.** The device first appears as `/dev/ttyACM0`, which only root and the `dialout` group (`uucp` on Arch) may open. A udev rule lets the user logged in at the computer open it, and keeps ModemManager from probing it, which could get in the way of the switch to USB networking.
-- **The network interface.** The same rule names the device's interface `quaderno0` and brings it up, which is all the kernel needs to give it the IPv6 link-local address `quaderno` uses.
-- **NetworkManager**, if you use it. Its default profile for a new wired interface waits for DHCP and router advertisements, which the device doesn't send, and can drop the connection when they time out. A profile that matches `quaderno*` gives the interface only a link-local address.
-
-Both files ship with the package, in [`quaderno/linux/`](quaderno/linux). `quaderno linux-setup` prints a script that installs them. Read it, then run it; `sudo` asks for your password:
-
+```sh
+$ ls -l /dev/ttyACM0
+crw-rw---- 1 root dialout 166, 0 ... /dev/ttyACM0
+# ^^^      ^ owner  group
+# ││└─ other: --- (no access)
+# │└── group: rw- (dialout on Debian/Ubuntu, uucp on Arch)
+# └─── owner: rw- (root)
 ```
+
+Because normal desktop accounts are not in `dialout`, opening `/dev/ttyACM0` raises `PermissionError`. There are two ways Linux grants access, and which one applies depends on **where your terminal session lives**:
+
+- **Local desktop / console session (`TAG+="uaccess"`, recommended):** `60-quaderno.rules` tags only `04c5:1656` with `uaccess`. Because the filename sorts before systemd's `73-seat-late.rules`, `systemd-logind` dynamically attaches a POSIX ACL (`user:<you>:rw-`, shown as a trailing `+` in `crw-rw----+` and visible via `getfacl /dev/ttyACM0`) exclusively to the user seated at the local console—without granting access to every other serial device on the machine or requiring a re-login.
+- **Remote SSH or headless session (`dialout` group):** An SSH session has no local `logind` seat, so `uaccess` ACLs are not applied to it. In that case, add your user to the group that owns `/dev/ttyACM0` (`dialout` on Debian/Ubuntu/Fedora, `uucp` on Arch), then **start a new login session** (already-open shells do not pick up new group memberships):
+
+  ```sh
+  sudo usermod -aG dialout $USER
+  ```
+
+#### 3. Install the udev rule and NetworkManager profile
+
+Both files ship with the package in [`quaderno/linux/`](quaderno/linux). `quaderno linux-setup` prints the commands that install them; inspect it, then run it (`sudo` asks for your password):
+
+```sh
 quaderno linux-setup
 quaderno linux-setup | sh
 ```
 
-Then unplug the QUADERNO and plug it back in. The rule's access grant (`uaccess`) applies only to whoever is logged in at the computer itself. Over SSH, add yourself to the group that owns the port instead, then log in again:
+Then **unplug the QUADERNO and plug it back in** so udev applies `60-quaderno.rules` to the device.
 
-```
-sudo usermod -aG dialout $USER
+#### 4. Verifying the Linux stack (worked example)
+
+```sh
+# 1. Confirm serial mode (04c5:1656) and the udev uaccess ACL before switching
+lsusb -d 04c5:                 # Bus ... ID 04c5:1656 Fujitsu, Ltd FMVDP41
+ls -l /dev/ttyACM0             # crw-rw----+ 1 root dialout ... (note the '+')
+getfacl /dev/ttyACM0           # includes user:<you>:rw-
+
+# 2. Cold switch: serial (1656) -> ~1-2 s USB re-enumeration -> Ethernet (1657)
+quaderno -v addr               # ~4 s -> fe80::c8d3:84ff:fec2:323b%quaderno0
+
+# 3. Confirm interface rename, IPv6 link-local, and NetworkManager profile
+lsusb -d 04c5:                 # now ID 04c5:1657 Fujitsu, Ltd FMVDP41
+ip -br addr show quaderno0     # quaderno0  UP  fe80::.../64
+nmcli device status            # quaderno0  ethernet  connected  QUADERNO
+
+# 4. Pair, exercise the API, and run the offline test suite + strict type check
+quaderno pair
+quaderno ping && quaderno info
+.venv/bin/pytest
+.venv/bin/mypy
 ```
 
 ### Tab completion (zsh)
@@ -318,7 +413,10 @@ If pairing received a certificate it couldn't read, none is stored and connectio
 
 ## How the connection works
 
-1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*` on macOS and `/dev/ttyACM*` on Linux. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new network interface: `enN` on macOS; `usbN` or `ethN` on Linux, which the udev rule from `quaderno linux-setup` renames `quaderno0`. The script writes only to a tty whose USB VID/PID match.
+1. **USB mode switch.** On plug-in, the device appears as a CDC-ACM serial port: USB VID `0x04C5`, PID `0x1656`, `/dev/cu.usbmodem*` on macOS and `/dev/ttyACM*` on Linux. Writing `01 00 00 01 00 00 00 01 01 04` to that port makes it disconnect and re-enumerate as CDC-ECM Ethernet (PID `0x1657`), which appears as a new network interface:
+   - **macOS:** `enN` (e.g. `en8`), discovered via `ioreg -a -r -c IOUSBHostDevice -l`.
+   - **Linux:** `ethN` or `usbN`, renamed to `quaderno0` by `60-quaderno.rules` and activated with IPv6 link-local by `quaderno.nmconnection`; discovered via `/sys/bus/usb/devices/<dev>/<dev>:<cfg>.<if>/net/`. Because Linux briefly drops the device from sysfs (~1–2 s) between `0x1656` disappearing and `0x1657` enumerating, `usb.discover()` waits out that gap within `answer_timeout` (~4 s end-to-end on a cold plug-in).
+   The script writes only to a tty whose USB VID/PID match.
 2. **Address.** The device's IPv6 link-local address is derived from its serial number: `('1'+serial) * 0x9e37fffffffc0001`, masked, with `fffe` inserted in the middle. For example, serial `850000312345678` gives `fe80::c8d3:84ff:fec2:323b`. It is used only on the network interface the system created for the device. On macOS, the I/O Registry (`ioreg`) lists that interface (e.g. `en8`) and its link status under the USB device. On Linux, sysfs does: `/sys/bus/usb/devices/<device>/<interface>/net/`, with the link status in `/sys/class/net/<interface>/carrier`. On Linux, an error also says when the interface is down or has no IPv6 link-local address. The link status is used only to word an error (missing interface, link down, or no answer), never to skip trying: right after one plug-in it read "not valid" while the device answered. With several QUADERNOs attached, the serial saved at pairing picks the right one.
 3. **Pairing.** Plain HTTP on port 8080, in five calls:
    - `POST /register/pin`: the device sends nonce `n1`, its MAC and its Diffie-Hellman public value.
@@ -460,7 +558,7 @@ computer slept. Wake it with its power button, or unplug and re-plug it, then tr
 - **`lists no network interface for it`**: the system didn't set up networking for the device after the switch. Unplug and re-plug it. On Linux, also check that the `cdc_ether` driver loads: `sudo modprobe cdc_ether`.
 - **`USB network link (enN) is down`**: the interface exists but has no link. Wake or unlock the device; if that doesn't help, re-plug it.
 - **`its link is up, but it doesn't answer`**: the network is fine but the device's server isn't responding. Wake or unlock the device.
-- **`no permission to open /dev/ttyACM0`** (Linux): run `quaderno linux-setup | sh`, then re-plug the device. Over SSH, add yourself to the group the message names instead, as described in [Linux setup](#linux-setup).
+- **`no permission to open /dev/ttyACM0`** (Linux): run `quaderno linux-setup | sh`, then re-plug the device. Over SSH, add yourself to the group the message names instead, as described in [Install → Linux](#linux).
 - **`that interface is down`, `has no IPv6 link-local address` or `IPv6 is turned off on that interface`** (Linux): run `quaderno linux-setup | sh`, then re-plug the device. `ip addr show quaderno0` should then list an `inet6 fe80::` address. With NetworkManager, `nmcli device status` should show `quaderno0` connected with the `QUADERNO` profile.
 - **`isn't the one these credentials were paired with`**: a different QUADERNO is plugged in. Plug in the paired one, or pair this one into its own folder with `quaderno --config DIR pair` and use `--config DIR` with it.
 - **`couldn't read the list of USB devices`**: macOS's `ioreg` failed or timed out, or Linux's `/sys/bus/usb/devices` couldn't be read; the message includes why. This is not the same as the device being absent.
