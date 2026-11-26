@@ -1,15 +1,30 @@
 [project]
 name = "quaderno"
 dynamic = ["version"]
-description = "Python API and command-line client for the Fujitsu QUADERNO e-paper tablet over USB"
+description = "Python API and command-line client for the Fujitsu QUADERNO e-paper tablet over USB and Wi-Fi"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
+authors = [
+    {name = "Santiago Arraga González"},
+]
+keywords = ["quaderno", "fujitsu", "dpt-rp1", "digital-paper", "e-paper", "e-ink", "pdf"]
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]
 classifiers = [  # informational only: pip installs the same wheel everywhere
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -19,8 +34,11 @@ test = ["pytest>=8", "mypy>=1.10"]
 quaderno = "quaderno.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/sarraga/quaderno"
 Repository = "https://github.com/sarraga/quaderno"
 Manual = "https://github.com/sarraga/quaderno/blob/main/docs/MANUAL.md"
+API = "https://github.com/sarraga/quaderno/blob/main/docs/API.md"
+Issues = "https://github.com/sarraga/quaderno/issues"
 
 [build-system]
 requires = ["setuptools>=77"]  # 77: SPDX `license` string and `license-files`

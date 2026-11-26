@@ -4,13 +4,21 @@ A command-line client for the Fujitsu QUADERNO (FMV-DP41, a rebadged Sony DPT-CP
 It is a Python package with two faces: a **Python API** (`import quaderno`) and the **`quaderno` command** built on it. The only dependency is [`cryptography`](https://cryptography.io).
 It pairs with the device by itself, so the official QUADERNO app isn't needed.
 
-**New here? Start with the [manual](docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
+**New here? Start with the [manual](https://github.com/sarraga/quaderno/blob/main/docs/MANUAL.md)**: what the tool can do, task by task, written for someone who has never used it.
 
 Tested end-to-end against a QUADERNO A4 (FMV-DP41) with firmware 2.2.09.11030FP and Web API 2.1 over USB on both **macOS** and **Linux** (systemd-udevd + NetworkManager), and over **Wi-Fi** (zero-dependency mDNS/Bonjour discovery with TLS 1.2 certificate pinning) on macOS. The full cycle (cold plug-in, USB mode switch, Wi-Fi discovery, pairing, login, info, config, search, screenshot, download, and file operations) was exercised with the official app closed. The code differs between macOS and Linux only in OS discovery hooks (`ioreg`/Bonjour on macOS, `sysfs` on Linux), and the offline test suite covers both.
 
 ## Install
 
-You need macOS or Linux, Python 3.11 or newer, and a USB cable that carries data. Clone the repository first:
+You need macOS or Linux, Python 3.11 or newer, and either a USB data cable or Wi-Fi on the same network.
+
+From PyPI:
+
+```sh
+pip install quaderno        # or: pipx install quaderno / uv tool install quaderno
+```
+
+Or install from a git checkout (needed if you also want the shell completion scripts or to run the test suite):
 
 ```sh
 git clone https://github.com/sarraga/quaderno.git ~/quaderno
@@ -110,7 +118,7 @@ Because normal desktop accounts are not in `dialout`, opening `/dev/ttyACM0` rai
 
 #### 3. Install the udev rule and NetworkManager profile
 
-Both files ship with the package in [`quaderno/linux/`](quaderno/linux). `quaderno linux-setup` prints the commands that install them; inspect it, then run it (`sudo` asks for your password):
+Both files ship with the package in [`quaderno/linux/`](https://github.com/sarraga/quaderno/tree/main/quaderno/linux). `quaderno linux-setup` prints the commands that install them; inspect it, then run it (`sudo` asks for your password):
 
 ```sh
 quaderno linux-setup
@@ -362,7 +370,7 @@ quaderno pastlog quaderno-log.bin          # download encrypted diagnostic archi
 - **`replace` overwrites an existing document's PDF bytes in place** (`PUT /documents/{id}/file`), preserving its document ID; pass `--revision REV` for optimistic concurrency control (`40017` on mismatch).
 - **`viewing`** prints the open document's path and page, for example `Document/Books/x.pdf  page 59 of 736`, or `nothing is open on the device`. It pairs with `open`.
 - **`config`** with no arguments lists all scalar settings (via `/system/configs3`, normalizing `timeout_to_sleep` to `timeout_to_standby`); `--all` prints the raw `/system/configs3` JSON. Settable keys: `owner`, `timezone`, `date_format`, `time_format`, `timeout_to_standby`, `mtp` (`0`/`1`), `regulation_voltage`, `use_mode` (`personal`/`shared`/`others`), `annotations_permission` (`yes`/`no`), `additional_client_registration` (`accept_all`/`accept_dcss_only`/`refuse`), `control_servers_editable` (`yes`/`no`), `initialized_flag`, `wifi` (`on`/`off`), `wifi_apmode` (`on`/`off`), `wifi_sleep_policy` (`disabled`/`enabled_always`/`enabled_if_plugged`).
-- **`templates`, `wifi`, `power`, `firmware`, `pen-buttons`, `certs`, `pastlog`** expose the remaining device Web API controls directly from the command line. See [`docs/API.md`](docs/API.md) for the complete endpoint-by-endpoint reference.
+- **`templates`, `wifi`, `power`, `firmware`, `pen-buttons`, `certs`, `pastlog`** expose the remaining device Web API controls directly from the command line. See [`docs/API.md`](https://github.com/sarraga/quaderno/blob/main/docs/API.md) for the complete endpoint-by-endpoint reference.
 
 ## Python API
 
@@ -395,7 +403,7 @@ with quaderno.connect() as dev:                  # USB by default; pass transpor
     print(dev.info()["storage"])
 ```
 
-- **Structs:** [`quaderno/models.py`](quaderno/models.py) defines `TypedDict` structs and `Literal` enums for every request and response model (`DeviceInformation`, `CurrentViewing`, `NoteTemplate`, `FileUploadResult`, `ConfigsV2`, `ConfigsV3`, `WifiApConfig`, `WifiApInfo`, `PenButtonsInfo`, `CertificateInfo`, `DocumentProcessStatus`, `UpdateFirmwarePrecheck`, `DialogParameters`, `DocumentAttribute`, `TransferWizardNextScreen`, etc.). They are plain `dict`s at runtime and statically checked under `mypy --strict`.
+- **Structs:** [`quaderno/models.py`](https://github.com/sarraga/quaderno/blob/main/quaderno/models.py) defines `TypedDict` structs and `Literal` enums for every request and response model (`DeviceInformation`, `CurrentViewing`, `NoteTemplate`, `FileUploadResult`, `ConfigsV2`, `ConfigsV3`, `WifiApConfig`, `WifiApInfo`, `PenButtonsInfo`, `CertificateInfo`, `DocumentProcessStatus`, `UpdateFirmwarePrecheck`, `DialogParameters`, `DocumentAttribute`, `TransferWizardNextScreen`, etc.). They are plain `dict`s at runtime and statically checked under `mypy --strict`.
 - **Session renewal:** device sessions expire after 30 minutes idle; `Client` automatically re-authenticates once on HTTP `401`.
 - **Progress:** operations that change things take `on_event=`, a function that receives an `Event(kind, message, path, warning)` for each step. Kinds include `uploaded`, `skipped`, `created`, `moved`, `deleted` and `downloaded`. The CLI simply prints `event.message`, sending warnings to stderr.
 - **Errors:** every failure on the device side is a `quaderno.QuadernoError`; local file problems (a directory that doesn't exist, no permission) are ordinary `OSError`s. Subclasses separate unreachable devices (`ConnectError`), credential and identity problems (`AuthError`), pairing (`PairingError`), errors from operations (`NotFoundError`, `ExistsError`, `NotEmptyError`, `RequestError`, `LockedError`, `StorageFullError`), and malformed answers from the device (`ProtocolError`). The full tree is under [Errors and exit codes](#errors-and-exit-codes).
@@ -653,6 +661,6 @@ computer slept. Wake it with its power button, or unplug and re-plug it, then tr
 
 Copyright (C) 2026 Santiago Arraga González
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; see [LICENSE](LICENSE) for the full text.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; see [LICENSE](https://github.com/sarraga/quaderno/blob/main/LICENSE) for the full text.
 
 QUADERNO is a trademark of its owner. This project is not affiliated with or endorsed by Fujitsu or Sony.

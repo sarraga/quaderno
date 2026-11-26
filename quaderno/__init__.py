@@ -1,4 +1,4 @@
-"""Python API and command-line client for the Fujitsu QUADERNO (Sony DPT) over USB.
+"""Python API and command-line client for the Fujitsu QUADERNO (Sony DPT) over USB or Wi-Fi.
 
     import quaderno
     with quaderno.connect() as dev:          # find the device on USB and log in
@@ -30,7 +30,7 @@ from .models import (BatteryStatus, CertificateInfo, CommonValue, ConfigsV1, Con
                      WifiApConfig, WifiApInfo)
 from .pairing import PairResult, pair
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"
 __all__ = ["connect", "discover", "pair", "Device", "Entry", "Event", "PutResult", "PairResult",
            "Transport", "mdns", "models",
            "BatteryStatus", "CertificateInfo", "CommonValue", "ConfigsV1", "ConfigsV2",
