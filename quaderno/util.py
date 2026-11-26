@@ -3,6 +3,7 @@
 import datetime
 import fnmatch
 import re
+import sys
 import unicodedata
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +14,11 @@ ROOT = "Document"  # the device's single top-level folder
 GLOB_CHARS = frozenset("*?[")
 HTTPS_PORT = 8443  # Web API (TLS, self-signed certificate)
 REG_PORT = 8080    # pairing ("registration"), plain HTTP
+_WIN_RESERVED = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
 
 JsonObject = dict[str, Any]  # a decoded JSON object from the device: not validated
 
@@ -51,9 +57,27 @@ def nfc(name: str) -> str:
 
 def safe_local_name(name: str) -> str:
     """Device names become local path components; reject anything that could escape."""
-    if name in ("", ".", "..") or "/" in name or "\0" in name:
+    if name in ("", ".", "..") or "/" in name or "\\" in name or "\0" in name:
         raise QuadernoError(f"refusing unsafe name from device: {name!r}")
+    if sys.platform == "win32":
+        stem = name.rstrip(" .").split(".", 1)[0].lower()
+        if ":" in name or name.endswith((" ", ".")) or stem in _WIN_RESERVED:
+            raise QuadernoError(f"refusing unsafe Windows name from device: {name!r}")
     return name
+
+
+def sanitize_terminal(text: str) -> str:
+    """Escape C0/C1 control characters (including ANSI ESC) for safe TTY output."""
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch == "\n" or ch == "\t":
+            out.append(ch)
+        elif code < 0x20 or 0x7F <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def is_pattern(component: str, regex: bool = False) -> bool:

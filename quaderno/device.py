@@ -22,16 +22,18 @@ import datetime
 import errno
 import logging
 import os
+import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import BinaryIO, cast
 from urllib.parse import quote, urlencode
 
 from . import credentials, discovery, pairing, usb
 from .client import Client
 from .credentials import Credentials
 from .entry import Entry
-from .errors import ExistsError, NotEmptyError, NotFoundError, ProtocolError, QuadernoError
+from .errors import (CertificateError, ExistsError, NotEmptyError, NotFoundError, ProtocolError,
+                     QuadernoError)
 from .events import EventHandler, emit
 from .models import (CertificateInfo, CommonValue, ConfigsV2, ConfigsV3, CurrentViewing,
                      DeviceInformation, DialogParameters, DocumentAttribute, DocumentProcessStatus,
@@ -87,17 +89,29 @@ def connect(addr: str | None = None, config_dir: str | None = None, timeout: flo
         log.warning("warning: the device's TLS certificate is not checked: the credentials in "
                     "%s include none; run `quaderno pair --force` to pair again and save it",
                     creds.source)
-    if not addr:
-        addr = os.environ.get("QUADERNO_ADDR") or discovery.discover(
+    explicit_addr = addr or os.environ.get("QUADERNO_ADDR")
+    resolved_transport = discovery.parse_transport(transport or os.environ.get("QUADERNO_TRANSPORT"))
+    cached_addr = credentials.load_wifi_addr(creds.source)
+    if explicit_addr:
+        addr = explicit_addr
+    else:
+        addr = discovery.discover(
             creds.serial,
-            transport=discovery.parse_transport(transport or os.environ.get("QUADERNO_TRANSPORT")),
+            transport=resolved_transport,
             on_switch=on_switch,
-            cached_addr=credentials.load_wifi_addr(creds.source),
-            on_wifi_addr=lambda a: credentials.save_wifi_addr(creds.source, a),
+            cached_addr=cached_addr,
+            pinned_cert=creds.pinned_cert,
         )
     dev = Device(addr, creds.client_id, creds.key, timeout=timeout, pinned_cert=creds.pinned_cert)
     dev.credentials = creds
-    dev.authenticate()
+    try:
+        dev.authenticate()
+    except CertificateError:
+        if not explicit_addr and cached_addr and addr == cached_addr:
+            credentials.clear_wifi_addr(creds.source)
+        raise
+    if not explicit_addr and resolved_transport != "usb" and credentials.is_wifi_addr(addr):
+        credentials.save_wifi_addr(creds.source, addr)
     return dev
 
 
@@ -107,6 +121,24 @@ def _need_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
         raise FileNotFoundError(errno.ENOENT, "No such directory", parent)
+
+
+def _atomic_write(target: str, write_to: Callable[[BinaryIO], int]) -> int:
+    """Write via a private temporary file in target's directory and rename atomically."""
+    _need_dir(target)
+    parent = os.path.dirname(os.path.abspath(target))
+    fd, tmp = tempfile.mkstemp(prefix=".quaderno-", suffix=".part", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            n = write_to(fh)
+        os.replace(tmp, target)
+        return n
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class Device(Client):
@@ -155,6 +187,7 @@ class Device(Client):
         pagination. `base` carries its own query string, if any; `limit` caps how
         many are fetched in all. The device's own default page size is 1300."""
         out: list[Entry] = []
+        seen_ids: set[str] = set()
         while True:
             sep = "&" if "?" in base else "?"
             page = f"{base}{sep}offset={len(out)}&limit={page_size}"
@@ -162,9 +195,15 @@ class Device(Client):
             batch = r.get("entry_list", [])
             if not isinstance(batch, list) or not all(isinstance(d, dict) for d in batch):
                 raise ProtocolError(f"GET {page}: entry_list isn't a list of entries")
-            out += [Entry.from_api(d) for d in batch]
+            added = 0
+            for d in batch:
+                entry = Entry.from_api(d)
+                if entry.id not in seen_ids:
+                    seen_ids.add(entry.id)
+                    out.append(entry)
+                    added += 1
             count = json_int(r, "count") if "count" in r else len(out)
-            if not batch or len(out) >= count or (limit is not None and len(out) >= limit):
+            if not batch or added == 0 or len(out) >= count or (limit is not None and len(out) >= limit):
                 return out[:limit] if limit is not None else out
 
     def _children(self, folder_id: str, *, v2: bool = False, order: str | None = None,
@@ -207,12 +246,17 @@ class Device(Client):
         return self._children(self._folder(folder).id, v2=v2, order=order, fields=fields,
                               limit=limit)
 
-    def walk(self, folder: PathOrEntry = ROOT) -> Iterator[Entry]:
+    def walk(self, folder: PathOrEntry = ROOT, *, _seen: set[str] | None = None) -> Iterator[Entry]:
         """Everything below a folder, depth-first; parents come before children."""
-        for e in self.entries(folder):
+        seen = set() if _seen is None else _seen
+        root_entry = self._folder(folder)
+        if root_entry.id in seen:
+            return
+        seen.add(root_entry.id)
+        for e in self._children(root_entry.id):
             yield e
             if e.is_folder:
-                yield from self.walk(e)
+                yield from self.walk(e, _seen=seen)
 
     def find(self, pattern: str, regex: bool = False) -> tuple[list[Entry], bool]:
         """Entries matching a path whose components may be patterns.
@@ -279,15 +323,7 @@ class Device(Client):
         time is unreadable, the file is kept with a warning, without it."""
         _need_dir(target)
         doc = doc if isinstance(doc, Entry) else self.resolve(doc)
-        tmp = target + ".part"
-        try:
-            with open(tmp, "wb") as fh:
-                n = self.download_to(doc.id, fh)
-            os.replace(tmp, target)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        n = _atomic_write(target, lambda fh: self.download_to(doc.id, fh))
         try:
             mtime = doc.mtime
         except ProtocolError as err:  # the contents are fine; only the date is lost
@@ -696,16 +732,7 @@ class Device(Client):
         entry = doc if isinstance(doc, Entry) else self.resolve(doc)
         if not entry.is_document:
             raise QuadernoError(f"{entry.path} is not a document")
-        tmp = target + ".part"
-        try:
-            with open(tmp, "wb") as fh:
-                n = self.download_annotation_to(entry.id, page, fh)
-            os.replace(tmp, target)
-            return n
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        return _atomic_write(target, lambda fh: self.download_annotation_to(entry.id, page, fh))
 
     def get_document_attribute(self, doc: PathOrEntry) -> DocumentAttribute:
         """Get custom action attributes for a document (GET /documents/{id}/attribute)."""
@@ -1060,8 +1087,8 @@ class Device(Client):
             raise QuadernoError(f"unsupported screenshot format {chosen!r} (use 'png' or 'jpeg')")
         endpoint = ("/system/controls/screen_shot2?format=jpeg"
                     if chosen == "jpeg" else "/system/controls/screen_shot")
-        with open(path, "wb") as fh:
-            return self.request_stream("GET", endpoint, fh, headers={"Accept": "*/*"})
+        return _atomic_write(
+            path, lambda fh: self.request_stream("GET", endpoint, fh, headers={"Accept": "*/*"}))
 
     def sleep(self) -> None:
         """Put the device into sleep/standby (PUT /system/controls/sleep)."""
@@ -1089,17 +1116,7 @@ class Device(Client):
 
     def download_pastlog(self, target: str) -> int:
         """Download the encrypted diagnostic pastlog archive (GET /system/controls/pastlog)."""
-        _need_dir(target)
-        tmp = target + ".part"
-        try:
-            with open(tmp, "wb") as fh:
-                n = self.download_pastlog_to(fh)
-            os.replace(tmp, target)
-            return n
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        return _atomic_write(target, self.download_pastlog_to)
 
     def indicate(self, dialog_params: DialogParameters, *,
                  show_animation: bool = False) -> CommonValue | None:

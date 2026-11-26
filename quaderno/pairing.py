@@ -27,6 +27,9 @@ from .events import EventHandler, emit
 from .util import REG_PORT, JsonObject, json_str
 
 
+MAX_REG_BYTES = 1024 * 1024  # cap registration API responses (1 MiB)
+
+
 def reg_request(addr: str, method: str, path: str,
                 body: JsonObject | None = None) -> tuple[int, JsonObject | bytes | None]:
     """One call to the registration API; returns (status, the JSON object answered,
@@ -40,11 +43,13 @@ def reg_request(addr: str, method: str, path: str,
     try:
         conn.request(method, path, body=data, headers=hdrs)
         resp = conn.getresponse()
-        raw = resp.read()
+        raw = resp.read(MAX_REG_BYTES + 1)
     except OSError as err:
         raise DeviceUnreachableError(f"pairing: lost contact with the device ({err})") from err
     finally:
         conn.close()
+    if len(raw) > MAX_REG_BYTES:
+        raise ProtocolError(f"pairing: {method} {path} response exceeds {MAX_REG_BYTES} bytes")
     if not raw:
         return resp.status, None
     try:
@@ -87,6 +92,8 @@ def register(addr: str, client_id: str, public_pem: str, read_pin: Callable[[], 
 
     m1 = call("/register/pin", None, 200)
     n1, mac, yb = u(m1, "a"), u(m1, "b"), u(m1, "c")  # yb as sent (may carry a 0x00 sign byte)
+    if len(yb) > 512:
+        raise PairingError("pairing: device sent an oversized DH value")
     ya, zz = crypto.dh_exchange(int.from_bytes(yb, "big"))
     n2 = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", zz, n1 + mac + n2, 10000, 48)
@@ -149,6 +156,10 @@ def pair(read_pin: Callable[[], str], addr: str | None = None, force: bool = Fal
         addr = os.environ.get("QUADERNO_ADDR") or discovery.discover(
             transport=discovery.parse_transport(transport or os.environ.get("QUADERNO_TRANSPORT")),
         )
+    if credentials.is_wifi_addr(addr):
+        emit(on_event, "warning",
+             "warning: pairing over Wi-Fi uses unencrypted HTTP (port 8080) and is vulnerable "
+             "to an active on-LAN MITM; pair over USB on untrusted networks", warning=True)
     status, info = reg_request(addr, "GET", "/register/information")
     found = info.get("serial_number") if status == 200 and isinstance(info, dict) else None
     serial = found if isinstance(found, str) else None

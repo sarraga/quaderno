@@ -21,6 +21,8 @@ from .util import HTTPS_PORT, JsonObject, json_int, json_str
 
 log = logging.getLogger("quaderno")
 CHUNK = 8 * 1024 * 1024  # upload piece size (the one tested)
+MAX_JSON_BYTES = 32 * 1024 * 1024  # cap non-streaming JSON responses
+MAX_ERR_BYTES = 65536
 _STALE: tuple[type[BaseException], ...] = (
     http.client.RemoteDisconnected, http.client.CannotSendRequest,
     http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError)
@@ -69,6 +71,7 @@ class Client:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE  # self-signed; pinned_cert does the checking
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
             ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
         except ssl.SSLError:
@@ -138,7 +141,7 @@ class Client:
                 name, _, rest = h.partition("=")
                 self.cookies[name.strip()] = rest.split(";", 1)[0]
             if resp.status not in ok:
-                err_data = resp.read()
+                err_data = resp.read(MAX_ERR_BYTES)
                 if (resp.status == 401 and _reauth and self.key is not None
                         and self.cookies and not path.startswith("/auth")):
                     reauth_needed = True
@@ -151,7 +154,10 @@ class Client:
                     total += len(chunk)
                 result = total
             else:
-                answer = resp.read()
+                answer = resp.read(MAX_JSON_BYTES + 1)
+                if len(answer) > MAX_JSON_BYTES:
+                    self.close()
+                    raise ProtocolError(f"{method} {path}: response exceeds {MAX_JSON_BYTES} bytes")
                 result = self._json(method, path, answer) if answer else None
         except QuadernoError:
             if resp.will_close:
@@ -319,15 +325,18 @@ class Client:
                 params: dict[str, str] = {"offset_bytes": str(offset), "total_bytes": str(size)}
                 if extra_params:
                     params.update(extra_params)
+                prev_offset = offset
                 r = self.request_json(
                     "PUT", f"{path}?{urlencode(params)}", body,
                     {"Content-Type": f"multipart/form-data; boundary={boundary}"}, ok=(200, 206))
                 offset = json_int(r, "current_bytes")
+                if offset < 0 or offset > size:
+                    raise ProtocolError(f"upload returned out-of-range offset {offset} (size {size})")
                 if offset >= size:
                     if r.get("completed") != "yes":
                         raise RequestError("upload finished but device did not mark it complete")
                     return cast(FileUploadResult, r)
-                if not chunk:
+                if not chunk or offset <= prev_offset:
                     raise RequestError("upload stalled")
                 fh.seek(offset)
 

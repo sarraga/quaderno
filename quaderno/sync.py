@@ -2,6 +2,8 @@
 
 import json
 import os
+import stat
+import tempfile
 from typing import TYPE_CHECKING, Any, TypedDict, TypeGuard
 
 from .errors import QuadernoError
@@ -26,10 +28,28 @@ class SyncState(TypedDict):
     entries: dict[str, SyncRecord]    # by device entry id
 
 
+def _safe_relpath(rel: str) -> str:
+    """Validate a '/'-separated relative path from sync state or the device."""
+    parts = rel.split("/")
+    if not parts or any(p == "" for p in parts):
+        raise QuadernoError(f"refusing unsafe sync path: {rel!r}")
+    clean = "/".join(safe_local_name(p) for p in parts)
+    if clean == SYNC_STATE:
+        raise QuadernoError(f"refusing sync path colliding with {SYNC_STATE}")
+    return clean
+
+
 def _is_record(r: Any) -> TypeGuard[SyncRecord]:
-    return (isinstance(r, dict) and isinstance(r.get("path"), str)
+    if not (isinstance(r, dict) and isinstance(r.get("path"), str)
             and (r.get("rev") is None or isinstance(r.get("rev"), str))
-            and isinstance(r.get("size"), int) and isinstance(r.get("mtime"), int))
+            and not isinstance(r.get("size"), bool) and isinstance(r.get("size"), int)
+            and not isinstance(r.get("mtime"), bool) and isinstance(r.get("mtime"), int)):
+        return False
+    try:
+        _safe_relpath(r["path"])
+    except QuadernoError:
+        return False
+    return True
 
 
 def _load_state(path: str) -> SyncState:
@@ -81,21 +101,35 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
     def save() -> None:
         if dry_run:
             return
-        tmp = state_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f, indent=1, ensure_ascii=False)
-        os.replace(tmp, state_path)
+        fd, tmp = tempfile.mkstemp(prefix=".quaderno-sync.", suffix=".tmp", dir=root)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f, indent=1, ensure_ascii=False)
+            os.replace(tmp, state_path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def local_of(rel: str) -> str:
-        return os.path.join(root, *rel.split("/"))
+        clean = _safe_relpath(rel)
+        candidate = os.path.join(root, *clean.split("/"))
+        real_root = os.path.realpath(root)
+        real_parent = os.path.realpath(os.path.dirname(candidate))
+        if os.path.commonpath([real_root, real_parent]) != real_root:
+            raise QuadernoError(f"refusing path escaping sync root: {rel!r}")
+        return candidate
 
     def pristine(rec: SyncRecord) -> bool:
-        """True if the local copy is exactly what sync last wrote."""
+        """True if the local copy is a regular file exactly as sync last wrote."""
         try:
-            st = os.stat(local_of(rec["path"]))
+            st = os.lstat(local_of(rec["path"]))
         except OSError:
             return False
-        return st.st_size == rec["size"] and int(st.st_mtime) == rec["mtime"]
+        return (stat.S_ISREG(st.st_mode)
+                and st.st_size == rec["size"] and int(st.st_mtime) == rec["mtime"])
 
     def act(kind: str, tag: str, text: str, path: str | None) -> None:
         emit(on_event, kind, f"{prefix_text}{tag:7} {text}", path)
@@ -109,6 +143,10 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
         if not e.path.startswith(prefix):
             continue
         rel = "/".join(safe_local_name(p) for p in e.path[len(prefix):].split("/"))
+        if rel == SYNC_STATE:
+            stats["conflict"] += 1
+            act("clash", "CLASH", f"{rel} (reserved for sync state; skipped)", e.path)
+            continue
         key = nfc(rel).casefold()  # macOS volumes are usually case-insensitive; skipping
                                    # these everywhere keeps a synced tree the same on all systems
         if key in planned:
@@ -128,7 +166,7 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
             if old["path"] == rel:
                 stats["unchanged"] += 1
                 continue
-            if not os.path.exists(target):  # moved/renamed on the device
+            if not os.path.lexists(target):  # moved/renamed on the device
                 act("move", "move", f"{old['path']} -> {rel}", e.path)
                 if not dry_run:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -137,7 +175,7 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
                     save()
                 stats["moved"] += 1
                 continue
-        if os.path.exists(target) and not (old and old["path"] == rel and pristine(old)):
+        if os.path.lexists(target) and not (old and old["path"] == rel and pristine(old)):
             stats["kept"] += 1
             why = "changed locally" if old and old["path"] == rel else "exists locally, not from sync"
             act("keep", "KEEP", f"{rel} ({why}; device version not downloaded)", e.path)
@@ -151,7 +189,7 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
         if old and old["path"] != rel and pristine(old):
             os.remove(local_of(old["path"]))  # moved and changed: drop the stale copy
         entries[e.id] = {"path": rel, "rev": e.revision, "size": size,
-                         "mtime": int(os.stat(target).st_mtime)}
+                         "mtime": int(os.lstat(target).st_mtime)}
         save()
 
     for eid in [k for k in entries if k not in seen]:
@@ -163,9 +201,11 @@ def sync_folder(dev: "Device", local: str, remote: str = ROOT, delete: bool = Fa
         if pristine(rec):
             act("delete", "delete", rec["path"], None)
             if not dry_run:
-                os.remove(local_of(rec["path"]))
-                d = os.path.dirname(local_of(rec["path"]))
-                while d != root and os.path.isdir(d) and not os.listdir(d):
+                p = local_of(rec["path"])
+                os.remove(p)
+                d = os.path.dirname(p)
+                while (d != root and d.startswith(root + os.sep)
+                       and os.path.isdir(d) and not os.path.islink(d) and not os.listdir(d)):
                     os.rmdir(d)
                     d = os.path.dirname(d)
             stats["deleted"] += 1

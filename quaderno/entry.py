@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import ProtocolError
-from .util import ROOT, JsonObject, parse_device_time
+from .util import ROOT, JsonObject, json_str, parse_device_time
 
 log = logging.getLogger("quaderno")
 
@@ -75,12 +75,23 @@ class Entry:
     def from_api(cls, d: JsonObject) -> "Entry":
         """Build from a Web API entry. Dates are kept as the device's text and
         only parsed when used (mtime); see _int_field for size and page count."""
-        return cls(id=d["entry_id"], name=d.get("entry_name", ""),
-                   path=d.get("entry_path", "").rstrip("/"), type=d.get("entry_type", ""),
-                   parent_id=d.get("parent_folder_id"), size=_int_field(d, "file_size"),
-                   pages=_int_field(d, "total_page"), revision=d.get("file_revision"),
-                   modified=d.get("modified_date"), created=d.get("created_date"),
-                   ext_id=d.get("ext_id"), title=d.get("title"), author=d.get("author"),
-                   document_type=d.get("document_type"),
-                   current_page=_int_field(d, "current_page"), file_hash=d.get("file_hash"),
-                   reading_date=d.get("reading_date"), raw=dict(d))
+        def opt_str(key: str) -> str | None:
+            v = d.get(key)
+            if v is None:
+                return None
+            if not isinstance(v, str):
+                raise ProtocolError(f"the device's answer has non-text {key!r}: {v!r}")
+            return v
+
+        eid = json_str(d, "entry_id")
+        name = opt_str("entry_name") or ""
+        path = (opt_str("entry_path") or "").rstrip("/")
+        etype = opt_str("entry_type") or ""
+        return cls(id=eid, name=name, path=path, type=etype,
+                   parent_id=opt_str("parent_folder_id"), size=_int_field(d, "file_size"),
+                   pages=_int_field(d, "total_page"), revision=opt_str("file_revision"),
+                   modified=opt_str("modified_date"), created=opt_str("created_date"),
+                   ext_id=opt_str("ext_id"), title=opt_str("title"), author=opt_str("author"),
+                   document_type=opt_str("document_type"),
+                   current_page=_int_field(d, "current_page"), file_hash=opt_str("file_hash"),
+                   reading_date=opt_str("reading_date"), raw=dict(d))

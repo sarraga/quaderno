@@ -14,6 +14,6 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="04c5", ATTRS{idProduct}=="1656", ENV{ID_MM_D
 # that the NetworkManager profile next to this file matches it, and bring it up:
 # without NetworkManager, that is all the kernel needs to give it the IPv6
 # link-local address quaderno connects from.
-SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="04c5", ATTRS{idProduct}=="1657", NAME="quaderno%n", RUN+="/bin/sh -c 'ip link set dev $name up'"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="04c5", ATTRS{idProduct}=="1657", NAME="quaderno%n", RUN+="/bin/sh -c 'ip link set dev \"$1\" up' _ $name"
 
 LABEL="quaderno_end"

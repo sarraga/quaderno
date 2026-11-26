@@ -24,8 +24,11 @@ def parse_transport(value: str | None) -> Transport:
     raise ConnectError(f"unknown transport {value!r}: expected usb, wifi, or auto")
 
 
-def _try_cached_wifi(cached_addr: str, serial_hint: str | None) -> bool:
+def _try_cached_wifi(cached_addr: str, serial_hint: str | None, *,
+                     pinned_cert: bytes | None = None) -> bool:
     """Fast check whether a cached Wi-Fi IP still points to the same QUADERNO."""
+    if pinned_cert is not None:
+        return mdns.probe_tls_pin(cached_addr, pinned_cert, timeout=1.0)
     if not usb.probe(cached_addr, timeout=1.0):
         return False
     ok, serial = mdns.fetch_serial(cached_addr, timeout=1.5)
@@ -35,10 +38,14 @@ def _try_cached_wifi(cached_addr: str, serial_hint: str | None) -> bool:
 
 
 def _discover_wifi(serial_hint: str | None, *, cached_addr: str | None,
-                   mdns_timeout: float, on_wifi_addr: Callable[[str], None] | None) -> str:
-    if cached_addr and _try_cached_wifi(cached_addr, serial_hint):
+                   mdns_timeout: float, on_wifi_addr: Callable[[str], None] | None,
+                   pinned_cert: bytes | None = None) -> str:
+    if cached_addr and _try_cached_wifi(cached_addr, serial_hint, pinned_cert=pinned_cert):
         return cached_addr
-    addr = mdns.discover(serial_hint, timeout=mdns_timeout)
+    if pinned_cert is not None:
+        addr = mdns.discover(serial_hint, timeout=mdns_timeout, pinned_cert=pinned_cert)
+    else:
+        addr = mdns.discover(serial_hint, timeout=mdns_timeout)
     if on_wifi_addr is not None:
         on_wifi_addr(addr)
     return addr
@@ -47,7 +54,8 @@ def _discover_wifi(serial_hint: str | None, *, cached_addr: str | None,
 def discover(serial_hint: str | None = None, *, transport: Transport = "usb",
              on_switch: usb.SwitchHandler | None = None,
              cached_addr: str | None = None, mdns_timeout: float = 5.0,
-             on_wifi_addr: Callable[[str], None] | None = None) -> str:
+             on_wifi_addr: Callable[[str], None] | None = None,
+             pinned_cert: bytes | None = None) -> str:
     """Find the QUADERNO and return its address.
 
     - `transport="usb"` (default): USB only (macOS `ioreg`, Linux `sysfs`).
@@ -59,16 +67,19 @@ def discover(serial_hint: str | None = None, *, transport: Transport = "usb",
         return usb.discover(serial_hint, on_switch=on_switch)
     if transport == "wifi":
         return _discover_wifi(serial_hint, cached_addr=cached_addr,
-                              mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr)
+                              mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr,
+                              pinned_cert=pinned_cert)
     if not usb.is_supported():
         return _discover_wifi(serial_hint, cached_addr=cached_addr,
-                              mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr)
+                              mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr,
+                              pinned_cert=pinned_cert)
     try:
         return usb.discover(serial_hint, on_switch=on_switch)
     except DeviceNotFoundError as usb_err:
         try:
             return _discover_wifi(serial_hint, cached_addr=cached_addr,
-                                  mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr)
+                                  mdns_timeout=mdns_timeout, on_wifi_addr=on_wifi_addr,
+                                  pinned_cert=pinned_cert)
         except DeviceNotFoundError as wifi_err:
             if "isn't the one these credentials" in str(wifi_err):
                 raise

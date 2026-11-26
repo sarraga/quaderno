@@ -14,6 +14,7 @@ import hmac
 import secrets
 import ssl
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -100,7 +101,11 @@ def wrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
 
 
 def unwrap(data: bytes, auth_key: bytes, kw_key: bytes) -> bytes:
+    if len(data) < 32:
+        raise PairingError("pairing: wrapped message is too short")
     plain = aes_cbc_decrypt(kw_key, data[-16:], data[:-16])
+    if len(plain) < 8:
+        raise PairingError("pairing: unwrapped payload is too short")
     body, tag = plain[:-8], plain[-8:]
     if not hmac.compare_digest(tag, hmac_sha256(auth_key, body)[:8]):
         raise PairingError("pairing: wrapped data failed its integrity check")
@@ -128,10 +133,15 @@ def dh_exchange(peer_public: int) -> tuple[bytes, bytes]:
 # --- certificates ------------------------------------------------------------
 
 def cert_to_der(data: bytes) -> bytes | None:
-    """PEM or DER certificate bytes -> DER, or None if it is not readable."""
+    """PEM or DER X.509 certificate bytes -> DER, or None if not a valid certificate."""
     try:
         if data.startswith(b"-----BEGIN"):
-            return ssl.PEM_cert_to_DER_cert(data.decode("ascii"))
-        return data if data[:1] == b"\x30" else None
+            der = ssl.PEM_cert_to_DER_cert(data.decode("ascii"))
+        elif data[:1] == b"\x30":
+            der = data
+        else:
+            return None
+        x509.load_der_x509_certificate(der)
+        return der
     except (ValueError, UnicodeDecodeError):
         return None

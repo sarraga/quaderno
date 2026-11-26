@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import getpass
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import shlex
 import sys
 import time
 from collections.abc import Callable
+from typing import TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import credentials, discovery, pairing, usb
@@ -16,7 +18,7 @@ from .device import SETTABLE_CONFIGS, Device, connect
 from .entry import Entry
 from .errors import AuthError, ConnectError, PairingError, QuadernoError
 from .events import Event
-from .util import ROOT, JsonObject, human
+from .util import ROOT, JsonObject, human, sanitize_terminal
 
 
 class Args(argparse.Namespace):
@@ -64,6 +66,7 @@ class Args(argparse.Namespace):
     ssid: str             # wifi add/rm
     security: str         # wifi add/rm
     password: str | None  # wifi add; certs add-client
+    password_stdin: bool  # wifi add; certs add-client
     file: str             # replace; templates add; firmware upload; certs
     remote_doc: str       # replace; annotations
     revision: str | None  # replace
@@ -75,9 +78,26 @@ class Args(argparse.Namespace):
 Command = Callable[[Device, Args], "int | None"]
 
 
+def _tty_safe(text: str, stream: TextIO = sys.stdout) -> str:
+    """Escape control/ANSI sequences when writing untrusted strings to a TTY."""
+    return sanitize_terminal(text) if stream.isatty() else text
+
+
+def _read_secret(args: Args, prompt: str, *, required: bool = False) -> str:
+    """Read a password from --password, --password-stdin, or a TTY getpass prompt."""
+    if args.password is not None:
+        return args.password
+    if getattr(args, "password_stdin", False):
+        return sys.stdin.readline().rstrip("\r\n")
+    if required and sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    return ""
+
+
 def show(event: Event) -> None:
     """Print an API event: warnings to stderr, the rest to stdout."""
-    print(event.message, file=sys.stderr if event.warning else sys.stdout)
+    stream = sys.stderr if event.warning else sys.stdout
+    print(_tty_safe(event.message, stream), file=stream)
 
 
 def open_device(args: Args) -> Device:
@@ -110,7 +130,7 @@ def cmd_ls(dev: Device, args: Args) -> None:
     rows, by_pattern = dev.ls(args.path, recursive=args.recursive, regex=args.regex)
     full_path = args.recursive or by_pattern
     for e in rows:
-        print(_row(e, args.long, full_path))
+        print(_tty_safe(_row(e, args.long, full_path)))
 
 
 _SORT_FIELDS = {"name": "entry_name", "title": "title", "author": "author",
@@ -125,7 +145,7 @@ def cmd_search(dev: Device, args: Args) -> None:
     rows = dev.search(args.keyword, target=args.target, entry_type=entry_type,
                       mark=args.mark, order=order, origin_folder=origin)
     for e in rows:
-        print(_row(e, args.long, full_path=True))
+        print(_tty_safe(_row(e, args.long, full_path=True)))
     if not rows:
         print(f"no matches for {args.keyword!r}", file=sys.stderr)
 
@@ -147,7 +167,7 @@ def cmd_viewing(dev: Device, args: Args) -> None:
             if v.get("total_page"):
                 page += f" of {v['total_page']}"
         title = v.get("title")
-        print(path + page + (f"  ({title})" if title else ""))
+        print(_tty_safe(path + page + (f"  ({title})" if title else "")))
 
 
 def cmd_config(dev: Device, args: Args) -> None:
@@ -300,15 +320,18 @@ def cmd_wifi(dev: Device, args: Args) -> None:
         print(f"wifi = {args.action}")
     elif args.action == "scan":
         for ap in dev.wifi_scan():
-            print(f"{ap.get('ssid', '')}\t{ap.get('security', '')}\t"
-                  f"{ap.get('frequency_band', '')}\t{ap.get('rssi_level', '')}\t"
-                  f"{ap.get('state', '')}")
+            line = (f"{ap.get('ssid', '')}\t{ap.get('security', '')}\t"
+                    f"{ap.get('frequency_band', '')}\t{ap.get('rssi_level', '')}\t"
+                    f"{ap.get('state', '')}")
+            print(_tty_safe(line))
     elif args.action == "ls":
         for cfg in dev.wifi_accesspoints():
-            print(f"{cfg.get('ssid', '')}\t{cfg.get('security', '')}")
+            print(_tty_safe(f"{cfg.get('ssid', '')}\t{cfg.get('security', '')}"))
     elif args.action == "add":
-        dev.add_wifi_accesspoint(args.ssid, security=args.security, passwd=args.password or "")
-        print(f"added {args.ssid} ({args.security})")
+        passwd = _read_secret(args, f"Wi-Fi password for {args.ssid}: ",
+                              required=args.security in ("psk", "eap"))
+        dev.add_wifi_accesspoint(args.ssid, security=args.security, passwd=passwd)
+        print(_tty_safe(f"added {args.ssid} ({args.security})"))
     elif args.action == "rm":
         dev.delete_wifi_accesspoint(args.ssid, args.security)
         print(f"deleted {args.ssid} ({args.security})")
@@ -353,9 +376,10 @@ def cmd_certs(dev: Device, args: Args) -> None:
         print(f"installed CA cert {args.name}")
     elif args.action == "add-client":
         assert args.name is not None
+        passwd = _read_secret(args, f"PKCS#12 password for {args.name}: ", required=True)
         with open(args.file, "rb") as fh:
             dev.install_client_certificate(args.name, os.path.basename(args.file), fh.read(),
-                                           password=args.password or "")
+                                           password=passwd)
         print(f"installed client cert {args.name}")
     elif args.action == "clear":
         if not args.yes:
@@ -670,6 +694,8 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("ssid")
     wp.add_argument("--security", choices=["nonsec", "psk", "eap"], default="psk")
     wp.add_argument("--password", default=None)
+    wp.add_argument("--password-stdin", action="store_true",
+                    help="read password from stdin (avoids exposing it in process list)")
     wp = wsub.add_parser("rm", help="delete a saved Wi-Fi access point")
     wp.add_argument("ssid")
     wp.add_argument("security", choices=["nonsec", "psk", "eap"])
@@ -702,6 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("name")
     cp.add_argument("file")
     cp.add_argument("--password", default=None)
+    cp.add_argument("--password-stdin", action="store_true",
+                    help="read password from stdin (avoids exposing it in process list)")
     cp = csub.add_parser("clear", help="remove all installed certificates")
     cp.add_argument("-y", "--yes", action="store_true", help="confirm certificate wipe")
 
@@ -753,18 +781,25 @@ def main(argv: list[str] | None = None) -> int:
             serial: str | None = None
             cred_dir: str | None = None
             cached_addr: str | None = None
+            pinned_cert: bytes | None = None
             try:
                 creds = credentials.load_credentials(
                     credentials.find_credentials_dir(args.config_dir))
-                serial, cred_dir = creds.serial, creds.source
+                serial, cred_dir, pinned_cert = creds.serial, creds.source, creds.pinned_cert
                 cached_addr = credentials.load_wifi_addr(cred_dir)
             except QuadernoError:
                 pass
             transport = discovery.parse_transport(
                 args.transport or os.environ.get("QUADERNO_TRANSPORT"))
             save_cb = (lambda a: credentials.save_wifi_addr(cred_dir, a)) if cred_dir else None
-            print(args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
-                serial, transport=transport, cached_addr=cached_addr, on_wifi_addr=save_cb))
+            if pinned_cert is not None:
+                found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+                    serial, transport=transport, cached_addr=cached_addr,
+                    on_wifi_addr=save_cb, pinned_cert=pinned_cert)
+            else:
+                found_addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+                    serial, transport=transport, cached_addr=cached_addr, on_wifi_addr=save_cb)
+            print(found_addr)
             return 0
         fn = args.fn
         if fn is None:  # every other command sets one

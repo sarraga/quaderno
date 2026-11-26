@@ -3,6 +3,7 @@ directory, else CONFIG_DIR (~/.config/quaderno, or $QUADERNO_CONFIG)."""
 
 import ipaddress
 import os
+import tempfile
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
@@ -63,17 +64,26 @@ def load_credentials(cred_dir: str | None = None) -> Credentials:
 
 def write_private(path: str, data: str | bytes, mode: int = 0o600) -> None:
     """Write atomically, creating the file with `mode` (never world-readable first)."""
-    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "wb" if isinstance(data, bytes) else "w") as f:
-        f.write(data)
-    os.replace(path + ".tmp", path)
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb" if isinstance(data, bytes) else "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 WIFI_ADDR_FILE = "wifi_addr.dat"
 
 
 def is_wifi_addr(addr: str) -> bool:
-    """True for an IPv4 or non-link-local IPv6 address suitable to cache for Wi-Fi."""
+    """True for a routable/LAN IPv4 or non-link-local IPv6 address suitable for Wi-Fi."""
     bare = addr.strip("[]")
     if "%" in bare:
         return False
@@ -81,7 +91,9 @@ def is_wifi_addr(addr: str) -> bool:
         ip = ipaddress.ip_address(bare)
     except ValueError:
         return False
-    return not (ip.version == 6 and ip.is_link_local)
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_reserved or ip.is_link_local:
+        return False
+    return True
 
 
 def load_wifi_addr(cred_dir: str) -> str | None:
@@ -105,11 +117,23 @@ def save_wifi_addr(cred_dir: str, addr: str) -> None:
         pass
 
 
+def clear_wifi_addr(cred_dir: str) -> None:
+    """Remove any cached Wi-Fi address in `cred_dir` (best-effort)."""
+    try:
+        os.remove(os.path.join(cred_dir, WIFI_ADDR_FILE))
+    except OSError:
+        pass
+
+
 def save_pairing(cred_dir: str, client_id: str, private_pem: str, public_pem: str, cert: bytes,
                  serial: str | None) -> bool:
     """Store a new pairing. Returns True if the device certificate was stored for
     TLS pinning (False if the device sent something unreadable)."""
     os.makedirs(cred_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(cred_dir, 0o700)
+    except OSError:
+        pass
     write_private(os.path.join(cred_dir, "privatekey.dat"), private_pem)
     write_private(os.path.join(cred_dir, "publickey.dat"), public_pem, 0o644)
     cert_path = os.path.join(cred_dir, "devicecert.bin")

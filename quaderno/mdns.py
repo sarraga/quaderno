@@ -13,6 +13,7 @@ import json
 import re
 import select
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -29,6 +30,13 @@ MDNS_ADDR_V4 = "224.0.0.251"
 MDNS_PORT = 5353
 RESEND_INTERVAL = 0.5
 PLATFORM = sys.platform
+
+# Defensive limits against hostile or flooded LAN mDNS traffic
+MAX_DNS_NAME_LEN = 255
+MAX_RECORDS_PER_PACKET = 128
+MAX_INFO_BYTES = 65536
+MAX_PROBES = 16
+MAX_PACKETS_PER_TICK = 64
 
 TYPE_A = 1
 TYPE_PTR = 12
@@ -83,12 +91,15 @@ def build_query(name: str, qtype: int, *, unicast: bool = True) -> bytes:
     return header + encode_name(name) + struct.pack("!HH", qtype, qclass)
 
 
-def read_name(packet: bytes, offset: int, _depth: int = 0) -> tuple[str, int]:
+def read_name(packet: bytes, offset: int, _depth: int = 0,
+              _visited: set[int] | None = None) -> tuple[str, int]:
     """Decode a (possibly compressed) DNS name at `offset`.
     Returns `(dotted_name, offset_after_name_in_stream)`."""
     if _depth > 16:
         raise ValueError("DNS compression pointer loop")
+    visited = set() if _visited is None else _visited
     labels: list[str] = []
+    total_len = 0
     pos = offset
     jumped = False
     end_pos = offset
@@ -96,6 +107,9 @@ def read_name(packet: bytes, offset: int, _depth: int = 0) -> tuple[str, int]:
     while True:
         if pos >= size:
             raise ValueError("truncated DNS name")
+        if pos in visited:
+            raise ValueError("DNS compression pointer loop")
+        visited.add(pos)
         length = packet[pos]
         if length == 0:
             if not jumped:
@@ -105,13 +119,17 @@ def read_name(packet: bytes, offset: int, _depth: int = 0) -> tuple[str, int]:
             if pos + 1 >= size:
                 raise ValueError("truncated DNS pointer")
             ptr = ((length & 0x3F) << 8) | packet[pos + 1]
-            if ptr >= size:
-                raise ValueError("out-of-range DNS pointer")
+            if ptr >= size or ptr in visited:
+                raise ValueError("DNS compression pointer loop" if ptr in visited
+                                 else "out-of-range DNS pointer")
             if not jumped:
                 end_pos = pos + 2
                 jumped = True
-            rest, _ = read_name(packet, ptr, _depth + 1)
+            rest, _ = read_name(packet, ptr, _depth + 1, visited)
             if rest:
+                total_len += len(rest) + (1 if labels else 0)
+                if total_len > MAX_DNS_NAME_LEN:
+                    raise ValueError("DNS name too long")
                 labels.append(rest)
             break
         if length & 0xC0:
@@ -119,13 +137,16 @@ def read_name(packet: bytes, offset: int, _depth: int = 0) -> tuple[str, int]:
         pos += 1
         if pos + length > size:
             raise ValueError("truncated DNS label")
+        total_len += length + (1 if labels else 0)
+        if total_len > MAX_DNS_NAME_LEN:
+            raise ValueError("DNS name too long")
         labels.append(packet[pos:pos + length].decode("utf-8", errors="replace"))
         pos += length
     return ".".join(labels), end_pos
 
 
 def parse_records(packet: bytes) -> list[DnsRecord]:
-    """Parse all Answer, Authority, and Additional records from an mDNS response.
+    """Parse Answer, Authority, and Additional records from an mDNS response.
     Returns an empty list for queries or malformed packets."""
     if len(packet) < 12:
         return []
@@ -134,13 +155,16 @@ def parse_records(packet: bytes) -> list[DnsRecord]:
         return []
     offset = 12
     try:
-        for _ in range(qdcount):
+        for _ in range(min(qdcount, MAX_RECORDS_PER_PACKET)):
             _, offset = read_name(packet, offset)
             offset += 4
             if offset > len(packet):
                 return []
+        if qdcount > MAX_RECORDS_PER_PACKET:
+            return []
         records: list[DnsRecord] = []
-        for _ in range(ancount + nscount + arcount):
+        total_rrs = min(ancount + nscount + arcount, MAX_RECORDS_PER_PACKET)
+        for _ in range(total_rrs):
             name, offset = read_name(packet, offset)
             if offset + 10 > len(packet):
                 break
@@ -172,18 +196,40 @@ def parse_records(packet: bytes) -> list[DnsRecord]:
 # --- device info check --------------------------------------------------------------
 
 def _usable_wifi_addr(addr: str) -> bool:
-    """True for IPv4 or non-link-local IPv6 addresses reachable without a zone scope."""
+    """True for a routable/LAN IPv4 or non-link-local IPv6 address.
+    Rejects loopback, multicast, unspecified, reserved, and link-local ranges so a
+    rogue LAN mDNS responder cannot steer pre-auth HTTP probes to localhost/metadata."""
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
-    return not (ip.version == 6 and ip.is_link_local)
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_reserved or ip.is_link_local:
+        return False
+    return True
 
 
 def _rank_addrs(addrs: Sequence[str]) -> list[str]:
-    """Prefer IPv4 over IPv6 on Wi-Fi and drop un-scoped IPv6 link-local addresses."""
+    """Prefer IPv4 over IPv6 on Wi-Fi and drop unusable/link-local addresses."""
     usable = [a for a in addrs if _usable_wifi_addr(a)]
     return sorted(dict.fromkeys(usable), key=lambda a: (1 if ":" in a else 0))
+
+
+def probe_tls_pin(addr: str, pinned_cert: bytes, timeout: float = 2.0) -> bool:
+    """True if `addr`:8443 completes TLS and presents exactly `pinned_cert`."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    try:
+        with socket.create_connection((addr.strip("[]"), HTTPS_PORT), timeout=timeout) as raw_sock:
+            with ctx.wrap_socket(raw_sock) as tls_sock:
+                return tls_sock.getpeercert(binary_form=True) == pinned_cert
+    except OSError:
+        return False
 
 
 def fetch_serial(addr: str, port: int = REG_PORT, timeout: float = 1.5) -> tuple[bool, str | None]:
@@ -194,12 +240,12 @@ def fetch_serial(addr: str, port: int = REG_PORT, timeout: float = 1.5) -> tuple
         conn.request("GET", "/register/information",
                      headers={"Host": f"digitalpaper.local:{port}", "Accept": "application/json"})
         resp = conn.getresponse()
-        raw = resp.read()
+        raw = resp.read(MAX_INFO_BYTES + 1)
     except OSError:
         return False, None
     finally:
         conn.close()
-    if resp.status != 200 or not raw:
+    if resp.status != 200 or not raw or len(raw) > MAX_INFO_BYTES:
         return False, None
     try:
         data = json.loads(raw)
@@ -367,7 +413,8 @@ def _record_device(found: list[WifiDevice], found_by_key: dict[str, int],
 
 
 def _browse_bonjour(services: Sequence[str], *, timeout: float,
-                    want_serial: str | None) -> list[WifiDevice]:
+                    want_serial: str | None,
+                    pinned_cert: bytes | None = None) -> list[WifiDevice]:
     """Query macOS's native mDNSResponder daemon via libSystem's DNS-SD C API.
 
     On macOS, mDNSResponder listens continuously and caches the QUADERNO's
@@ -424,20 +471,20 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
     deadline = time.time() + timeout
     instances: list[tuple[int, str, str, str]] = []
     seen_insts: set[tuple[int, str, str, str]] = set()
-    more_coming = True
+    more_by_ref: dict[int, bool] = {}
 
-    def on_browse(_sd: object, flags: int, ifidx: int, err: int,
+    def on_browse(sd: int | None, flags: int, ifidx: int, err: int,
                   name: bytes | None, regtype: bytes | None, domain: bytes | None,
                   _ctx: object) -> None:
-        nonlocal more_coming
         if err == 0 and (flags & _DNSSD_FLAGS_ADD) and name and regtype and domain:
             item = (ifidx, name.decode("utf-8", errors="replace"),
                     regtype.decode("utf-8", errors="replace"),
                     domain.decode("utf-8", errors="replace"))
-            if item not in seen_insts:
+            if item not in seen_insts and len(instances) < MAX_PROBES:
                 seen_insts.add(item)
                 instances.append(item)
-        more_coming = bool(flags & _DNSSD_FLAGS_MORE_COMING)
+        if sd is not None:
+            more_by_ref[sd] = bool(flags & _DNSSD_FLAGS_MORE_COMING)
 
     cb_browse = browse_cb_t(on_browse)
     brefs: list[ctypes.c_void_p] = []
@@ -450,11 +497,18 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
                 domain.encode("utf-8"), cb_browse, None)
             if err == 0 and ref.value:
                 brefs.append(ref)
+                more_by_ref[ref.value] = True
         if not brefs:
             return []
-        fd_map = {int(lib.DNSServiceRefSockFD(r)): r for r in brefs}
+        fd_map: dict[int, ctypes.c_void_p] = {}
+        for r in brefs:
+            fd = int(lib.DNSServiceRefSockFD(r))
+            if fd >= 0:
+                fd_map[fd] = r
+        if not fd_map:
+            return []
         browse_end = min(deadline, time.time() + min(timeout, 1.5))
-        while time.time() < browse_end:
+        while fd_map and time.time() < browse_end:
             wait = min(0.2, max(0.0, browse_end - time.time()))
             try:
                 ready, _, _ = select.select(list(fd_map), [], [], wait)
@@ -462,8 +516,10 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
                 break
             for fd in ready:
                 if lib.DNSServiceProcessResult(fd_map[fd]) != 0:
-                    fd_map.pop(fd, None)
-            if instances and not more_coming:
+                    dead = fd_map.pop(fd)
+                    if dead.value:
+                        more_by_ref.pop(dead.value, None)
+            if instances and not any(more_by_ref.values()):
                 break
     finally:
         for ref in brefs:
@@ -477,7 +533,7 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
     checked: set[tuple[str, int]] = set()
 
     for ifidx, name, regtype, domain in instances:
-        if time.time() >= deadline:
+        if time.time() >= deadline or len(checked) >= MAX_PROBES:
             break
         resolved: list[tuple[str, int]] = []
 
@@ -498,7 +554,7 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
         try:
             rfd = int(lib.DNSServiceRefSockFD(rref))
             res_end = min(deadline, time.time() + 1.0)
-            while time.time() < res_end and not resolved:
+            while rfd >= 0 and time.time() < res_end and not resolved:
                 wait = min(0.2, max(0.0, res_end - time.time()))
                 ready, _, _ = select.select([rfd], [], [], wait)
                 if ready and lib.DNSServiceProcessResult(rref) != 0:
@@ -511,6 +567,8 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
         if not resolved:
             continue
         host, port = resolved[0]
+        if port != REG_PORT:
+            continue
         raw_ips: list[str] = []
         addr_more = True
 
@@ -521,7 +579,7 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
             if err == 0 and (flags & _DNSSD_FLAGS_ADD) and sa_ptr:
                 hdr = ctypes.string_at(sa_ptr, 2)
                 sa_len = hdr[0]
-                if sa_len >= 8:
+                if 8 <= sa_len <= 128:
                     ip = _sockaddr_to_ip(ctypes.string_at(sa_ptr, sa_len))
                     if ip:
                         raw_ips.append(ip)
@@ -536,7 +594,7 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
             try:
                 afd = int(lib.DNSServiceRefSockFD(aref))
                 addr_end = min(deadline, time.time() + 1.0)
-                while time.time() < addr_end:
+                while afd >= 0 and time.time() < addr_end:
                     wait = min(0.2, max(0.0, addr_end - time.time()))
                     ready, _, _ = select.select([afd], [], [], wait)
                     if ready and lib.DNSServiceProcessResult(aref) != 0:
@@ -551,12 +609,16 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
         inst_name = f"{name}.{regtype}{domain}".rstrip(".")
         inst_key = _norm_dns(inst_name)
         for ip in _rank_addrs(raw_ips):
+            if time.time() >= deadline or len(checked) >= MAX_PROBES:
+                break
             ep = (ip, port)
             if ep in checked:
                 continue
             checked.add(ep)
             ok, serial = fetch_serial(ip, port)
             if not ok:
+                continue
+            if pinned_cert is not None and not probe_tls_pin(ip, pinned_cert, timeout=1.5):
                 continue
             _record_device(found, found_by_key, inst_key,
                            WifiDevice(ip, port, serial, inst_name, host))
@@ -567,15 +629,20 @@ def _browse_bonjour(services: Sequence[str], *, timeout: float,
 
 
 def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
-           want_serial: str | None = None) -> list[WifiDevice]:
+           want_serial: str | None = None,
+           pinned_cert: bytes | None = None) -> list[WifiDevice]:
     """Browse mDNS for QUADERNO services and return verified WifiDevices.
     Exits early as soon as `want_serial` is matched (or shortly after the first
     device answers when `want_serial` is None)."""
     start = time.time()
     deadline = start + timeout
     if PLATFORM == "darwin":
-        bonjour_devs = _browse_bonjour(services, timeout=min(timeout, 2.0),
-                                       want_serial=want_serial)
+        if pinned_cert is not None:
+            bonjour_devs = _browse_bonjour(services, timeout=min(timeout, 2.0),
+                                           want_serial=want_serial, pinned_cert=pinned_cert)
+        else:
+            bonjour_devs = _browse_bonjour(services, timeout=min(timeout, 2.0),
+                                           want_serial=want_serial)
         if bonjour_devs and (want_serial is None
                              or any(d.serial == want_serial for d in bonjour_devs)):
             return bonjour_devs
@@ -625,25 +692,32 @@ def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
                 continue
             rname = _norm_dns(rec.name)
             if rec.rtype == TYPE_PTR and isinstance(rec.value, str) and rname in wanted:
-                instances.setdefault(_norm_dns(rec.value), rec.value)
+                if len(instances) < MAX_PROBES:
+                    instances.setdefault(_norm_dns(rec.value), rec.value)
             elif rec.rtype == TYPE_SRV and isinstance(rec.value, tuple):
                 port, target = rec.value
-                srvs[rname] = (target, port)
+                if len(srvs) < MAX_PROBES * 2 or rname in srvs:
+                    srvs[rname] = (target, port)
             elif rec.rtype in (TYPE_A, TYPE_AAAA) and isinstance(rec.value, str):
-                bucket = addrs.setdefault(rname, [])
-                if rec.value not in bucket:
-                    bucket.append(rec.value)
+                if len(addrs) < MAX_PROBES * 2 or rname in addrs:
+                    bucket = addrs.setdefault(rname, [])
+                    if rec.value not in bucket and len(bucket) < MAX_PROBES:
+                        bucket.append(rec.value)
 
     def resolve_ready() -> bool:
         """Issue follow-up queries and verify newly resolved endpoints.
         Returns True if `want_serial` was matched and we can stop immediately."""
         for inst_key, inst_name in list(instances.items()):
+            if time.time() >= deadline or len(checked) >= MAX_PROBES:
+                break
             if inst_key not in srvs:
                 if inst_key not in queried_srv:
                     queried_srv.add(inst_key)
                     send_query(inst_name, TYPE_SRV)
                 continue
             host, port = srvs[inst_key]
+            if port != REG_PORT:
+                continue
             host_key = _norm_dns(host)
             candidates = _rank_addrs(addrs.get(host_key, ()))
             if not candidates:
@@ -656,12 +730,16 @@ def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
             if inst_idx is not None and ":" not in found[inst_idx].addr:
                 continue
             for ip in candidates:
+                if time.time() >= deadline or len(checked) >= MAX_PROBES:
+                    break
                 ep = (ip, port)
                 if ep in checked:
                     continue
                 checked.add(ep)
                 ok, serial = fetch_serial(ip, port)
                 if not ok:
+                    continue
+                if pinned_cert is not None and not probe_tls_pin(ip, pinned_cert, timeout=1.5):
                     continue
                 _record_device(found, found_by_key, inst_key,
                                WifiDevice(ip, port, serial, inst_name, host))
@@ -690,7 +768,9 @@ def browse(services: Sequence[str] = (SERVICE,), *, timeout: float = 5.0,
             except (OSError, ValueError):
                 break
             for sock in ready:
-                while True:
+                for _ in range(MAX_PACKETS_PER_TICK):
+                    if time.time() >= deadline:
+                        break
                     try:
                         packet, _src = sock.recvfrom(9000)
                     except BlockingIOError:
@@ -726,18 +806,25 @@ def _choose(devs: Sequence[WifiDevice], serial_hint: str | None) -> WifiDevice:
 
 
 def discover(serial_hint: str | None = None, *, timeout: float = 5.0,
-             services: Sequence[str] = (SERVICE,)) -> str:
+             services: Sequence[str] = (SERVICE,),
+             pinned_cert: bytes | None = None) -> str:
     """Find a QUADERNO on Wi-Fi via mDNS and return its IP address.
 
     Raises DeviceNotFoundError if none (or not the paired one) answers mDNS, or
     DeviceUnreachableError if the device answered mDNS but HTTPS port 8443 refuses."""
-    devs = browse(services=services, timeout=timeout, want_serial=serial_hint)
+    if pinned_cert is not None:
+        devs = browse(services=services, timeout=timeout, want_serial=serial_hint,
+                      pinned_cert=pinned_cert)
+    else:
+        devs = browse(services=services, timeout=timeout, want_serial=serial_hint)
     if not devs:
         raise DeviceNotFoundError(
             "no QUADERNO found on Wi-Fi via mDNS: make sure the tablet is awake, on the "
             "same Wi-Fi network, and advertising mDNS (or pass --addr)")
     dev = _choose(devs, serial_hint)
-    if not probe(dev.addr, timeout=2.0):
+    reachable = (probe_tls_pin(dev.addr, pinned_cert, timeout=2.0)
+                 if pinned_cert is not None else probe(dev.addr, timeout=2.0))
+    if not reachable:
         raise DeviceUnreachableError(
             f"found QUADERNO ({dev.serial or dev.host}) on Wi-Fi at {dev.addr}, but it "
             f"doesn't answer on port {HTTPS_PORT}: wake or unlock it")
