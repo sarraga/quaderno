@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import cast
 from urllib.parse import quote, urlencode
 
-from . import credentials, pairing, usb
+from . import credentials, discovery, pairing, usb
 from .client import Client
 from .credentials import Credentials
 from .entry import Entry
@@ -74,9 +74,12 @@ class PutResult:
 
 
 def connect(addr: str | None = None, config_dir: str | None = None, timeout: float = 60,
-            on_switch: usb.SwitchHandler | None = None) -> "Device":
+            on_switch: usb.SwitchHandler | None = None,
+            transport: discovery.Transport | None = None) -> "Device":
     """Find the device (or use `addr`), log in, and return a Device. Credentials
     come from `config_dir`, else $QUADERNO_CONFIG, else ~/.config/quaderno.
+    `transport` selects `'usb'` (default), `'wifi'` (opt-in Wi-Fi mDNS), or
+    `'auto'` (USB first, then Wi-Fi; also configurable via $QUADERNO_TRANSPORT).
     If pairing didn't store the device's certificate (it sent one that couldn't
     be read), TLS is not verified, and every call warns about it."""
     creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
@@ -84,7 +87,14 @@ def connect(addr: str | None = None, config_dir: str | None = None, timeout: flo
         log.warning("warning: the device's TLS certificate is not checked: the credentials in "
                     "%s include none; run `quaderno pair --force` to pair again and save it",
                     creds.source)
-    addr = addr or os.environ.get("QUADERNO_ADDR") or usb.discover(creds.serial, on_switch=on_switch)
+    if not addr:
+        addr = os.environ.get("QUADERNO_ADDR") or discovery.discover(
+            creds.serial,
+            transport=discovery.parse_transport(transport or os.environ.get("QUADERNO_TRANSPORT")),
+            on_switch=on_switch,
+            cached_addr=credentials.load_wifi_addr(creds.source),
+            on_wifi_addr=lambda a: credentials.save_wifi_addr(creds.source, a),
+        )
     dev = Device(addr, creds.client_id, creds.key, timeout=timeout, pinned_cert=creds.pinned_cert)
     dev.credentials = creds
     dev.authenticate()

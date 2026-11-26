@@ -1,6 +1,7 @@
 """Where pairing credentials live, and loading/saving them: an explicit
 directory, else CONFIG_DIR (~/.config/quaderno, or $QUADERNO_CONFIG)."""
 
+import ipaddress
 import os
 from dataclasses import dataclass
 
@@ -66,6 +67,42 @@ def write_private(path: str, data: str | bytes, mode: int = 0o600) -> None:
     with os.fdopen(fd, "wb" if isinstance(data, bytes) else "w") as f:
         f.write(data)
     os.replace(path + ".tmp", path)
+
+
+WIFI_ADDR_FILE = "wifi_addr.dat"
+
+
+def is_wifi_addr(addr: str) -> bool:
+    """True for an IPv4 or non-link-local IPv6 address suitable to cache for Wi-Fi."""
+    bare = addr.strip("[]")
+    if "%" in bare:
+        return False
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        return False
+    return not (ip.version == 6 and ip.is_link_local)
+
+
+def load_wifi_addr(cred_dir: str) -> str | None:
+    """Return the last Wi-Fi address cached in `cred_dir`, or None."""
+    path = os.path.join(cred_dir, WIFI_ADDR_FILE)
+    try:
+        with open(path) as f:
+            addr = f.read().strip()
+    except OSError:
+        return None
+    return addr if is_wifi_addr(addr) else None
+
+
+def save_wifi_addr(cred_dir: str, addr: str) -> None:
+    """Cache `addr` in `cred_dir` for fast Wi-Fi reconnects (best-effort)."""
+    if not is_wifi_addr(addr) or not os.path.isdir(cred_dir):
+        return
+    try:
+        write_private(os.path.join(cred_dir, WIFI_ADDR_FILE), addr.strip("[]") + "\n", 0o644)
+    except OSError:
+        pass
 
 
 def save_pairing(cred_dir: str, client_id: str, private_pem: str, public_pem: str, cert: bytes,

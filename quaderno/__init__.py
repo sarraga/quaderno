@@ -12,8 +12,9 @@ Pair first with `quaderno pair` (or quaderno.pair(read_pin)). See device.Device
 for all operations and errors.py for the exception hierarchy.
 """
 
-from . import models
+from . import mdns, models
 from .device import Device, PutResult, connect
+from .discovery import Transport, discover
 from .entry import Entry
 from .errors import (AuthError, CertificateError, ConnectError, DeviceNotFoundError,
                      DeviceUnreachableError, ExistsError, LockedError, LoginError, NotEmptyError,
@@ -30,7 +31,8 @@ from .models import (BatteryStatus, CertificateInfo, CommonValue, ConfigsV1, Con
 from .pairing import PairResult, pair
 
 __version__ = "0.5.0"
-__all__ = ["connect", "pair", "Device", "Entry", "Event", "PutResult", "PairResult", "models",
+__all__ = ["connect", "discover", "pair", "Device", "Entry", "Event", "PutResult", "PairResult",
+           "Transport", "mdns", "models",
            "BatteryStatus", "CertificateInfo", "CommonValue", "ConfigsV1", "ConfigsV2",
            "ConfigsV3", "CurrentViewing", "DeviceInformation", "DialogParameters",
            "DocumentAttribute", "DocumentProcessStatus", "DocumentsViewInfo", "FileUploadResult",

@@ -206,6 +206,7 @@ quaderno linux-setup                    print the one-time Linux setup script (s
 
 Global options:
 - `--addr ADDR` (or `$QUADERNO_ADDR`) skips discovery.
+- `--wifi` opts in to Wi-Fi mDNS discovery instead of USB (`--usb` overrides `$QUADERNO_TRANSPORT`; set `$QUADERNO_TRANSPORT=wifi` to default to Wi-Fi, or `auto` for USB-then-Wi-Fi fallback).
 - `--config DIR` (or `$QUADERNO_CONFIG`) keeps the credentials in another directory, for every command including `pair`.
 - `-v` prints which credentials, address and TLS mode are in use.
 
@@ -456,6 +457,7 @@ RSA key generation, signing, key files and AES come from the `cryptography` pack
 | `tests/test_patterns.py` | globs/regex in ls, get, mv, rm, open; rm confirmation |
 | `tests/test_pair.py` | crypto wiring vs `/usr/bin/openssl`; pairing vs a simulated device |
 | `tests/test_errors.py` | discovery states (stuck serial mode...), reading `ioreg` and a simulated Linux sysfs, `linux-setup`, HTTP/connection errors, malformed answers, local file errors, Tab completion options, exit codes |
+| `tests/test_mdns.py` | pure-stdlib DNS-SD/mDNS packet encoding/decoding, serial matching, cached Wi-Fi IP probe, USB → Wi-Fi fallback, CLI `--usb`/`--wifi` |
 | `tests/test_types.py` | `mypy --strict` over the package and the tests (skipped if mypy isn't installed) |
 
 None of them needs the device: `tests/fakedevice.py` is a `quaderno.Device` with only the HTTP layer replaced, so the tests run the real API and CLI code. Two manual checks do need it, and pytest doesn't collect them:
@@ -476,8 +478,10 @@ quaderno/
   client.py       HTTPS transport (kept-alive, certificate pinning, auto re-auth) and binary transfer
   pairing.py      PIN pairing protocol
   crypto.py       RSA/AES via `cryptography`, HMAC, Diffie-Hellman, PEM/DER
-  credentials.py  where credentials live; loading and saving them
+  credentials.py  where credentials live; loading and saving them (including cached Wi-Fi IP)
   usb.py          finding the device on USB (`ioreg -a` on macOS, sysfs on Linux), USB mode switch, address
+  mdns.py         finding the device on Wi-Fi via stdlib mDNS (`_dp_fujitsu._tcp.local`)
+  discovery.py    unified discovery across USB and Wi-Fi (with cached Wi-Fi fast path)
   entry.py        Entry: a document or folder
   events.py       Event: progress reports from API operations
   errors.py       the exception hierarchy
@@ -492,7 +496,19 @@ tests/                  offline tests (fake device) and manual device checks
 
 ## Wi-Fi
 
-If the device is on Wi-Fi, pass its address explicitly with `--addr 192.168.x.y`. This is untested here. dpt-rp1-py finds Fujitsu units on Wi-Fi by browsing the mDNS service `_dp_fujitsu._tcp`.
+By default `quaderno` connects over USB only. Pass `--wifi` to discover the device over Wi-Fi automatically via mDNS (`_dp_fujitsu._tcp.local`, pure Python stdlib — no extra dependencies):
+
+```
+quaderno --wifi info
+quaderno --wifi ls
+quaderno --wifi addr
+```
+
+- **Fast reconnects:** `--wifi` tries the last known Wi-Fi IP cached in `wifi_addr.dat` (verified via `/register/information`) before falling back to an mDNS browse matching `serial.dat`.
+- **Environment override:** set `$QUADERNO_TRANSPORT=wifi` to use Wi-Fi by default (override with `--usb`), or `$QUADERNO_TRANSPORT=auto` to try USB first and fall back to Wi-Fi. Passing `--addr 192.168.x.y` (or `$QUADERNO_ADDR`) skips discovery altogether.
+- **Security:** the same TLS certificate pinning (`devicecert.bin`) applies over Wi-Fi, so a stale DHCP address or rogue host on the LAN is rejected before credentials are sent.
+- **Tab completion:** `quaderno --wifi ...` completion only probes the cached Wi-Fi IP (short timeout) — it never blocks on a multi-second mDNS browse.
+- **Standby note:** depending on `wifi_sleep_policy` (`quaderno config wifi_sleep_policy`), the tablet may stop advertising mDNS after sitting idle; waking it or caching its IP helps.
 
 ## If you also use the official QUADERNO app
 
@@ -504,7 +520,7 @@ If the device is on Wi-Fi, pass its address explicitly with `--addr 192.168.x.y`
 
 ## Alternative: dpt-rp1-py
 
-[dpt-rp1-py](https://github.com/janten/dpt-rp1-py) implements the same API and adds sync, Wi-Fi configuration and note templates. It requires `pycryptodome` (native code) and other packages, and it can't find the device over USB by itself. It should be able to use the same credentials, but the following command has not been tested here:
+[dpt-rp1-py](https://github.com/janten/dpt-rp1-py) implements the same Sony/Fujitsu Web API and supports Sony DPT-RP1/CP1, Readmoo mooInk Pro 2, and Windows, adding bidirectional `sync`, a FUSE filesystem mounter (`dptmount`), and a macOS PDF print service. It requires `pycryptodome`, `zeroconf`, and other packages, and uses a separate Linux-only helper (`dptusb`) for USB switching. It can share the same credentials:
 
 ```
 dptrp1 --client-id ~/.config/quaderno/deviceid.dat --key ~/.config/quaderno/privatekey.dat --addr "[$(quaderno addr)]" list-documents

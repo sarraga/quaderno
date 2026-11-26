@@ -10,9 +10,10 @@ _quaderno_device_paths() {
   [[ $typed == *[\*\?\[]* ]] && return 1        # a glob pattern: nothing to complete
   local -a lines dirs docs ddisp fdisp expl flag
   [[ $kind == dirs ]] && flag=(--dirs)
-  # --config and --addr from the command line (captured in _quaderno) apply here too
+  # --config, --addr, --usb and --wifi from the command line apply here too
   [[ -n $_quaderno_config ]] && flag+=(--config "$_quaderno_config")
   [[ -n $_quaderno_addr ]] && flag+=(--addr "$_quaderno_addr")
+  [[ -n $_quaderno_transport ]] && flag+=("$_quaderno_transport")
   lines=("${(@f)$(quaderno __complete $flag -- "$typed" 2>/dev/null)}")
   local l
   for l in $lines; do
@@ -77,12 +78,17 @@ _quaderno() {
   _arguments -C \
     '(- *)'{-h,--help}'[show help]' \
     '--addr=[device address]:address' \
+    '(--usb --wifi)--wifi[discover over Wi-Fi via mDNS]' \
+    '(--usb --wifi)--usb[connect over USB (default)]' \
     '--config=[credentials directory]:directory:_files -/' \
     '(-v --verbose)'{-v,--verbose}'[print credentials, address, TLS mode]' \
     '1:command:->cmd' \
     '*::argument:->args' && ret=0
   # The global options, before the subcommand's own _arguments call replaces opt_args.
   local _quaderno_config=${(Q)opt_args[--config]} _quaderno_addr=${(Q)opt_args[--addr]}
+  local _quaderno_transport=''
+  (( $+opt_args[--usb] )) && _quaderno_transport='--usb'
+  (( $+opt_args[--wifi] )) && _quaderno_transport='--wifi'
 
   case $state in
     cmd) _describe -t commands 'quaderno command' cmds && ret=0 ;;

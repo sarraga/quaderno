@@ -87,6 +87,11 @@ def _network(node: RegistryNode) -> tuple[str | None, bool | None]:
     return _str(ctrl, "BSD Name") or _str(node, "BSD Name"), link
 
 
+def is_supported() -> bool:
+    """Whether USB auto-discovery is supported on this platform."""
+    return PLATFORM == "darwin" or PLATFORM.startswith("linux")
+
+
 def usb_devices() -> list[UsbDevice]:
     """QUADERNO devices attached over USB: from the I/O Registry on macOS, from
     sysfs on Linux. Raises ConnectError if the list can't be read, so that the

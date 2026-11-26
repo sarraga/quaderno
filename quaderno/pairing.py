@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import credentials, crypto, usb
+from . import credentials, crypto, discovery, usb
 from .client import Client
 from .errors import (DeviceUnreachableError, PairingError, ProtocolError, QuadernoError,
                      WrongPinError)
@@ -136,7 +136,8 @@ class PairResult:
 
 
 def pair(read_pin: Callable[[], str], addr: str | None = None, force: bool = False,
-         cred_dir: str | None = None, on_event: EventHandler | None = None) -> PairResult:
+         cred_dir: str | None = None, on_event: EventHandler | None = None,
+         transport: discovery.Transport | None = None) -> PairResult:
     """Pair with the device (it shows a PIN; `read_pin()` must return it) and store
     new credentials in `cred_dir` (default ~/.config/quaderno). Refuses to replace
     an existing pairing unless `force`."""
@@ -144,12 +145,18 @@ def pair(read_pin: Callable[[], str], addr: str | None = None, force: bool = Fal
     if credentials.is_paired(cred_dir) and not force:
         raise PairingError(f"already paired (credentials in {cred_dir}); "
                             "use --force to pair again and replace them")
-    addr = addr or os.environ.get("QUADERNO_ADDR") or usb.discover()
+    if not addr:
+        addr = os.environ.get("QUADERNO_ADDR") or discovery.discover(
+            transport=discovery.parse_transport(transport or os.environ.get("QUADERNO_TRANSPORT")),
+        )
     status, info = reg_request(addr, "GET", "/register/information")
     found = info.get("serial_number") if status == 200 and isinstance(info, dict) else None
     serial = found if isinstance(found, str) else None
-    if not serial:
-        serial = next((d.serial for d in usb.usb_devices() if d.serial), None)
+    if not serial and usb.is_supported():
+        try:
+            serial = next((d.serial for d in usb.usb_devices() if d.serial), None)
+        except QuadernoError:
+            pass
     emit(on_event, "device", f"device {serial or '?'} at {addr}")
     emit(on_event, "keygen", "generating 2048-bit RSA key ...")
     private_pem, public_pem = crypto.generate_keypair()
@@ -163,6 +170,7 @@ def pair(read_pin: Callable[[], str], addr: str | None = None, force: bool = Fal
         except (QuadernoError, OSError):
             pass  # keep the error that got us here, if any
     pinned = credentials.save_pairing(cred_dir, client_id, private_pem, public_pem, cert, serial)
+    credentials.save_wifi_addr(cred_dir, addr)
     if not pinned:
         emit(on_event, "warning", "warning: device sent an unreadable certificate; "
                                   "TLS will not be pinned", warning=True)

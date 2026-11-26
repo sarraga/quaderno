@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import credentials, pairing, usb
+from . import credentials, discovery, pairing, usb
 from .device import SETTABLE_CONFIGS, Device, connect
 from .entry import Entry
 from .errors import AuthError, ConnectError, PairingError, QuadernoError
@@ -25,6 +25,7 @@ class Args(argparse.Namespace):
     fn: "Command | None"
     addr: str | None
     config_dir: str | None
+    transport: discovery.Transport | None = None
     verbose: bool
     regex: bool           # ls, get, mv, cp, rm, open
     recursive: bool       # ls, get, put, rm
@@ -83,7 +84,8 @@ def open_device(args: Args) -> Device:
     def on_switch(tty: str, serial: str | None) -> None:
         if args.verbose:
             print(f"switching {tty} ({serial}) to USB Ethernet", file=sys.stderr)
-    dev = connect(addr=args.addr, config_dir=args.config_dir, on_switch=on_switch)
+    dev = connect(addr=args.addr, config_dir=args.config_dir, on_switch=on_switch,
+                  transport=args.transport)
     if args.verbose:
         tls = "pinned to devicecert.bin" if dev.pinned_cert else "unverified (no pinned cert)"
         source = dev.credentials.source if dev.credentials else "?"
@@ -449,23 +451,34 @@ def cmd_pair(args: Args) -> None:
     def on_switch(tty: str, serial: str | None) -> None:
         if args.verbose:
             print(f"switching {tty} ({serial})", file=sys.stderr)
-    addr = args.addr or os.environ.get("QUADERNO_ADDR") or usb.discover(on_switch=on_switch)
+    transport = discovery.parse_transport(args.transport or os.environ.get("QUADERNO_TRANSPORT"))
+    addr = args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+        transport=transport, on_switch=on_switch)
     pairing.pair(read_pin, addr=addr, force=args.force, cred_dir=args.config_dir,
                  on_event=on_event)
 
 
 def complete(argv: list[str]) -> int:
-    """`quaderno __complete [--dirs] [--config DIR] [--addr ADDR] [--] PREFIX`:
+    """`quaderno __complete [--dirs] [--config DIR] [--addr ADDR] [--usb|--wifi] [--] PREFIX`:
     device paths for shell Tab completion, one per line, folders ending in '/'.
     Lists the folder PREFIX is in, keeping the folder part exactly as typed. The
-    shell passes on --config and --addr from the command line being completed.
-    Never prints errors; prints nothing (at once) when the device isn't connected."""
-    dirs_only, config_dir, addr, prefix = False, None, os.environ.get("QUADERNO_ADDR"), ""
+    shell passes on global options from the command line being completed.
+    Never prints errors; prints nothing (at once) when the device isn't connected
+    (never blocks on a slow mDNS scan)."""
+    dirs_only = False
+    config_dir: str | None = None
+    addr: str | None = os.environ.get("QUADERNO_ADDR")
+    transport_flag: str | None = None
+    prefix = ""
     rest = list(argv)
     while rest:
         a = rest.pop(0)
         if a == "--dirs":
             dirs_only = True
+        elif a == "--usb":
+            transport_flag = "usb"
+        elif a == "--wifi":
+            transport_flag = "wifi"
         elif a in ("--config", "--addr") and rest:
             value = rest.pop(0)
             if a == "--config":
@@ -478,10 +491,22 @@ def complete(argv: list[str]) -> int:
         else:
             prefix = a
     try:
-        if not addr and not usb.usb_devices():
+        transport = discovery.parse_transport(transport_flag or os.environ.get("QUADERNO_TRANSPORT"))
+        target = addr
+        if target:
+            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+        elif transport != "wifi" and usb.is_supported() and usb.usb_devices():
+            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+            target = usb.discover(creds.serial)
+        elif transport != "usb":
+            creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
+            cached = credentials.load_wifi_addr(creds.source)
+            if not cached or not usb.probe(cached, timeout=0.25):
+                return 0
+            target = cached
+        else:
             return 0
-        creds = credentials.load_credentials(credentials.find_credentials_dir(config_dir))
-        with Device(addr or usb.discover(creds.serial), creds.client_id, creds.key, timeout=5,
+        with Device(target, creds.client_id, creds.key, timeout=5,
                     pinned_cert=creds.pinned_cert) as dev:
             dev.authenticate()
             typed_dir, sep, _ = prefix.rpartition("/")
@@ -501,8 +526,13 @@ def complete(argv: list[str]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="quaderno",
-                                 description="Fujitsu QUADERNO over USB: files, sync, pairing.")
-    ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' (default: auto)")
+                                 description="Fujitsu QUADERNO over USB or Wi-Fi: files, sync, pairing.")
+    ap.add_argument("--addr", help="device address, e.g. 'fe80::...%%en8' or '192.168.1.42' (default: USB)")
+    tr = ap.add_mutually_exclusive_group()
+    tr.add_argument("--wifi", dest="transport", action="store_const", const="wifi",
+                    help="discover over Wi-Fi via mDNS (opt-in; skips USB)")
+    tr.add_argument("--usb", dest="transport", action="store_const", const="usb",
+                    help="connect over USB (default; overrides $QUADERNO_TRANSPORT)")
     ap.add_argument("--config", dest="config_dir", metavar="DIR",
                     help="credentials directory, for reading and for `pair` "
                          "(default: $QUADERNO_CONFIG or ~/.config/quaderno)")
@@ -676,7 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("-y", "--yes", action="store_true", help="confirm certificate wipe")
 
     add("time", cmd_time, "set the device clock to this computer's time")
-    add("addr", None, "print the device address (switches USB mode if needed)")
+    add("addr", None, "print the device address (USB or Wi-Fi)")
     add("linux-setup", None, "print a script that sets up Linux for the device (udev rule, "
                              "NetworkManager profile); run it with `quaderno linux-setup | sh`")
 
@@ -720,12 +750,21 @@ def main(argv: list[str] | None = None) -> int:
             print(linux_setup_script(), end="")
             return 0
         if args.cmd == "addr":
+            serial: str | None = None
+            cred_dir: str | None = None
+            cached_addr: str | None = None
             try:
-                serial = credentials.load_credentials(
-                    credentials.find_credentials_dir(args.config_dir)).serial
+                creds = credentials.load_credentials(
+                    credentials.find_credentials_dir(args.config_dir))
+                serial, cred_dir = creds.serial, creds.source
+                cached_addr = credentials.load_wifi_addr(cred_dir)
             except QuadernoError:
-                serial = None
-            print(args.addr or usb.discover(serial))
+                pass
+            transport = discovery.parse_transport(
+                args.transport or os.environ.get("QUADERNO_TRANSPORT"))
+            save_cb = (lambda a: credentials.save_wifi_addr(cred_dir, a)) if cred_dir else None
+            print(args.addr or os.environ.get("QUADERNO_ADDR") or discovery.discover(
+                serial, transport=transport, cached_addr=cached_addr, on_wifi_addr=save_cb))
             return 0
         fn = args.fn
         if fn is None:  # every other command sets one
